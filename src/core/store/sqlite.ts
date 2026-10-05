@@ -25,6 +25,15 @@ export class SqliteVectorStore implements VectorStore {
 
   async init(): Promise<void> {
     if (this.ready) return;
+    // SQLite refuses to create a file in a directory that does not exist, and
+    // the default store is ~/.ai-memory/memory.db — a path that is not there
+    // on a fresh machine. Creating it here is the one place that knows the file
+    // is about to be opened; every caller goes through init().
+    if (this.dbPath !== ":memory:" && !this.dbPath.startsWith("file:")) {
+      const { mkdir } = await import("node:fs/promises");
+      const { dirname } = await import("node:path");
+      await mkdir(dirname(this.dbPath), { recursive: true });
+    }
     const D = await getDatabaseSync();
     this.db = new D(this.dbPath);
     // Shared-store durability (ADR-0007): four different agents may open this file

@@ -1,8 +1,11 @@
 import "../src/config.js";
 import { MemoryService } from "../src/core/memoryService.js";
+import { resolveDbPath } from "../src/core/dbPath.js";
 
 const ns = process.env.NAMESPACE ?? "default:default";
-const dbPath = process.env.MEMORY_DB_PATH ?? "memory.db";
+// Same resolution the server and CLI use. Writing ./memory.db here seeded a
+// store nothing read — ADR-0007 moved the default to ~/.ai-memory/memory.db.
+const dbPath = resolveDbPath(process.env.MEMORY_DB_PATH);
 
 const svc = new MemoryService({ dbPath });
 await svc.init();
