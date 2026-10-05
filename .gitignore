@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+test-*.db*
+.env
+
+# local tooling state, not project source
+_asar/
+.codegraph/
+.pi/

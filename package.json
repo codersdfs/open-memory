@@ -1,0 +1,23 @@
+{
+  "name": "ai-memory",
+  "version": "0.2.0",
+  "description": "Local-first memory for pi agents: SQLite + hybrid retrieval + hard token budget. One process, no UI framework.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/api/server.ts",
+    "start": "tsx src/api/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "seed": "tsx scripts/seed.ts",
+    "wiki:ingest": "tsx scripts/wiki-ingest.ts",
+    "wiki:links": "tsx scripts/wiki-links.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.1"
+  }
+}

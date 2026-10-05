@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Wiki graph</title>
+<style>
+  body{margin:0;background:#09090b;color:#e4e4e7;font:13px ui-sans-serif,system-ui;display:flex;height:100vh}
+  #canvas{flex:1;display:block;cursor:grab} #canvas.panning{cursor:grabbing}
+  #side{width:300px;border-left:1px solid #27272a;padding:16px;overflow:auto;background:#0c0c0e}
+  h2{font-size:13px;margin:0 0 4px} .muted{color:#71717a;font-size:11px}
+  ul{list-style:none;padding:0;margin:8px 0} li{padding:2px 0}
+  a{color:#a5b4fc;cursor:pointer;text-decoration:none} a:hover{text-decoration:underline}
+  button{background:#27272a;border:0;color:#e4e4e7;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px}
+  button:hover{background:#3f3f46}
+  svg text{font-size:10px;fill:#a1a1aa;pointer-events:none;user-select:none}
+</style></head>
+<body>
+<svg id="canvas"></svg>
+<div id="side"><p class="muted">click a node</p></div>
+<script src="./graph.js"></script>
+</body></html>
