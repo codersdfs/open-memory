@@ -6,9 +6,14 @@ A **local-first, namespace-partitioned memory substrate** that stores *Episodic 
 - **Smart Search**: 2-stage — `0.6*vector + 0.2*BM25 + 0.15*recency + 0.05*importance` → MMR diversify → threshold `0.72` (empty allowed) → **hard budget** (default 800 tokens) + overflow summarization (ADR-0002). Deterministic, zero extra LLM call.
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
 - **Inspector UI**: plain `index.html` + `app.js` served by the same `node:http` process as the API. No bundler, no framework. List/filter by type, playground with `k / threshold / budget` sliders, budget preview, soft-delete, supersede chain.
+- **Wiki graph** (`/graph.html`): Obsidian-style node graph over your own markdown. Edges come from `[[wikilinks]]` written into page frontmatter at ingest — nothing is inferred, so the graph never lies about intent. Drag nodes; positions persist to `wiki/.positions.json`. Dangling links render as hollow nodes — hiding them would hide the maintenance debt.
+- **CLI** (`ai-memory`): every subcommand works non-interactively, because hooks call it. Uses the daemon when one answers, otherwise opens the store in-process.
+- **MCP server** (`src/mcp/tools.ts`): `memory_*` tools, every one accepting an explicit `scope`.
 - **Zero runtime dependencies.** `node:http`, `node:sqlite`, `node:crypto`. Dev-only: tsx, typescript, vitest.
 
 ## Quick start
+
+**Requires Node 22+** — `node:sqlite` is still flagged experimental (Node 24 is what this is developed against).
 
 ```bash
 npm install
@@ -16,7 +21,18 @@ npm run seed     # seeds 8 demo memories into memory.db (default:default)
 npm start        # API + UI on http://127.0.0.1:3000  (PORT / HOST override)
 ```
 
-Dev with reload: `npm run dev`.
+Dev with reload: `npm run dev`. Then open **http://127.0.0.1:3000** for the inspector, or **/graph.html** for the wiki graph.
+
+### Wiki to memory
+
+```bash
+npm run wiki:ingest -- ./docs            # markdown -> ./wiki/*.md + semantic sections
+npm run wiki:links                       # graph: nodes, degrees, dangling links
+npm run wiki:links -- --suggest <slug>   # link candidates (shared title terms, no model call)
+npm run wiki:links -- --add <from> <to>  # append [[to]] to <from>
+```
+
+Whole documents are not stored. One 1.5k-char blob is a file, not a memory: it matches on any word it happens to share with the query and spends half the recall budget printing back a decision record you could just read. `wiki:ingest` splits on headings and stores each section with its heading attached.
 
 ## API
 
@@ -30,6 +46,8 @@ Dev with reload: `npm run dev`.
 | `POST` | `/memories/search` | `{query, namespace, k?, budgetTokens?, threshold?, type?}` |
 | `POST` | `/extract` | `{text, namespace}` — heuristic (no LLM) or LLM if `ENABLE_EXTRACTOR=true` + `OPENAI_API_KEY` |
 | `POST` | `/decay` | prunes `episodic >90d && importance<=0.3` + `working >7d` |
+| `GET` | `/graph` | wiki node graph: `{nodes, edges}` |
+| `GET`/`POST` | `/positions` | read / write `{slug, x, y}` for the graph canvas |
 | `GET` | `/health` | |
 | `GET` | `/stats?namespace=` | |
 | `PATCH` | `/memories/:id` | `{status?, pin?}` governance |
@@ -79,7 +97,11 @@ This is a deliberate divergence, not drift. The agent is answering questions it 
 
 ## Embeddings
 
-One provider: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero download. It is the only thing that exists, on purpose: swapping in a hosted embedder means an API key, a network hop on every save, and a `dim` migration (`rm memory.db*`) the moment the model changes. Add a real one only when recall measurably misses, and give it a name + dim in `/health`.
+One provider: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero download.
+
+**Be clear about what this is:** a hash embedder is a deterministic bucket of tokens, not a semantic model. It matches on shared vocabulary, not on meaning. It is the right default because it is instant, offline, free and needs no key — but if you expect "vector search" to mean "finds things that mean the same thing", that is the assumption to check. `.env.example` documents NVIDIA NIM and OpenAI keys; wiring one in is an interface, not a rewrite, but the `dim` change requires `rm memory.db*`.
+
+It is the only provider that exists, on purpose: a hosted embedder means an API key, a network hop on every save, and a `dim` migration the moment the model changes. Add a real one only when recall measurably misses.
 ## Storage
 
 - `SqliteVectorStore` via `node:sqlite` (`DatabaseSync`, Node 22+). Single file `memory.db` (WAL). `InMemoryVectorStore` is used in tests.
@@ -88,8 +110,28 @@ One provider: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero do
 ## Project layout
 
 ```
+```
 CONTEXT.md              # ubiquitous language (Memory, Token Burning, etc.)
-docs/adr/0001-0004.md
+docs/adr/0001-0006.md   # decision records
+docs/DESIGN-node-graph.md
+src/core/
+  types.ts              # Memory, Namespace, SearchResult
+  embedding/            # provider, hash
+  store/                # interface, sqlite (node:sqlite), memory (in-memory)
+  retrieval/            # hybrid, bm25, mmr, tokens/budget
+  extraction/           # heuristic + optional LLM extractor
+  lifecycle/ decay.ts
+  graph.ts              # wiki graph: parsePage, buildGraph, suggestPages
+  memoryService.ts
+src/api/ server.ts (node:http, routes inline, serves UI), tool.ts
+src/adapters/           # agent config writers (claude, codex, pi, dsh)
+src/mcp/ tools.ts       # memory_* MCP tools
+src/cli/                # the ai-memory command
+src/ui/ index.html, app.js, graph.html, graph.js, style.css   # static, no build step
+tests/                  # 136 tests
+scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts
+memory.db               # created on first run, gitignored
+```
 src/core/
   types.ts              # Memory, Namespace, SearchResult
   embedding/            # provider, hash
@@ -108,7 +150,10 @@ memory.db               # created on first run
 ## Tests
 
 ```bash
-npm test            # vitest (13 tests: store, retrieval, api, entrypoint)
+```bash
+npm test            # vitest — 136 tests, 16 files
+npm run lint        # tsc --noEmit
+```
 npm run lint        # tsc --noEmit
 ```
 

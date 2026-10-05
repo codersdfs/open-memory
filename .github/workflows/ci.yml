@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite is still flagged experimental; 22.5 is the floor the
+          # DatabaseSync API needs, 24 is what the suite is developed against.
+          node-version: 24
+      - run: npm ci
+      # Types before tests: a broken signature is a cheaper failure to read
+      # than a test stack trace pointing at the same line.
+      - run: npm run lint
+      - run: npm test
+      # The store is gitignored, so pack must not sweep up a developer's
+      # memory.db or .env on the way to publish.
+      - run: npm pack --dry-run
