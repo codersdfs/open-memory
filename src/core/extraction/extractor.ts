@@ -1,4 +1,5 @@
 import type { MemoryType } from "../types.js";
+import { jevKeep, jevEnabled, importanceFor, JEV_MIN_KEEP } from "../judgment/judge.js";
 
 export interface ExtractedMemory {
   text: string;
@@ -35,10 +36,10 @@ export class Extractor {
         console.warn("[extractor] LLM failed, falling back to heuristic", e);
       }
     }
-    return this.heuristicExtract(turnText);
+    return await this.heuristicExtract(turnText);
   }
 
-  private heuristicExtract(text: string): ExtractedMemory[] {
+  private async heuristicExtract(text: string): Promise<ExtractedMemory[]> {
     const candidates: ExtractedMemory[] = [];
     // Keep the terminator: the "is this a question?" gate below reads it, and
     // splitting on [.!?] silently strips exactly the punctuation it needs.
@@ -49,6 +50,11 @@ export class Extractor {
     for (const s of sentences.slice(0, this.maxPerTurn * 2)) {
       if (candidates.length >= this.maxPerTurn) break;
       if (!Extractor.isWorthKeeping(s)) continue;
+      // Cheap rules already dropped the obvious junk; what survives is exactly
+      // the class they cannot judge — "run the tests before commit" is scaffolding
+      // in one repo and a durable routine in another. One noul settles it.
+      const verdict = await this.judge(s);
+      if (verdict && verdict.keep < JEV_MIN_KEEP()) continue;
       // Gate saw the punctuation; storage should not carry it.
       const clean = s.replace(/[.!?]+$/, "").trim();
       const lower = s.toLowerCase();
@@ -64,7 +70,14 @@ export class Extractor {
         type = "episodic";
         importance = 0.6;
       }
-      candidates.push({ text: clean.slice(0, 500), type, importance });
+      // Judge confidence outranks the regex importance: jev saw the whole
+      // sentence, the pattern above only saw a verb.
+      candidates.push({
+        text: clean.slice(0, 500),
+        type,
+        importance: verdict ? importanceFor(verdict.keep) : importance,
+        tags: verdict ? ["judged:jev"] : undefined,
+      });
     }
     return candidates.slice(0, this.maxPerTurn);
   }
@@ -88,6 +101,19 @@ export class Extractor {
     // Code, not context.
     if (!/\s/.test(s) && /[.:/\\]/.test(s)) return false;
     return true;
+  }
+
+  /**
+   * One noul per surviving sentence. Failure returns null, which means "store
+   * it, unjudged" — the fail-open contract lives in the judge, not here.
+   */
+  private async judge(sentence: string): Promise<{ keep: number } | null> {
+    if (!jevEnabled()) return null;
+    try {
+      return await jevKeep(sentence);
+    } catch {
+      return null;
+    }
   }
 
   private async llmExtract(text: string): Promise<ExtractedMemory[]> {

@@ -102,6 +102,32 @@ One provider: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero do
 **Be clear about what this is:** a hash embedder is a deterministic bucket of tokens, not a semantic model. It matches on shared vocabulary, not on meaning. It is the right default because it is instant, offline, free and needs no key — but if you expect "vector search" to mean "finds things that mean the same thing", that is the assumption to check. `.env.example` documents NVIDIA NIM and OpenAI keys; wiring one in is an interface, not a rewrite, but the `dim` change requires `rm memory.db*`.
 
 It is the only provider that exists, on purpose: a hosted embedder means an API key, a network hop on every save, and a `dim` migration the moment the model changes. Add a real one only when recall measurably misses.
+## Smart write gate
+
+Extraction is two stages, cheapest first.
+
+**1. Heuristic rules** (\`Extractor.isWorthKeeping\`) — free, deterministic, and wrong in one specific direction. "Run the tests before commit" is throwaway task scaffolding in one repo and a durable routine in another. No regex settles that, and both answers are defensible.
+
+**2. Jev judge** (optional, \`src/core/judgment/judge.ts\`) — one \`noul\` per sentence that survived stage 1, asking whether it will still be useful to an assistant weeks from now. The result is a probability, so a borderline memory is stored *weak* instead of being either certainly kept or certainly dropped:
+
+\`\`\`
+keep 1.0 -> importance 0.90      keep 0.5 -> importance 0.65      keep 0.0 -> importance 0.40
+\`\`\`
+
+\`importanceFor()\` is deliberately monotonic in confidence: decay then keeps what the judge was sure about and lets the shaky ones sink. Memories that went through it are tagged \`judged:jev\`.
+
+Below \`MEMORY_JEV_MIN\` (default 0.5) the sentence is dropped. **Fail-open**: no key, a 401, or the API being down means the memory is stored *unjudged* rather than lost. A store that silently stops recording because a judge API is down is worse than one that occasionally keeps a mediocre fact.
+
+\`\`\`bash
+echo -n 'ts-...' > ~/.typesafe-key && chmod 600 ~/.typesafe-key
+# in .env:
+JEV_API_KEY_FILE=~/.typesafe-key       # a path, so .env stays shareable
+MEMORY_JEV_MIN=0.5
+MEMORY_JEV=false                     # turn it off, heuristic only
+\`\`\`
+
+Judge confidence outranks the regex importance: Jev read the whole sentence, the pattern only saw a verb. With no key configured, behavior is byte-identical to v0.2.0.
+
 ## Storage
 
 - `SqliteVectorStore` via `node:sqlite` (`DatabaseSync`, Node 22+). Single file `memory.db` (WAL). `InMemoryVectorStore` is used in tests.
@@ -128,7 +154,7 @@ src/adapters/           # agent config writers (claude, codex, pi, dsh)
 src/mcp/ tools.ts       # memory_* MCP tools
 src/cli/                # the ai-memory command
 src/ui/ index.html, app.js, graph.html, graph.js, style.css   # static, no build step
-tests/                  # 136 tests
+tests/                  # 146 tests
 scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts
 memory.db               # created on first run, gitignored
 ```
@@ -151,7 +177,7 @@ memory.db               # created on first run
 
 ```bash
 ```bash
-npm test            # vitest — 136 tests, 16 files
+npm test            # vitest — 146 tests, 17 files
 npm run lint        # tsc --noEmit
 ```
 npm run lint        # tsc --noEmit
