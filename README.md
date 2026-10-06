@@ -123,6 +123,8 @@ EMBEDDING_DIM=1024                                          # for any other mode
 
 NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` body fields that E5/Nemotron score on; OpenAI rejects those, so they are sent only for NIM.
 
+**Neither provider has a measured retrieval comparison yet.** They are wired end to end — save embeds, search embeds, `reembed` migrates a store, the weight follows the provider — but the claim that real embeddings find paraphrases the hash one misses has not been measured on this corpus, because that needs a key. Until it is measured, treat the vector term as *wired, not proven*: `wayfinder/tickets/011`.
+
 **The dimension is load-bearing.** The vector column holds raw JSON, so a provider swap without clearing the store makes every search return noise rather than an error. Startup therefore refuses on a mismatch and names both dims:
 
 ```
@@ -130,7 +132,14 @@ embedding dim mismatch: /home/you/.ai-memory/memory.db holds 384-dim vectors,
 but the openai embedder produces 1536.
 ```
 
-Move the file aside (`mv memory.db memory.db.bak`) to start fresh on the new provider. There is no automatic re-embed command yet — ticket `wayfinder/tickets/011`.
+`ai-memory reembed` rewrites every stored vector with the current provider, and the mismatch error above names it:
+
+```bash
+EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... ai-memory reembed   # rewrite in place
+ai-memory reembed --dry-run                                        # count first, write nothing
+```
+
+It covers archived, draft and soft-deleted rows too, so a later `restore` cannot hand the retriever a vector of the wrong width; a row left stale by an interrupted run is skipped by search rather than crashing it. `mv memory.db memory.db.bak` remains the start-fresh option.
 
 The vector weight follows the embedder: `0.6` when a real provider is configured, `0` for hash (which returns ~0.9 cosine to everything, so the term would be noise). `MEMORY_VECTOR_WEIGHT` overrides either. A configured embedder that contributed nothing to ranking would cost a network hop per save and buy nothing — which is why this is not a number you have to discover.
 

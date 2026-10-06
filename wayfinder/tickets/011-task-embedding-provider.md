@@ -101,3 +101,29 @@ wire body for both providers, dim validation, API error text, and the startup gu
 The published package is now installable (`open-memory@0.3.0`), so the only
 thing between this and `npm publish` is that the headline feature — *hybrid*
 retrieval — is currently one-legged, and the README would have to say so.
+
+---
+
+## Update 2026-10-06 — the code side is done, the measurement is not
+
+`ai-memory reembed` exists now (`src/core/embedding/reembed.ts`), so a store written
+by the hash provider can be moved onto a real one instead of being thrown away — the
+prerequisite this ticket named. It is what the dimension-mismatch error points at, it
+covers archived/draft/soft-deleted rows (a restored row must not carry an old-width
+vector), and a failed batch is retried one text at a time so a single bad document
+does not cost the whole chunk.
+
+The README no longer implies the vector path is proven: it says neither provider has
+a measured comparison and that the term is *wired, not proven*. That clears the
+release blocker as stated above — the claim is honest now instead of pending.
+
+What is left is one measurement, and it needs a key rather than code:
+
+1. `EMBEDDING_PROVIDER=openai OPENAI_API_KEY=... ai-memory reembed` — a provider swap
+   needs its own store, and `--dry-run` counts the work first
+2. Run the same three queries twice: as written, then reworded. Compare `--explain`'s
+   `vector` term against the hash baseline. The bar is not a constant — it is "does the
+   reworded query return the memory at all", which the hash embedder cannot do
+   (it matches vocabulary, not meaning).
+3. Record the result here either way. If a real provider does not beat the hash
+   embedder on this corpus, that is a finding, and the README should say so.
