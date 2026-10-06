@@ -34,6 +34,8 @@ export class HybridRetriever {
   private weights: { vector: number; bm25: number; recency: number; strength: number };
   private halfLifeDays: number;
   private mmrLambda: number;
+  /** How far the best vector hit must lead its partition's median cosine to count. */
+  private semanticMargin: number;
   constructor(
     private store: VectorStore,
     private embedder: EmbeddingProvider,
@@ -59,6 +61,11 @@ export class HybridRetriever {
     };
     this.halfLifeDays = config.recencyHalfLifeDays ?? 30;
     this.mmrLambda = config.mmrLambda ?? 0.6;
+    // Calibrated on 53 rows, six paraphrases against six unrelated queries; the note in
+    // searchOne carries the numbers. Raise it to be stricter about admitting a memory
+    // with no shared words, lower it to reach further.
+    const margin = Number(process.env.MEMORY_SEMANTIC_MARGIN ?? 0.2);
+    this.semanticMargin = Number.isFinite(margin) ? margin : 0.2;
   }
 
   /**
@@ -119,8 +126,31 @@ export class HybridRetriever {
     // every row, which is the threshold's whole budget — so an unrelated query
     // cleared 0.35 and came back with results it had no business returning.
     // Relevance gates; recency and importance only break ties among matches.
+    // Vector evidence can also *admit* a memory no word matches — the one thing a real
+    // embedder buys over the hash one. It has to be a relative test. Measured on a
+    // 53-row corpus: unrelated queries peaked at cosine 0.120 / 0.147 / 0.256 while
+    // genuine paraphrases sat at 0.271 and 0.304, so *any* absolute floor either admits
+    // the kubernetes query or drops a paraphrase. Leading the partition's median
+    // separated them where absolute similarity did not: noise never led by more than
+    // 0.176, four of six paraphrases led by 0.231-0.345. The default margin sits between
+    // those two measured numbers. The two paraphrases it still misses are ones the model
+    // ranked 2nd and 8th — ranking failures, not gate failures.
+    //
+    // Only the partition's best vector hit can be admitted this way, and only when the
+    // embedder is real: the hash cosine is ~0.9 to everything, so it can lead nothing.
+    let semanticTopId: string | null = null;
+    if (this.weights.vector > 0 && vectorHits.length > 0) {
+      const spread = await this.store.cosineSpread({ namespace, queryEmbedding });
+      const best = vectorHits[0]!;
+      if (best.vectorScore - spread.median >= this.semanticMargin) semanticTopId = best.memory.id;
+    }
+
     const relevant = scored.filter(
-      (s) => s.bm25Score > 0 || s.vectorScore >= VECTOR_FLOOR || s.memory.pin === 1
+      (s) =>
+        s.bm25Score > 0 ||
+        s.vectorScore >= VECTOR_FLOOR ||
+        s.memory.pin === 1 ||
+        s.memory.id === semanticTopId
     );
 
     // The gate is a floor on *relevance*, never on the total. Recency and strength
@@ -143,7 +173,11 @@ export class HybridRetriever {
     const relevanceOf = (s: Scored) =>
       Math.max(s.bm25Score, this.weights.vector > 0 ? s.vectorScore : 0);
     return relevant.filter(
-      (s) => relevanceOf(s) >= threshold || s.score >= threshold || s.memory.pin === 1
+      (s) =>
+        relevanceOf(s) >= threshold ||
+        s.score >= threshold ||
+        s.memory.id === semanticTopId ||
+        s.memory.pin === 1
     );
   }
 

@@ -35,6 +35,11 @@ the command stays `ai-memory`.
 
 ### Added
 
+- **A semantic gate.** A memory with no shared words is admitted when it is the
+  partition's best vector hit and leads that partition's median cosine by
+  `MEMORY_SEMANTIC_MARGIN` (default `0.2`). At the production floor of 0.72, four
+  paraphrased queries went from 0/4 hits on the hash embedder to 3/4 with nemotron,
+  while the unrelated query still returns nothing.
 - `ai-memory reembed` — rewrite every stored vector for a provider swap, including
   archived and forgotten rows. `--dry-run` counts first.
 - `--all` sweeps every partition you own, rather than the two the resolver guessed.

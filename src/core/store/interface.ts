@@ -47,6 +47,26 @@ export interface VectorStore {
     includeArchived?: boolean;
     includeDraft?: boolean;
   }): Promise<{ memory: Memory; vectorScore: number }[]>;
+
+  /**
+   * How this query's cosines are distributed across one partition.
+   *
+   * A top-1 cosine cannot say whether a match is real: measured on a 53-row corpus,
+   * unrelated queries reached 0.120 / 0.147 / 0.256 while genuine paraphrases sat at
+   * 0.271 and 0.304 — overlapping ranges. A *relative* number can: the noise never led
+   * its partition by more than 0.176 over the median, while four of six paraphrases led
+   * by 0.231-0.345. Full scan on purpose: the median of the over-fetched top-N is not
+   * the partition's median, and that difference is the whole measurement.
+   */
+  cosineSpread(opts: {
+    namespace: string;
+    queryEmbedding: number[];
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+  }): Promise<{ median: number; count: number }>;
   /**
    * Retrieval reinforcement (R2): every id that came back above threshold gets a
    * little stronger and its use clock reset. One UPDATE, no read-modify-write

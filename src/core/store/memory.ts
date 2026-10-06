@@ -2,6 +2,7 @@ import { randomUUID } from "crypto";
 import type { Memory, MemoryInput } from "../types.js";
 import type { VectorStore } from "./interface.js";
 import { cosineSimilarity } from "../embedding/provider.js";
+import { median } from "../stats.js";
 
 export class InMemoryVectorStore implements VectorStore {
   private map = new Map<string, Memory>();
@@ -36,6 +37,41 @@ export class InMemoryVectorStore implements VectorStore {
 
   async getById(id: string): Promise<Memory | null> {
     return this.map.get(id) ?? null;
+  }
+
+  /** The pool every vector query works over; mirrors the SQL store's filters. */
+  private candidates(opts: {
+    namespace: string;
+    includeDeleted?: boolean;
+    type?: string;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+  }): Memory[] {
+    let arr = [...this.map.values()].filter((m) => m.namespace === opts.namespace);
+    if (!opts.includeDeleted) arr = arr.filter((m) => m.isDeleted === 0);
+    if (opts.type) arr = arr.filter((m) => m.type === opts.type);
+    if (opts.status) arr = arr.filter((m) => m.status === opts.status);
+    else {
+      if (!opts.includeArchived) arr = arr.filter((m) => m.status !== "archived");
+      if (!opts.includeDraft) arr = arr.filter((m) => m.status !== "draft");
+    }
+    return arr;
+  }
+
+  async cosineSpread(opts: {
+    namespace: string;
+    queryEmbedding: number[];
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+  }): Promise<{ median: number; count: number }> {
+    const cosines = this.candidates(opts)
+      .filter((m) => m.embedding.length === opts.queryEmbedding.length)
+      .map((m) => cosineSimilarity(opts.queryEmbedding, m.embedding));
+    return { median: median(cosines), count: cosines.length };
   }
 
   async distinctNamespaces(opts: { includeDeleted?: boolean } = {}): Promise<string[]> {
@@ -116,15 +152,7 @@ export class InMemoryVectorStore implements VectorStore {
     includeArchived?: boolean;
     includeDraft?: boolean;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
-    let arr = [...this.map.values()].filter((m) => m.namespace === opts.namespace);
-    if (!opts.includeDeleted) arr = arr.filter((m) => m.isDeleted === 0);
-    if (opts.type) arr = arr.filter((m) => m.type === opts.type);
-    if (opts.status) arr = arr.filter((m) => m.status === opts.status);
-    else {
-      if (!opts.includeArchived) arr = arr.filter((m) => m.status !== "archived");
-      if (!opts.includeDraft) arr = arr.filter((m) => m.status !== "draft");
-    }
-    const scored = arr.flatMap((memory) =>
+    const scored = this.candidates(opts).flatMap((memory) =>
       memory.embedding.length !== opts.queryEmbedding.length
         ? [] // stale width from an interrupted reembed: skip, do not throw
         : [{ memory, vectorScore: cosineSimilarity(opts.queryEmbedding, memory.embedding) }]

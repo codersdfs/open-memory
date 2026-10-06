@@ -3,6 +3,37 @@ import { randomUUID } from "crypto";
 import type { Memory, MemoryInput } from "../types.js";
 import type { VectorStore } from "./interface.js";
 import { cosineSimilarity } from "../embedding/provider.js";
+import { median } from "../stats.js";
+
+/**
+ * The candidate pool that vectorSearch and cosineSpread must agree on. They are read
+ * against each other, so two hand-written WHERE clauses would eventually drift and
+ * quietly measure different corpora.
+ */
+function candidateWhere(opts: {
+  namespace: string;
+  includeDeleted?: boolean;
+  type?: string;
+  status?: string;
+  includeArchived?: boolean;
+  includeDraft?: boolean;
+}): { whereSql: string; params: (string | number)[] } {
+  const where: string[] = ["namespace = ?"];
+  const params: (string | number)[] = [opts.namespace];
+  if (!opts.includeDeleted) where.push("is_deleted = 0");
+  if (opts.type) {
+    where.push("type = ?");
+    params.push(opts.type);
+  }
+  if (opts.status) {
+    where.push("status = ?");
+    params.push(opts.status);
+  } else {
+    if (!opts.includeArchived) where.push("status != 'archived'");
+    if (!opts.includeDraft) where.push("status != 'draft'");
+  }
+  return { whereSql: where.join(" AND "), params };
+}
 
 // Lazy load node:sqlite to avoid vite/vitest static resolve of "node:sqlite"
 // (vitest tries to bundle "sqlite" otherwise). We use vite-ignore.
@@ -243,6 +274,35 @@ export class SqliteVectorStore implements VectorStore {
     return { memories: rows.map(memoryFromRow), total: totalRow.c };
   }
 
+  async cosineSpread(opts: {
+    namespace: string;
+    queryEmbedding: number[];
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+  }): Promise<{ median: number; count: number }> {
+    this.ensure();
+    const { whereSql, params } = candidateWhere(opts);
+    const rows = this.db
+      .prepare(`SELECT embedding FROM memories WHERE ${whereSql}`)
+      .all(...(params as any)) as { embedding: string }[];
+    const cosines: number[] = [];
+    for (const r of rows) {
+      let vec: number[];
+      try {
+        vec = JSON.parse(r.embedding) as number[];
+      } catch {
+        continue;
+      }
+      // Same width rule as the search: a stale row is skipped, not fatal.
+      if (!Array.isArray(vec) || vec.length !== opts.queryEmbedding.length) continue;
+      cosines.push(cosineSimilarity(opts.queryEmbedding, vec));
+    }
+    return { median: median(cosines), count: cosines.length };
+  }
+
   async distinctNamespaces(opts: { includeDeleted?: boolean } = {}): Promise<string[]> {
     this.ensure();
     // includeDeleted exists for `reembed`: a forgotten row keeps its vector, and
@@ -302,21 +362,7 @@ export class SqliteVectorStore implements VectorStore {
     includeDraft?: boolean;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
     this.ensure();
-    const where: string[] = ["namespace = ?"];
-    const params: (string | number)[] = [opts.namespace];
-    if (!opts.includeDeleted) where.push("is_deleted = 0");
-    if (opts.type) {
-      where.push("type = ?");
-      params.push(opts.type);
-    }
-    if (opts.status) {
-      where.push("status = ?");
-      params.push(opts.status);
-    } else {
-      if (!opts.includeArchived) where.push("status != 'archived'");
-      if (!opts.includeDraft) where.push("status != 'draft'");
-    }
-    const whereSql = where.join(" AND ");
+    const { whereSql, params } = candidateWhere(opts);
     const rows = this.db.prepare(`SELECT * FROM memories WHERE ${whereSql}`).all(...(params as any)) as Row[];
     const scored = rows.flatMap((r) => {
       const mem = memoryFromRow(r);

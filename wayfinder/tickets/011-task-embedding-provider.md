@@ -166,6 +166,40 @@ that uses *relative* evidence — cosine against the corpus distribution for tha
 absolute cosine. That is the R3/R4 shape (`wayfinder/ROADMAP.md`), and it is the only
 thing left between a real provider and a config that is worth paying for.
 
+---
+
+## Implemented 2026-10-06 — the relative gate, with the margin fitted to the data
+
+The vague question above now has an answer. `HybridRetriever` admits a memory with no
+lexical overlap when it is the partition's best vector hit **and** leads that
+partition's median cosine by `MEMORY_SEMANTIC_MARGIN` (default `0.2`). Only the top hit
+can be admitted, and only when the embedder is real — the hash cosine is ~0.9 to
+everything and can lead nothing, so the default install is unchanged.
+
+The margin is the midpoint of the two numbers this corpus produced: the noisiest
+unrelated query led its partition's median by 0.176 (kubernetes), the weakest surviving
+paraphrase by 0.231. `cosineSpread()` in `VectorStore` computes the median over the
+whole partition on purpose — the median of the over-fetched top-N is not the corpus
+median, and that difference is the entire measurement. `tests/semantic-gate.test.ts`
+fixes each cosine by hand and covers both directions plus the knob; the two
+admission tests go red when the gate is disabled.
+
+**End to end at the production floor of `0.72`**, four paraphrases / one unrelated query:
+
+| store | paraphrases | unrelated |
+|---|---|---|
+| hash (the default install) | 0/4 | clean |
+| nemotron-3-embed-1b (2048d) | **3/4** | clean |
+
+The one miss is `19fbfcbf`, the memory the model ranked 2nd rather than 1st (`cos 0.203`
+against a top hit of `0.223`) — the gate never sees it, and that is a ranking problem
+for R3/R4, not a floor problem. The README no longer tells people to lower `0.72` when
+they configure a provider; that was the pre-gate advice and it is now wrong.
+
+**Still unmeasured:** whether the margin holds at scale. 0.2 sits 0.024 above the
+noisiest query in a 12-query sample on 53 rows. A larger store changes the median's
+stability, and that is the number to re-check before this default is trusted widely.
+
 **Cost of the measurement:** 2 batch requests to re-embed 84 rows, 11 single-text query
 embeddings.
 
