@@ -6,6 +6,7 @@ import { ApiEmbeddingProvider } from "../src/core/embedding/openai.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import type { EmbeddingProvider } from "../src/core/embedding/provider.js";
+import { HybridRetriever } from "../src/core/retrieval/hybrid.js";
 
 const env = (o: Record<string, string>) => o as NodeJS.ProcessEnv;
 
@@ -139,3 +140,44 @@ describe("dimension guard", () => {
     await expect(svc.init()).resolves.toBeUndefined();
   });
 });
+
+// The vector term must exist exactly when it carries signal. With hash it is noise
+// (~0.9 cosine to everything) and stays out of the score; with a real provider, a
+// configured embedder that contributed nothing would be a paid no-op.
+describe("vector weight follows the embedder", () => {
+  const vec = [1, 0, 0, 0];
+
+  const retrieverOf = async (name: string) => {
+    const store = new InMemoryVectorStore();
+    await store.init();
+    await store.insert({ namespace: "v:1", type: "semantic", text: "vector only match" }, vec);
+    const embedder: EmbeddingProvider = {
+      name,
+      dim: 4,
+      async embed() { return vec; },
+      async embedBatch() { return [vec]; },
+    };
+    return new HybridRetriever(store, embedder);
+  };
+
+  const weightOf = async (name: string) => {
+    const res = await (await retrieverOf(name)).search({ query: "nothing lexical", namespace: "v:1", threshold: 0, k: 1, explain: true });
+    return res.memories[0].explain!.weighted.vector;
+  };
+
+  it("weights the vector term for a real provider", async () => {
+    expect(await weightOf("openai")).toBeGreaterThan(0);
+  });
+
+  it("leaves it out for the hash default", async () => {
+    expect(await weightOf("hash")).toBe(0);
+  });
+
+  it("still obeys an explicit MEMORY_VECTOR_WEIGHT", async () => {
+    process.env.MEMORY_VECTOR_WEIGHT = "0.1";
+    try {
+      expect(await weightOf("openai")).toBeCloseTo(0.1, 6);
+    } finally { delete process.env.MEMORY_VECTOR_WEIGHT; }
+  });
+});
+

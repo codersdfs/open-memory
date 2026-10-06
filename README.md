@@ -132,39 +132,39 @@ but the openai embedder produces 1536.
 
 Move the file aside (`mv memory.db memory.db.bak`) to start fresh on the new provider. There is no automatic re-embed command yet — ticket `wayfinder/tickets/011`.
 
-Until a real provider is configured, set `MEMORY_VECTOR_WEIGHT=0.6` to put the vector term back into the score; with the hash embedder it is left at `0` because it returns ~0.9 cosine to everything (see "Retrieval").
+The vector weight follows the embedder: `0.6` when a real provider is configured, `0` for hash (which returns ~0.9 cosine to everything, so the term would be noise). `MEMORY_VECTOR_WEIGHT` overrides either. A configured embedder that contributed nothing to ranking would cost a network hop per save and buy nothing — which is why this is not a number you have to discover.
 
 ## Retrieval
 
-Score = \`0.6*bm25 + 0.25*recency + 0.15*strength\` (\`vector\` weight 0 by default — see below), plus \`+0.3\` for a pinned memory. Relevance gates first: a memory with no lexical overlap and no vector signal is not a match, it is just a recent important one, and recency+strength alone would clear the threshold on every row.
+Score = `0.6*bm25 + 0.25*recency + 0.15*strength` (`vector` weight 0 by default — see below), plus `+0.3` for a pinned memory. Relevance gates first: a memory with no lexical overlap and no vector signal is not a match, it is just a recent important one, and recency+strength alone would clear the threshold on every row.
 
-**\`strength\` vs \`importance\`.** \`importance\` is what the write-time judge thought (see "Smart write gate"). \`strength\` is what use has proven — it starts equal to \`importance\` and grows on retrieval. They are separate fields on purpose: if reinforcement wrote \`importance\`, then "the model thought this mattered" and "this keeps answering questions" would compete for one number and neither would be true. Ranking reads \`strength\`; the judge owns \`importance\`; decay prunes on \`strength\`.
+**`strength` vs `importance`.** `importance` is what the write-time judge thought (see "Smart write gate"). `strength` is what use has proven — it starts equal to `importance` and grows on retrieval. They are separate fields on purpose: if reinforcement wrote `importance`, then "the model thought this mattered" and "this keeps answering questions" would compete for one number and neither would be true. Ranking reads `strength`; the judge owns `importance`; decay prunes on `strength`.
 
-**\`MEMORY_VECTOR_WEIGHT\`** defaults to \`0\`. The hash embedder returns ~0.9 cosine to everything, so the vector term is noise until a real embedder is wired in — with the hash provider, lexical overlap is the only relevance signal that exists.
+**`MEMORY_VECTOR_WEIGHT`** defaults to `0.6` once a real embedder is configured and `0` for hash: the hash provider returns ~0.9 cosine to everything, so the vector term would be noise, and with it lexical overlap is the only relevance signal that exists. Set the variable to override either way.
 
 ## Smart write gate
 
 Extraction is two stages, cheapest first.
 
-**1. Heuristic rules** (\`Extractor.isWorthKeeping\`) — free, deterministic, and wrong in one specific direction. "Run the tests before commit" is throwaway task scaffolding in one repo and a durable routine in another. No regex settles that, and both answers are defensible.
+**1. Heuristic rules** (`Extractor.isWorthKeeping`) — free, deterministic, and wrong in one specific direction. "Run the tests before commit" is throwaway task scaffolding in one repo and a durable routine in another. No regex settles that, and both answers are defensible.
 
-**2. Jev judge** (optional, \`src/core/judgment/judge.ts\`) — one \`noul\` per sentence that survived stage 1, asking whether it will still be useful to an assistant weeks from now. The result is a probability, so a borderline memory is stored *weak* instead of being either certainly kept or certainly dropped:
+**2. Jev judge** (optional, `src/core/judgment/judge.ts`) — one `noul` per sentence that survived stage 1, asking whether it will still be useful to an assistant weeks from now. The result is a probability, so a borderline memory is stored *weak* instead of being either certainly kept or certainly dropped:
 
-\`\`\`
+```
 keep 1.0 -> importance 0.90      keep 0.5 -> importance 0.65      keep 0.0 -> importance 0.40
-\`\`\`
+```
 
-\`importanceFor()\` is deliberately monotonic in confidence: decay then keeps what the judge was sure about and lets the shaky ones sink. Memories that went through it are tagged \`judged:jev\`.
+`importanceFor()` is deliberately monotonic in confidence: decay then keeps what the judge was sure about and lets the shaky ones sink. Memories that went through it are tagged `judged:jev`.
 
-Below \`MEMORY_JEV_MIN\` (default 0.5) the sentence is dropped. **Fail-open**: no key, a 401, or the API being down means the memory is stored *unjudged* rather than lost. A store that silently stops recording because a judge API is down is worse than one that occasionally keeps a mediocre fact.
+Below `MEMORY_JEV_MIN` (default 0.5) the sentence is dropped. **Fail-open**: no key, a 401, or the API being down means the memory is stored *unjudged* rather than lost. A store that silently stops recording because a judge API is down is worse than one that occasionally keeps a mediocre fact.
 
-\`\`\`bash
+```bash
 echo -n 'ts-...' > ~/.typesafe-key && chmod 600 ~/.typesafe-key
 # in .env:
 JEV_API_KEY_FILE=~/.typesafe-key       # a path, so .env stays shareable
 MEMORY_JEV_MIN=0.5
 MEMORY_JEV=false                     # turn it off, heuristic only
-\`\`\`
+```
 
 Judge confidence outranks the regex importance: Jev read the whole sentence, the pattern only saw a verb. With no key configured, behavior is byte-identical to v0.2.0.
 
@@ -195,7 +195,7 @@ src/adapters/           # agent config writers (claude, codex, pi, dsh)
 src/mcp/ tools.ts       # memory_* MCP tools
 src/cli/                # the ai-memory command
 src/ui/ index.html, app.js, graph.html, graph.js, style.css   # static, no build step
-tests/                  # 170 tests
+tests/                  # 173 tests
 scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts
 memory.db               # created on first run, gitignored
 ```
@@ -218,7 +218,7 @@ memory.db               # created on first run
 
 ```bash
 ```bash
-npm test            # vitest — 170 tests, 20 files
+npm test            # vitest — 173 tests, 19 files
 npm run lint        # tsc --noEmit
 ```
 npm run lint        # tsc --noEmit

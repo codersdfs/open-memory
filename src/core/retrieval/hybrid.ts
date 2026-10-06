@@ -39,7 +39,15 @@ export class HybridRetriever {
     private embedder: EmbeddingProvider,
     private config: RetrievalConfig = {}
   ) {
-    const vectorWeight = Number(process.env.MEMORY_VECTOR_WEIGHT ?? 0);
+    // The vector term is noise with the hash embedder (~0.9 cosine to everything)
+    // and load-bearing with a real one, so the default follows the embedder rather
+    // than being a number every user has to discover and set. A real provider that
+    // silently contributed nothing would be worse than no provider: it costs a
+    // network hop per save and buys no ranking.
+    const envWeight = process.env.MEMORY_VECTOR_WEIGHT;
+    const vectorWeight = envWeight === undefined
+      ? (embedder.name === "hash" ? 0 : 0.6)
+      : Number(envWeight);
     this.weights = config.weights ?? {
       vector: Number.isFinite(vectorWeight) ? vectorWeight : 0,
       bm25: 0.6,
