@@ -243,12 +243,13 @@ export class SqliteVectorStore implements VectorStore {
     return { memories: rows.map(memoryFromRow), total: totalRow.c };
   }
 
-  async distinctNamespaces(): Promise<string[]> {
+  async distinctNamespaces(opts: { includeDeleted?: boolean } = {}): Promise<string[]> {
     this.ensure();
+    // includeDeleted exists for `reembed`: a forgotten row keeps its vector, and
+    // restoring it later must not hand the retriever a vector of the wrong width.
+    const where = opts.includeDeleted ? "" : "WHERE is_deleted = 0 ";
     const rows = this.db
-      .prepare(
-        `SELECT DISTINCT namespace FROM memories WHERE is_deleted = 0 ORDER BY namespace`
-      )
+      .prepare(`SELECT DISTINCT namespace FROM memories ${where}ORDER BY namespace`)
       .all() as { namespace: string }[];
     return rows.map((r) => r.namespace);
   }
@@ -317,10 +318,15 @@ export class SqliteVectorStore implements VectorStore {
     }
     const whereSql = where.join(" AND ");
     const rows = this.db.prepare(`SELECT * FROM memories WHERE ${whereSql}`).all(...(params as any)) as Row[];
-    const scored = rows.map((r) => {
+    const scored = rows.flatMap((r) => {
       const mem = memoryFromRow(r);
-      const vectorScore = cosineSimilarity(opts.queryEmbedding, mem.embedding);
-      return { memory: mem, vectorScore };
+      // A row left at the old width by an interrupted "ai-memory reembed" is skipped,
+      // not fatal. cosineSimilarity throws on a mismatch and the init guard reads only
+      // one row, so without this a single stale row would break every search in its
+      // partition. Re-embedding is how a store gets back in shape; searching must not
+      // be the thing that crashes while that happens.
+      if (mem.embedding.length !== opts.queryEmbedding.length) return [];
+      return [{ memory: mem, vectorScore: cosineSimilarity(opts.queryEmbedding, mem.embedding) }];
     });
     scored.sort((a, b) => b.vectorScore - a.vectorScore);
     return scored.slice(0, opts.limit);

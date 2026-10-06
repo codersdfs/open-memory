@@ -38,9 +38,9 @@ export class InMemoryVectorStore implements VectorStore {
     return this.map.get(id) ?? null;
   }
 
-  async distinctNamespaces(): Promise<string[]> {
+  async distinctNamespaces(opts: { includeDeleted?: boolean } = {}): Promise<string[]> {
     const held = [...this.map.values()]
-      .filter((m) => m.isDeleted === 0)
+      .filter((m) => opts.includeDeleted || m.isDeleted === 0)
       .map((m) => m.namespace);
     return [...new Set(held)].sort();
   }
@@ -124,7 +124,11 @@ export class InMemoryVectorStore implements VectorStore {
       if (!opts.includeArchived) arr = arr.filter((m) => m.status !== "archived");
       if (!opts.includeDraft) arr = arr.filter((m) => m.status !== "draft");
     }
-    const scored = arr.map((memory) => ({ memory, vectorScore: cosineSimilarity(opts.queryEmbedding, memory.embedding) }));
+    const scored = arr.flatMap((memory) =>
+      memory.embedding.length !== opts.queryEmbedding.length
+        ? [] // stale width from an interrupted reembed: skip, do not throw
+        : [{ memory, vectorScore: cosineSimilarity(opts.queryEmbedding, memory.embedding) }]
+    );
     scored.sort((a, b) => b.vectorScore - a.vectorScore);
     return scored.slice(0, opts.limit);
   }

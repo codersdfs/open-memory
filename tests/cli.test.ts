@@ -127,6 +127,19 @@ describe("ai-memory CLI", () => {
     expect(swept.scopes).toContain("claude:cli-test");
   });
 
+  it("reembed reports what it rewrote", () => {
+    run(["save", "user is a TypeScript engineer", "--json"], db);
+    const res = JSON.parse(run(["reembed", "--json"], db).stdout) as {
+      scanned: number;
+      rewritten: number;
+      dim: number;
+      previousDim: number;
+    };
+    expect(res.scanned).toBeGreaterThan(0);
+    expect(res.rewritten).toBe(res.scanned);
+    expect(res.previousDim).toBe(res.dim);
+  });
+
   it("lists and counts", () => {
     const list = run(["list", "--limit", "5", "--json"], db);
     expect(list.code).toBe(0);

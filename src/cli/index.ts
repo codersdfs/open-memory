@@ -4,6 +4,8 @@ import { MemoryClient, unwrapMemory } from "./http.js";
 import { allPartitions, resolveAgent, resolveRequestScope, resolveWriteKey, resolveUser, scopeOfNamespace, type MemoryScope } from "../core/scope.js";
 import { resolveDbPath, resolveHome, legacyDbPath, dbExists } from "../core/dbPath.js";
 import { MemoryService } from "../core/memoryService.js";
+import { createEmbeddingProvider } from "../core/embedding/index.js";
+import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
 import type { Memory, MemoryType, SearchResult } from "../core/types.js";
 
@@ -35,6 +37,7 @@ Memory
   stats                  counts per type for the resolved scope(s)
   decay                  apply lifecycle decay / pruning
   extract <text>         pull candidate memories out of free text and save them
+  reembed                rewrite every stored vector with the current embedder
 
 Setup & introspection
   setup                  create the memory home dir; --copy-db to migrate the old store
@@ -207,6 +210,43 @@ async function resolveNamespaces(
     scope: flagString(a, "scope") as MemoryScope | undefined,
     all: flagBool(a, "all")
   });
+}
+
+/**
+ * Rewrite every stored vector with the configured provider.
+ *
+ * Deliberately outside the daemon and outside `MemoryService`: the dimension guard in
+ * `MemoryService.init` refuses to serve a store whose vectors do not match the
+ * provider, and this command exists to repair exactly that store. Routing it through
+ * either layer would make the escape hatch unusable in the one situation it is for.
+ */
+async function cmdReembed(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const { SqliteVectorStore } = await import("../core/store/sqlite.js");
+  const embedder = createEmbeddingProvider();
+  const store = new SqliteVectorStore(resolveDbPath(flagString(a, "db")));
+  await store.init();
+  const previousDim = await store.storedDim();
+  const dryRun = flagBool(a, "dry-run");
+  if (!ctx.json) {
+    ctx.out(
+      `provider ${embedder.name} (${embedder.dim}d); store holds ${previousDim ?? "nothing"}${
+        dryRun ? " — dry run, nothing written" : ""
+      }`
+    );
+  }
+  const res = await reembedAll(store, embedder, { dryRun });
+  store.close();
+  if (ctx.json) {
+    ctx.out(JSON.stringify({ ...res, dim: embedder.dim, previousDim }, null, 2));
+  } else {
+    ctx.out(
+      `${res.rewritten} of ${res.scanned} vectors rewritten across ${res.partitions} partitions`
+    );
+    if (res.failed.length) {
+      ctx.err(`${res.failed.length} failed, e.g. ${res.failed[0]!.id}: ${res.failed[0]!.error}`);
+    }
+  }
+  return res.failed.length ? 1 : 0;
 }
 
 async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
@@ -638,6 +678,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdDecay(runner, ctx, a);
       case "extract":
         return await cmdExtract(runner, ctx, a);
+      case "reembed":
+        return await cmdReembed(runner, ctx, a);
       case "setup":
         return await cmdSetup(runner, ctx, a);
       case "db":

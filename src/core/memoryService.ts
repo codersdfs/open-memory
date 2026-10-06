@@ -53,7 +53,8 @@ export class MemoryService {
         `embedding dim mismatch: ${this.dbPath ?? "this store"} holds ${stored}-dim vectors, ` +
         `but the ${this.embedder.name} embedder produces ${this.embedder.dim}.\n` +
         `The vector column stores raw JSON, so searching across dimensions returns garbage, not an error.\n` +
-        `Fix: set EMBEDDING_PROVIDER back to what wrote this file, or move it aside and start fresh ` +
+        `Fix: run \`ai-memory reembed\` to rewrite every vector with the current provider, ` +
+        `or set EMBEDDING_PROVIDER back to what wrote this file, or move it aside and start fresh ` +
         `(e.g. mv ${this.dbPath ?? "memory.db"} ${this.dbPath ?? "memory.db"}.bak).`,
       );
     }
