@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { parseArgs, flagBool, flagList, flagNumber, flagString, queryText } from "./args.js";
 import { MemoryClient, unwrapMemory } from "./http.js";
 import { resolveAgent, resolveRequestScope, resolveWriteKey, resolveUser, type MemoryScope } from "../core/scope.js";

@@ -19,6 +19,17 @@ jobs:
       # than a test stack trace pointing at the same line.
       - run: npm run lint
       - run: npm test
-      # The store is gitignored, so pack must not sweep up a developer's
-      # memory.db or .env on the way to publish.
+      # The published package is a build artifact, not the repo. If `build` is
+      # broken, or tests leak into the tarball, that is a release bug that only
+      # shows up after someone installs it.
+      - run: npm run build
       - run: npm pack --dry-run
+      # The one check that would have caught a bin pointing at the wrong path:
+      # install it the way a user does and run it.
+      - name: install the tarball and run the CLI
+        run: |
+          npm pack --pack-destination /tmp
+          npm i -g --prefix /tmp/inst /tmp/ai-memory-*.tgz
+          AI_MEMORY_HOME=/tmp/inst-store /tmp/inst/ai-memory db info
+          AI_MEMORY_HOME=/tmp/inst-store /tmp/inst/ai-memory save "ci smoke" --type semantic
+          AI_MEMORY_HOME=/tmp/inst-store /tmp/inst/ai-memory search "ci smoke" --threshold 0 --explain

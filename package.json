@@ -6,8 +6,8 @@
   "keywords": ["memory", "agents", "rag", "sqlite", "mcp", "vector-search", "local-first"],
   "engines": { "node": ">=22.5.0" },
   "type": "module",
-  "bin": { "ai-memory": "dist/cli/index.js" },
-  "files": ["dist", "src/ui", "README.md", "CONTEXT.md", "docs", ".env.example"],
+  "bin": { "ai-memory": "dist/src/cli/index.js" },
+  "files": ["dist/src", "dist/scripts", "src/ui", "README.md", "CONTEXT.md", "LICENSE", "docs", ".env.example"],
   "scripts": {
     "dev": "tsx watch src/api/server.ts",
     "start": "tsx src/api/server.ts",
@@ -16,7 +16,7 @@
     "seed": "tsx scripts/seed.ts",
     "wiki:ingest": "tsx scripts/wiki-ingest.ts",
     "wiki:links": "tsx scripts/wiki-links.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc -p tsconfig.lint.json"
   },
   "dependencies": {},
   "devDependencies": {

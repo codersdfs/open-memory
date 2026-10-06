@@ -10,3 +10,6 @@ test-*.db*
 _asar/
 .codegraph/
 .pi/
+
+# another project that lives in this folder — not part of ai-memory
+pi-usage-ui/

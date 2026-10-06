@@ -16,6 +16,9 @@
     "declarationMap": true,
     "types": ["node"]
   },
-  "include": ["src/**/*", "scripts/**/*", "tests/**/*"],
+  // Tests are checked by `npm run lint`, not compiled into the package: a
+  // published tarball should carry the CLI and its library, not the suite that
+  // verified them.
+  "include": ["src/**/*", "scripts/**/*"],
   "exclude": ["node_modules", "dist", "src/ui/dist"]
 }
