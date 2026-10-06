@@ -34,6 +34,29 @@ describe("api", () => {
     expect(search).toHaveProperty("truncated");
   });
 
+  // The CLI's daemon path searches with GET. The `/memories/:id` pattern also
+  // matches "/memories/search", so when it was declared first every daemon-backed
+  // search answered "fetch the memory whose id is search" and 404ed — while
+  // POST search and the daemon-less CLI kept working, which is why the suite
+  // stayed green.
+  it("GET /memories/search returns results, not 'no memory with id search'", async () => {
+    await post("/memories", { namespace: "test:get", type: "semantic", text: "the daemon path uses a GET", importance: 0.8 });
+
+    const res = await fetch(`${base}/memories/search?query=daemon%20path&namespace=test:get&threshold=0`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { memories: { text: string }[] };
+    expect(body.memories.length).toBeGreaterThan(0);
+    expect(body.memories[0].text).toContain("daemon path");
+  });
+
+  it("GET /memories/search explains when asked, and not otherwise", async () => {
+    const plain = await (await fetch(`${base}/memories/search?query=daemon&namespace=test:get&threshold=0`)).json() as { memories: Record<string, unknown>[] };
+    expect(plain.memories[0]).not.toHaveProperty("explain");
+
+    const asked = await (await fetch(`${base}/memories/search?query=daemon&namespace=test:get&threshold=0&explain=1`)).json() as { memories: { explain?: { final: number; weighted: Record<string, number> } }[] };
+    expect(asked.memories[0].explain).toBeDefined();
+  });
+
   it("rejects a memory with a bad type at the trust boundary", async () => {
     const res = await post("/memories", { namespace: "test:1", type: "nonsense", text: "hi" });
     expect(res.status).toBe(400);

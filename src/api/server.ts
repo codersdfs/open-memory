@@ -144,6 +144,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, { pruned: await runDecay(service.store) });
   }
 
+  // Must precede the `/memories/:id` route below: that pattern also matches
+  // "/memories/search", so a GET would be read as "fetch the memory whose id is
+  // search" and answer 404 — which is exactly what `search` did whenever a
+  // daemon was running, while the daemon-less path and `POST` kept working.
+  if (/^\/memories\/search$/.test(path)) {
+    const p = parseSearch(method === "GET" ? q : await readJson(req));
+    if ("status" in p) return send(res, p.status, p.body);
+    return send(res, 200, await service.search(p.data));
+  }
+
   const mem = new RegExp("^/memories(/[^/]+)?(/supersede)?$").exec(path);
   if (mem) {
     const id = mem[1] ? decodeURIComponent(mem[1].slice(1)) : null;
@@ -194,12 +204,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
         query: str(q.q ?? q.query, 2000, 1),
       } as never));
     }
-  }
-
-  if (/^\/memories\/search$/.test(path)) {
-    const p = parseSearch(method === "GET" ? q : await readJson(req));
-    if ("status" in p) return send(res, p.status, p.body);
-    return send(res, 200, await service.search(p.data));
   }
 
   if (path === "/extract" && method === "POST") {
