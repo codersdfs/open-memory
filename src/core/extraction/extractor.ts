@@ -86,17 +86,41 @@ export class Extractor {
    * Write-side gate. Runs before anything reaches the store, so junk costs
    * nothing downstream - a bad memory is far more expensive than a missing one.
    *
-   * ponytail: three cheap rules. Grow this only when a real junk class shows up
-   * in the store; each new rule is a thing that can wrongly drop a good memory.
+   * ponytail: four cheap rules. Grow this only when a real junk class shows up in
+   * the store; each new rule is a thing that can wrongly drop a good memory. The
+   * interrogative rule above is the second one added for a measured junk class.
    */
   static isWorthKeeping(sentence: string): boolean {
     const s = sentence.trim();
     // A question is a request for an answer, not an answer. Not a memory.
     if (/\?\s*$/.test(s)) return false;
+    // Spoken turns drop the question mark: "how to look at it", "what next to ship
+    // this". Measured against a real store, these scored 0.07-0.21 with the judge
+    // while this regex let them in — the judge is optional and often off (no key),
+    // so the cheap rule has to catch them.
+    //
+    // The exceptions carry more weight than the rule, because two of them are
+    // exactly what the store is for:
+    //   "Do not force push to main"                — a standing order
+    //   "How to deploy the UI: npm run memory:ui"  — a procedure
+    // The pair that makes this hard is "how to <blah>": one is a procedure, the other
+    // a question whose answer is missing. The colon is the tell — a procedure carries
+    // its steps, a question does not.
+    // `may`/`might` are absent on purpose: "May 5 we decided..." is a date.
+    const opensQuestion = /^(what|why|how|where|when|who|which|whose|can|could|should|would|will|do|does|did|is|are|give)\b/i.test(s);
+    const carriesItsAnswer = /^(how|what|where|when|who) to\b/i.test(s) && s.includes(":");
+    const isAnOrder = /^(do not|don't|does not|is not|are not|why not)\b/i.test(s);
+    if (opensQuestion && !carriesItsAnswer && !isAnOrder) return false;
     // An instruction aimed at the agent ("read the file", "run npm test") is
     // task scaffolding that expires in one turn. A fact about how the user
     // wants things phrased survives.
-    if (/^(please\s+)?(read|open|run|build|fix|make|add|remove|delete|create|show|list|explain|try|use|search|find|check|write)\b/i.test(s)) return false;
+    // A leading adverb is still the same shape: "now finish the task" is the same
+    // scaffolding as "finish the task", and it leaked in a real store.
+    if (
+      /^(please|now|then|first|just|ok|okay)?\s*(read|open|run|build|fix|make|add|remove|delete|create|show|list|explain|try|use|search|find|check|write|put|move|rename|update|change|install|deploy|commit|push|pull|merge|revert|stop|start|tag|release|continue|finish|ensure|verify|review|test|implement|refactor|document)\b/i.test(s)
+    ) {
+      return false;
+    }
     // A path or identifier with no spaces: "memoryService.ts:42", "src/api".
     // Code, not context.
     if (!/\s/.test(s) && /[.:/\\]/.test(s)) return false;
