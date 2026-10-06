@@ -9,6 +9,7 @@ test-*.db*
 # local tooling state, not project source
 _asar/
 .codegraph/
+.codebase-memory/
 .pi/
 
 # another project that lives in this folder — not part of ai-memory
