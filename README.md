@@ -18,7 +18,7 @@ A **local-first, namespace-partitioned memory substrate** that stores *Episodic 
 **Requires Node 22+** — `node:sqlite` is still flagged experimental (Node 24 is what this is developed against).
 
 ```bash
-npm i -g ai-memory      # or: npx ai-memory
+npm i -g open-memory    # the package; the command is still `ai-memory`
 ai-memory db info       # where the store lives, and why
 ai-memory save "user prefers dark mode" --type semantic
 ai-memory search "dark mode" --explain

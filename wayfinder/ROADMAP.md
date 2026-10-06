@@ -33,6 +33,10 @@ demo second.
 **Acceptance:** `tests/retrieval.test.ts` — the four weights sum to the final
 score; `?explain=1` does not change ranking; the default response is unchanged.
 
+**Done (2026-09-05):** `?explain=1` / `--explain` returns the weighted terms behind
+every hit. Off by default — four extra numbers per hit is real payload on a
+response whose whole point is a token budget. 157 tests.
+
 **Cost:** ~1 file in `src/core/retrieval/`, ~40 lines of UI. No store change.
 
 **Do this first.** It is the cheapest item here and it makes the existing
@@ -61,6 +65,16 @@ memory eventually falls below a repeatedly-retrieved low-importance one.
 also writes? Proposed split — `importance` (write time, judge's view) vs
 `strength` (use time, reinforcement's view), retrieval weighting on `strength`.
 Decide before implementing.
+
+**Done (2026-09-05):** shipped as `strength` + `last_used_at` columns with an
+automatic backfill (`strength = importance`) — the split the Open note below
+proposed, so ranking reads `strength` and the judge keeps `importance`. Decay now
+measures age from `COALESCE(last_used_at, created_at)`, so a retrieved memory's
+clock resets. Reinforcement happens in SQL (`MIN(0.95, strength + 0.02)`), not in
+JS, so it is not a read-modify-write race. Only memories that made it into the
+token budget reinforce — the ones actually handed to a model are the ones that
+proved useful. 157 tests.
+
 
 ## R3 — Redundancy-aware eviction
 

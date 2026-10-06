@@ -1,12 +1,15 @@
 {
-  "name": "ai-memory",
+  "name": "open-memory",
   "version": "0.3.0",
   "description": "Local-first memory for pi agents: SQLite + hybrid retrieval + hard token budget. One process, no UI framework.",
   "license": "MIT",
   "keywords": ["memory", "agents", "rag", "sqlite", "mcp", "vector-search", "local-first"],
   "engines": { "node": ">=22.5.0" },
   "type": "module",
-  "bin": { "ai-memory": "dist/src/cli/index.js" },
+  "bin": {
+    "open-memory": "dist/src/cli/index.js",
+    "ai-memory": "dist/src/cli/index.js"
+  },
   "files": ["dist/src", "dist/scripts", "src/ui", "README.md", "CONTEXT.md", "LICENSE", "docs", ".env.example"],
   "scripts": {
     "dev": "tsx watch src/api/server.ts",
