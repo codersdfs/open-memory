@@ -18,6 +18,8 @@ export class InMemoryVectorStore implements VectorStore {
       text: input.text,
       embedding,
       importance: input.importance ?? 0.5,
+      strength: input.strength ?? input.importance ?? 0.5,
+      lastUsedAt: null,
       source: input.source,
       tags: input.tags,
       supersedesId: input.supersedesId ?? null,
@@ -115,11 +117,28 @@ export class InMemoryVectorStore implements VectorStore {
     return scored.slice(0, opts.limit);
   }
 
+  /** R2. Mirror of the SQL: +0.02, capped, and the use clock reset. */
+  async reinforce(ids: string[]): Promise<number> {
+    const now = Date.now();
+    let n = 0;
+    for (const id of new Set(ids)) {
+      const m = this.map.get(id);
+      if (!m) continue;
+      m.strength = Math.min(0.95, m.strength + 0.02);
+      m.lastUsedAt = now;
+      m.updatedAt = now;
+      n++;
+    }
+    return n;
+  }
+
   async prune(opts: { olderThanMs: number; maxImportance: number; type?: string }): Promise<number> {
     const cutoff = Date.now() - opts.olderThanMs;
     let n = 0;
     for (const m of this.map.values()) {
-      if (m.createdAt < cutoff && m.importance <= opts.maxImportance && m.isDeleted === 0) {
+      // Same rule as the SQL store: clock resets on use, and strength (not the
+      // judge's importance) decides.
+      if ((m.lastUsedAt ?? m.createdAt) < cutoff && m.strength <= opts.maxImportance && m.isDeleted === 0) {
         if (opts.type && m.type !== opts.type) continue;
         m.isDeleted = 1;
         m.updatedAt = Date.now();

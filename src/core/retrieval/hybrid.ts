@@ -1,6 +1,6 @@
 import type { EmbeddingProvider } from "../embedding/provider.js";
 import type { VectorStore } from "../store/interface.js";
-import type { Memory, SearchOptions, SearchResult, SearchResultItem } from "../types.js";
+import type { Memory, ScoreBreakdown, SearchOptions, SearchResult, SearchResultItem } from "../types.js";
 import { bm25Score } from "./bm25.js";
 import { mmr } from "./mmr.js";
 import { countTokens, budgetEnforce } from "./tokens.js";
@@ -15,7 +15,7 @@ import { LEGACY_NAMESPACE } from "../scope.js";
 const VECTOR_FLOOR = 0.95;
 
 export interface RetrievalConfig {
-  weights?: { vector: number; bm25: number; recency: number; importance: number };
+  weights?: { vector: number; bm25: number; recency: number; strength: number };
   recencyHalfLifeDays?: number;
   mmrLambda?: number;
 }
@@ -27,10 +27,11 @@ type Scored = {
   bm25Score: number;
   recencyScore: number;
   score: number;
+  breakdown: ScoreBreakdown;
 };
 
 export class HybridRetriever {
-  private weights: { vector: number; bm25: number; recency: number; importance: number };
+  private weights: { vector: number; bm25: number; recency: number; strength: number };
   private halfLifeDays: number;
   private mmrLambda: number;
   constructor(
@@ -43,7 +44,10 @@ export class HybridRetriever {
       vector: Number.isFinite(vectorWeight) ? vectorWeight : 0,
       bm25: 0.6,
       recency: 0.25,
-      importance: 0.15
+      // Reads `strength`, which starts at the judge's importance and grows with
+      // use (R2). The field name is the contract: this term must not be fed the
+      // write-time number, or reinforcement would have no effect on ranking.
+      strength: 0.15
     };
     this.halfLifeDays = config.recencyHalfLifeDays ?? 30;
     this.mmrLambda = config.mmrLambda ?? 0.6;
@@ -82,12 +86,24 @@ export class HybridRetriever {
       const b = bm25Score(opts.query, memory.text);
       const ageDays = (now - memory.createdAt) / (1000 * 60 * 60 * 24);
       const recencyScore = Math.exp(-ageDays / this.halfLifeDays);
-      const importanceScore = memory.importance;
+      const strengthScore = memory.strength;
       const w = this.weights;
       const pinBoost = memory.pin ? 0.3 : 0;
-      const score =
-        w.vector * vectorScore + w.bm25 * b + w.recency * recencyScore + w.importance * importanceScore + pinBoost;
-      return { memory, vectorScore, bm25Score: b, recencyScore, score };
+      const weighted = {
+        vector: w.vector * vectorScore,
+        bm25: w.bm25 * b,
+        recency: w.recency * recencyScore,
+        strength: w.strength * strengthScore
+      };
+      const score = weighted.vector + weighted.bm25 + weighted.recency + weighted.strength + pinBoost;
+      return {
+        memory,
+        vectorScore,
+        bm25Score: b,
+        recencyScore,
+        score,
+        breakdown: { vector: vectorScore, bm25: b, recency: recencyScore, strength: strengthScore, pinBoost, weighted, final: score }
+      };
     });
 
     // A memory with no lexical overlap and no vector signal is not a match, it is
@@ -180,6 +196,7 @@ export class HybridRetriever {
         if (!s) return null;
         return {
           ...s.memory,
+          ...(opts.explain ? { explain: s.breakdown } : {}),
           score: s.score,
           vectorScore: s.vectorScore,
           bm25Score: s.bm25Score,
@@ -188,6 +205,18 @@ export class HybridRetriever {
         } satisfies SearchResultItem;
       })
       .filter((m): m is SearchResultItem => m !== null);
+
+    // R2. Reinforce what survived the budget, not what merely scored: the
+    // memories that got injected into a prompt are the ones with evidence of
+    // being useful. Best-effort — a store that cannot record the reinforcement
+    // must still return the answer.
+    if (memories.length > 0) {
+      try {
+        await this.store.reinforce(memories.map((m) => m.id));
+      } catch (e) {
+        console.warn("[retrieval] reinforce skipped:", (e as Error).message);
+      }
+    }
 
     return {
       memories,

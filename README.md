@@ -5,6 +5,8 @@ A **local-first, namespace-partitioned memory substrate** that stores *Episodic 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
 - **Smart Search**: 2-stage — `0.6*vector + 0.2*BM25 + 0.15*recency + 0.05*importance` → MMR diversify → threshold `0.72` (empty allowed) → **hard budget** (default 800 tokens) + overflow summarization (ADR-0002). Deterministic, zero extra LLM call.
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
+- **Explainable recall** (R1): `?explain=1` (or `--explain`) returns where each score came from — `bm25 +0.37 · recency +0.24 · strength +0.12 = 0.737`. Off by default, because four extra numbers per hit is real payload on a response whose point is a token budget. Everyone returns results; this returns *why*.
+- **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95) and its clock resets, so decay reads age as time-since-last-use. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
 - **Inspector UI**: plain `index.html` + `app.js` served by the same `node:http` process as the API. No bundler, no framework. List/filter by type, playground with `k / threshold / budget` sliders, budget preview, soft-delete, supersede chain.
 - **Wiki graph** (`/graph.html`): Obsidian-style node graph over your own markdown. Edges come from `[[wikilinks]]` written into page frontmatter at ingest — nothing is inferred, so the graph never lies about intent. Drag nodes; positions persist to `wiki/.positions.json`. Dangling links render as hollow nodes — hiding them would hide the maintenance debt.
 - **CLI** (`ai-memory`): every subcommand works non-interactively, because hooks call it. Uses the daemon when one answers, otherwise opens the store in-process.
@@ -43,7 +45,7 @@ Whole documents are not stored. One 1.5k-char blob is a file, not a memory: it m
 | `GET` | `/memories/:id` | |
 | `DELETE` | `/memories/:id` | soft-delete |
 | `POST` | `/memories/:id/supersede` | `{namespace,type,text,...}` creates new + soft-deletes old via `supersedesId` |
-| `POST` | `/memories/search` | `{query, namespace, k?, budgetTokens?, threshold?, type?}` |
+| `POST` | `/memories/search` | `{query, namespace, k?, budgetTokens?, threshold?, type?, explain?}` |
 | `POST` | `/extract` | `{text, namespace}` — heuristic (no LLM) or LLM if `ENABLE_EXTRACTOR=true` + `OPENAI_API_KEY` |
 | `POST` | `/decay` | prunes `episodic >90d && importance<=0.3` + `working >7d` |
 | `GET` | `/graph` | wiki node graph: `{nodes, edges}` |
@@ -102,6 +104,15 @@ One provider: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero do
 **Be clear about what this is:** a hash embedder is a deterministic bucket of tokens, not a semantic model. It matches on shared vocabulary, not on meaning. It is the right default because it is instant, offline, free and needs no key — but if you expect "vector search" to mean "finds things that mean the same thing", that is the assumption to check. `.env.example` documents NVIDIA NIM and OpenAI keys; wiring one in is an interface, not a rewrite, but the `dim` change requires `rm memory.db*`.
 
 It is the only provider that exists, on purpose: a hosted embedder means an API key, a network hop on every save, and a `dim` migration the moment the model changes. Add a real one only when recall measurably misses.
+
+## Retrieval
+
+Score = \`0.6*bm25 + 0.25*recency + 0.15*strength\` (\`vector\` weight 0 by default — see below), plus \`+0.3\` for a pinned memory. Relevance gates first: a memory with no lexical overlap and no vector signal is not a match, it is just a recent important one, and recency+strength alone would clear the threshold on every row.
+
+**\`strength\` vs \`importance\`.** \`importance\` is what the write-time judge thought (see "Smart write gate"). \`strength\` is what use has proven — it starts equal to \`importance\` and grows on retrieval. They are separate fields on purpose: if reinforcement wrote \`importance\`, then "the model thought this mattered" and "this keeps answering questions" would compete for one number and neither would be true. Ranking reads \`strength\`; the judge owns \`importance\`; decay prunes on \`strength\`.
+
+**\`MEMORY_VECTOR_WEIGHT\`** defaults to \`0\`. The hash embedder returns ~0.9 cosine to everything, so the vector term is noise until a real embedder is wired in — with the hash provider, lexical overlap is the only relevance signal that exists.
+
 ## Smart write gate
 
 Extraction is two stages, cheapest first.
@@ -147,6 +158,7 @@ src/core/
   retrieval/            # hybrid, bm25, mmr, tokens/budget
   extraction/           # heuristic + optional LLM extractor
   lifecycle/ decay.ts
+  judgment/             # jev write gate (optional, opt-in)
   graph.ts              # wiki graph: parsePage, buildGraph, suggestPages
   memoryService.ts
 src/api/ server.ts (node:http, routes inline, serves UI), tool.ts
@@ -154,7 +166,7 @@ src/adapters/           # agent config writers (claude, codex, pi, dsh)
 src/mcp/ tools.ts       # memory_* MCP tools
 src/cli/                # the ai-memory command
 src/ui/ index.html, app.js, graph.html, graph.js, style.css   # static, no build step
-tests/                  # 146 tests
+tests/                  # 155 tests
 scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts
 memory.db               # created on first run, gitignored
 ```
@@ -177,7 +189,7 @@ memory.db               # created on first run
 
 ```bash
 ```bash
-npm test            # vitest — 146 tests, 17 files
+npm test            # vitest — 155 tests, 18 files
 npm run lint        # tsc --noEmit
 ```
 npm run lint        # tsc --noEmit

@@ -103,6 +103,14 @@ function renderMemories(result: SearchResult, ctx: Ctx): void {
     const score = typeof m.score === "number" ? m.score.toFixed(3) : "-";
     ctx.out(`[${m.id}] (${m.type}/${m.namespace}, score ${score})`);
     ctx.out(`  ${m.text.replace(/\s+/g, " ").trim()}`);
+    if (m.explain) {
+      const e = m.explain;
+      const parts = ["vector", "bm25", "recency", "strength"].map(
+        (k) => `${k} ${e.weighted[k as keyof typeof e.weighted].toFixed(3)}`
+      );
+      if (e.pinBoost) parts.push(`pin ${e.pinBoost.toFixed(3)}`);
+      ctx.out(`  why: ${parts.join(" + ")} = ${e.final.toFixed(3)}`);
+    }
   }
   ctx.out(`→ ${result.memories.length} memories, ${result.tokensUsed} tokens${result.truncated ? " (truncated)" : ""}`);
 }
@@ -168,11 +176,13 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
   const budgetTokens = flagNumber(a, "budget") ?? 800;
   const threshold = flagNumber(a, "threshold") ?? 0.35;
   const type = flagString(a, "type") as MemoryType | undefined;
+  // R1: opt-in, because the default answer is meant to be read, not debugged.
+  const explain = flagBool(a, "explain");
 
   if (await r.useDaemon()) {
     const res = await r.client().get<SearchResult>(
       "/memories/search" +
-        MemoryClient.query({ query, namespace, agent, scope, k, budgetTokens, threshold, type, all: flagBool(a, "all") })
+        MemoryClient.query({ query, namespace, agent, scope, k, budgetTokens, threshold, type, explain, all: flagBool(a, "all") })
     );
     if (!res.ok) {
       ctx.err(`search: ${res.error}`);
@@ -192,7 +202,8 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
     type,
     k,
     budgetTokens,
-    threshold
+    threshold,
+    explain
   });
   if (ctx.json) ctx.out(JSON.stringify({ ...result, memories: result.memories.map(stripEmbedding) }, null, 2));
   else renderMemories(result, ctx);

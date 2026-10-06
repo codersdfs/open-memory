@@ -112,7 +112,7 @@ async function doSearch(){
     els.budgetLabel.textContent = `${r.tokensUsed} / ${body.budgetTokens} tokens · ${r.memories.length} memories · score threshold ${body.threshold}${r.truncated?" · truncated (summary added)":""}`;
     els.results.innerHTML = r.memories.length ? r.memories.map(m => `
       <div class="bg-zinc-950 border border-zinc-800 rounded p-3">
-        <div class="flex justify-between text-xs text-zinc-500"><span class="px-1.5 py-0.5 rounded ${badge(m.type)}">${m.type}</span><span>score ${m.score.toFixed(3)} · vec ${m.vectorScore.toFixed(2)} · bm25 ${m.bm25Score.toFixed(2)} · recency ${m.recencyScore.toFixed(2)} · ${m.tokens} tok</span></div>
+        <div class="flex justify-between text-xs text-zinc-500"><span class="px-1.5 py-0.5 rounded ${badge(m.type)}">${m.type}</span><span>score ${m.score.toFixed(3)} · ${m.explain ? ["vec", "bm25", "recency", "strength"].map((k) => `${k} +${m.explain.weighted[k].toFixed(2)}`).join(" · ") + (m.explain.pinBoost ? " · pin +0.30" : "") + " · " : ""}${m.tokens} tok</span></div>
         <p class="mt-2 text-sm">${esc(m.text)}</p>
         <div class="text-xs text-zinc-600 mt-1">${m.id.slice(0,8)} · imp ${m.importance}</div>
       </div>`).join("") : `<p class="text-zinc-500">no memories above threshold ${body.threshold} — try lowering threshold (prevents context burn)</p>`;

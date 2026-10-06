@@ -62,6 +62,9 @@ function parseSearch(q: Record<string, unknown>) {
       status: enumOf(q.status, STATUSES),
       includeArchived: boolish(q.includeArchived),
       includeDraft: boolish(q.includeDraft),
+      // Opt-in: four extra numbers per hit is real payload on a response whose
+      // whole point is a token budget.
+      explain: boolish(q.explain) === true,
     },
   };
 }

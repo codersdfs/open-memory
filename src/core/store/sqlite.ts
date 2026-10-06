@@ -56,6 +56,8 @@ export class SqliteVectorStore implements VectorStore {
         text TEXT NOT NULL,
         embedding TEXT NOT NULL,
         importance REAL NOT NULL DEFAULT 0.5,
+        strength REAL NOT NULL DEFAULT 0.5,
+        last_used_at INTEGER,
         source TEXT,
         tags TEXT,
         supersedes_id TEXT,
@@ -77,6 +79,15 @@ export class SqliteVectorStore implements VectorStore {
     }
     if (!cols.has("pin")) {
       this.db.exec(`ALTER TABLE memories ADD COLUMN pin INTEGER NOT NULL DEFAULT 0 CHECK(pin IN (0,1))`);
+    }
+    // R2. Backfill from importance: a memory that already earned its score keeps
+    // it, and every existing row starts with the clock it was created with.
+    if (!cols.has("strength")) {
+      this.db.exec(`ALTER TABLE memories ADD COLUMN strength REAL NOT NULL DEFAULT 0.5`);
+      this.db.exec(`UPDATE memories SET strength = importance`);
+    }
+    if (!cols.has("last_used_at")) {
+      this.db.exec(`ALTER TABLE memories ADD COLUMN last_used_at INTEGER`);
     }
     // 3. create indexes (after columns guaranteed to exist)
     this.db.exec(`
@@ -128,6 +139,8 @@ export class SqliteVectorStore implements VectorStore {
       text: input.text,
       embedding,
       importance: input.importance ?? 0.5,
+      strength: input.strength ?? input.importance ?? 0.5,
+      lastUsedAt: null,
       source: input.source,
       tags: input.tags,
       supersedesId: input.supersedesId ?? null,
@@ -139,8 +152,8 @@ export class SqliteVectorStore implements VectorStore {
       updatedAt: now
     };
     const stmt = this.db.prepare(
-      `INSERT INTO memories (id, namespace, type, text, embedding, importance, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (id, namespace, type, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     await this.retryWrite(() => stmt.run(
       mem.id,
@@ -149,6 +162,8 @@ export class SqliteVectorStore implements VectorStore {
       mem.text,
       JSON.stringify(mem.embedding),
       mem.importance,
+      mem.strength,
+      mem.lastUsedAt,
       mem.source ?? null,
       mem.tags ? JSON.stringify(mem.tags) : null,
       mem.supersedesId ?? null,
@@ -283,10 +298,36 @@ export class SqliteVectorStore implements VectorStore {
     return scored.slice(0, opts.limit);
   }
 
+  /**
+   * R2. One statement, no read-modify-write: two agents reinforcing the same
+   * memory at once both land, because SQLite does the arithmetic.
+   */
+  async reinforce(ids: string[]): Promise<number> {
+    this.ensure();
+    const unique = [...new Set(ids)];
+    if (unique.length === 0) return 0;
+    const now = Date.now();
+    const stmt = this.db.prepare(
+      `UPDATE memories SET strength = MIN(0.95, strength + 0.02), last_used_at = ?, updated_at = ?
+       WHERE id = ? AND is_deleted = 0`
+    );
+    let n = 0;
+    for (const id of unique) {
+      const res = await this.retryWrite(() => stmt.run(now, now, id));
+      n += (res as unknown as { changes: number }).changes ?? 0;
+    }
+    return n;
+  }
+
   async prune(opts: { olderThanMs: number; maxImportance: number; type?: string }): Promise<number> {
     this.ensure();
     const cutoff = Date.now() - opts.olderThanMs;
-    const where: string[] = ["created_at < ?", "importance <= ?", "is_deleted = 0"];
+    // Age is time-since-last-use where there has been a use, else since creation:
+    // recalling an old memory is evidence it is not stale, and it resets the
+    // clock without needing a second decay formula. Strength, not importance, is
+    // what reinforcement moves — the judge's write-time number is not the one
+    // that should decide eviction.
+    const where: string[] = ["COALESCE(last_used_at, created_at) < ?", "strength <= ?", "is_deleted = 0"];
     const params: (string | number)[] = [cutoff, opts.maxImportance];
     if (opts.type) {
       where.push("type = ?");
@@ -305,6 +346,8 @@ type Row = {
   text: string;
   embedding: string;
   importance: number;
+  strength: number | null;
+  last_used_at: number | null;
   source: string | null;
   tags: string | null;
   supersedes_id: string | null;
@@ -324,6 +367,9 @@ function memoryFromRow(r: Row): Memory {
     text: r.text,
     embedding: JSON.parse(r.embedding),
     importance: r.importance,
+    // A column added later can be null in a DB migrated by an older build.
+    strength: r.strength ?? r.importance,
+    lastUsedAt: r.last_used_at ?? null,
     source: r.source ?? undefined,
     tags: r.tags ? JSON.parse(r.tags) : undefined,
     supersedesId: r.supersedes_id,

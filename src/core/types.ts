@@ -26,7 +26,16 @@ export interface Memory {
   type: MemoryType;
   text: string;
   embedding: number[];
-  importance: number; // 0-1
+  importance: number; // 0-1 — what the write-time judge thought
+  /**
+   * 0-1 — what use has proven. Starts equal to `importance` and grows on
+   * retrieval (R2). Retrieval weights this, decay prunes on it, and the judge
+   * keeps owning `importance` — otherwise "the model thought this mattered" and
+   * "this keeps answering questions" compete for one number and neither is true.
+   */
+  strength: number;
+  /** Epoch ms of the last above-threshold retrieval. null = never used. */
+  lastUsedAt: number | null;
   source?: string;
   tags?: string[];
   supersedesId?: string | null;
@@ -43,6 +52,8 @@ export interface MemoryInput {
   type: MemoryType;
   text: string;
   importance?: number;
+  /** Defaults to `importance` when omitted. */
+  strength?: number;
   source?: string;
   tags?: string[];
   supersedesId?: string | null;
@@ -77,14 +88,32 @@ export interface SearchOptions {
   status?: MemoryStatus;
   includeArchived?: boolean;
   includeDraft?: boolean;
+  /** Attach a per-term score breakdown to every returned memory (R1). */
+  explain?: boolean;
 }
 
 export interface SearchResultItem extends Memory {
+  /** Present only when the caller asked for `explain` (R1). */
+  explain?: ScoreBreakdown;
   score: number;
   vectorScore: number;
   bm25Score: number;
   recencyScore: number;
   tokens: number;
+}
+
+/**
+ * Where a result's score came from (R1). Four extra numbers per hit is real
+ * payload on a response whose whole point is a token budget, so this is opt-in.
+ */
+export interface ScoreBreakdown {
+  vector: number;
+  bm25: number;
+  recency: number;
+  strength: number;
+  pinBoost: number;
+  weighted: { vector: number; bm25: number; recency: number; strength: number };
+  final: number;
 }
 
 export interface SearchResult {

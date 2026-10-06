@@ -31,6 +31,12 @@ export interface VectorStore {
     includeArchived?: boolean;
     includeDraft?: boolean;
   }): Promise<{ memory: Memory; vectorScore: number }[]>;
+  /**
+   * Retrieval reinforcement (R2): every id that came back above threshold gets a
+   * little stronger and its use clock reset. One UPDATE, no read-modify-write
+   * race between the agents sharing this store.
+   */
+  reinforce(ids: string[]): Promise<number>;
   prune(opts: { olderThanMs: number; maxImportance: number; type?: string }): Promise<number>;
   // for budget/BM25 we need raw access; list already covers
 }
