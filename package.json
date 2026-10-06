@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "tsx watch src/api/server.ts",
     "start": "tsx src/api/server.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-ui.mjs",
     "test": "vitest run",
     "seed": "tsx scripts/seed.ts",
     "wiki:ingest": "tsx scripts/wiki-ingest.ts",

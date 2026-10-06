@@ -33,3 +33,6 @@ jobs:
           AI_MEMORY_HOME=/tmp/inst-store /tmp/inst/ai-memory db info
           AI_MEMORY_HOME=/tmp/inst-store /tmp/inst/ai-memory save "ci smoke" --type semantic
           AI_MEMORY_HOME=/tmp/inst-store /tmp/inst/ai-memory search "ci smoke" --threshold 0 --explain
+          # The UI is served, not imported, so tsc does not carry it into dist.
+          # Without the copy-ui step this 404s only after someone installs it.
+          test -f /tmp/inst/node_modules/ai-memory/dist/src/ui/graph.html
