@@ -64,7 +64,7 @@ describe("ai-memory CLI", () => {
     expect(search.code).toBe(0);
     const result = JSON.parse(search.stdout) as { memories: { id: string; text: string }[]; scopes: string[]; tokensUsed: number };
     expect(result.memories.map((m) => m.id)).toContain(saved.id);
-    expect(result.scopes).toEqual(["codex:cli-test", "shared:cli-test"]);
+    expect(result.scopes).toEqual(["codex:cli-test", "shared:cli-test", "default:default"]);
     expect(typeof result.tokensUsed).toBe("number");
   });
 
@@ -113,7 +113,7 @@ describe("ai-memory CLI", () => {
 
     const stats = run(["stats", "--json"], db);
     const s = JSON.parse(stats.stdout) as { scopes: string[]; perScope: Record<string, { total: number }> };
-    expect(s.scopes).toEqual(["codex:cli-test", "shared:cli-test"]);
+    expect(s.scopes).toEqual(["codex:cli-test", "shared:cli-test", "default:default"]);
     expect(s.perScope["shared:cli-test"]!.total).toBeGreaterThan(0);
   });
 

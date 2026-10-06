@@ -64,9 +64,11 @@ describe("scope resolution", () => {
     expect(keys).toEqual(["legacy:1"]);
   });
 
-  it("private search reads own layer first, then shared", () => {
+  it("private search reads own layer, the shared layer, then the legacy partition", () => {
     const keys = resolveScopeKeys({ agent: "codex", user: "alice" });
-    expect(keys).toEqual(["codex:alice", "shared:alice"]);
+    // The legacy partition rides along on every read so that memories written
+    // before layering existed stay reachable. See withLegacy in scope.ts.
+    expect(keys).toEqual(["codex:alice", "shared:alice", LEGACY_NAMESPACE]);
   });
 
   it("explicit shared scope reads only the shared layer", () => {
@@ -83,7 +85,7 @@ describe("scope resolution", () => {
   });
 
   it("the shared agent does not double-read", () => {
-    expect(resolveScopeKeys({ agent: SHARED_AGENT, user: "alice" })).toEqual(["shared:alice"]);
+    expect(resolveScopeKeys({ agent: SHARED_AGENT, user: "alice" })).toEqual(["shared:alice", LEGACY_NAMESPACE]);
   });
 
   it("agent comes from env before detection, explicit before env", () => {
@@ -103,11 +105,14 @@ describe("scope resolution", () => {
   });
 
   it("unknown but named agent ids still layer with shared", () => {
-    expect(resolveScopeKeys({ agent: "cursor", user: "alice" })).toEqual(["cursor:alice", "shared:alice"]);
+    expect(resolveScopeKeys({ agent: "cursor", user: "alice" })).toEqual(["cursor:alice", "shared:alice", LEGACY_NAMESPACE]);
   });
 
-  it("no agent identity means no surprise fan-out", () => {
-    expect(resolveScopeKeys({ user: "alice" })).toEqual(["default:alice"]);
+  it("no agent identity means no surprise layer fan-out", () => {
+    // Still one layer — but it never loses the partition its own pre-layering
+    // memories went to (LEGACY_NAMESPACE is what resolveWriteKey wrote before
+    // ADR-0007 existed for a caller that had no user segment).
+    expect(resolveScopeKeys({ user: "alice" })).toEqual(["default:alice", LEGACY_NAMESPACE]);
   });
 });
 
@@ -154,9 +159,9 @@ describe("request scope (query params / CLI flags / MCP args)", () => {
     expect(r.scopes).toEqual(["private", "shared"]);
   });
 
-  it("a bare request without an agent stays single-partition (legacy callers)", () => {
+  it("a bare request without an agent stays in the legacy family, no layer fan-out", () => {
     const r = resolveRequestScope({});
-    expect(r.namespaces).toHaveLength(1);
+    expect(r.namespaces).toHaveLength(2);
     expect(r.namespaces[0]).toMatch(/^default:/);
   });
 });

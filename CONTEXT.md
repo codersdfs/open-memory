@@ -20,6 +20,8 @@ _Avoid_: instruction, tool
 _Avoid_: cache, scratchpad
 
 **Namespace**: The isolation key `{agentId, userId}` that partitions all memories.
+
+**Read fan-out**: A read covers the caller's own partition, the `shared` partition, and `default:default` — where memories written before scoping existed live. Leaving the legacy partition out does not narrow a search, it empties it: an agent marker in the environment made a bare `ai-memory search` look only at `pi:<user>` (0 rows) while every row the user had sat in `default:default`. Writes still land in exactly one partition.
 _Avoid_: tenant, workspace
 
 **Token Burning**: Cost and latency incurred by injecting too many tokens of memory into a prompt.

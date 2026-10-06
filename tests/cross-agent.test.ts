@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
-import { resetScopeCache } from "../src/core/scope.js";
+import { LEGACY_NAMESPACE, resetScopeCache } from "../src/core/scope.js";
 
 /**
  * Cross-agent recall (ADR-0007).
@@ -50,7 +50,7 @@ describe("shared layer", () => {
       expect(r.memories.length, `${agent} should recall the shared fact`).toBeGreaterThan(0);
       expect(r.memories[0]!.text).toContain("staging deploy key");
       expect(r.memories[0]!.namespace).toBe(`shared:${USER}`);
-      expect(r.scopes).toEqual([`${agent}:${USER}`, `shared:${USER}`]);
+      expect(r.scopes).toEqual([`${agent}:${USER}`, `shared:${USER}`, LEGACY_NAMESPACE]);
     }
   });
 
@@ -145,6 +145,22 @@ describe("merge behaviour", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  // The bug this guards: every memory written before ADR-0007 lives in
+  // `default:default`, and an agent marker in the environment made a bare CLI call
+  // resolve to `pi:<user>` alone — so `ai-memory search "..."` printed "no
+  // memories matched" while all 46 rows sat in the legacy partition.
+  it("an agent-scoped search still finds memories written before layering existed", async () => {
+    await svc.save({
+      namespace: LEGACY_NAMESPACE,
+      type: "semantic",
+      text: "user is a TypeScript engineer who hates boilerplate",
+      importance: 0.7
+    });
+    const r = await svc.search({ query: "TypeScript engineer", agent: "pi", threshold: 0.2 });
+    expect(r.memories.map((m) => m.text)).toContain("user is a TypeScript engineer who hates boilerplate");
+    expect(r.scopes).toContain(LEGACY_NAMESPACE);
+  });
+
   it("a bare search asks for one legacy partition, not a two-layer fan-out", async () => {
     // No partition and no agent → the pre-ADR-0007 default bucket, so a caller
     // that never learned about scopes still gets exactly its old behaviour.
@@ -153,7 +169,8 @@ describe("merge behaviour", () => {
     // `agent: "default"` is the explicit form of "I have no agent identity":
     // detection would otherwise pick up whatever harness is running the tests.
     const r = await svc.search({ query: "anything at all", agent: "default", threshold: 0.2 });
-    expect(r.scopes).toHaveLength(1);
+    // Two partitions, but both are legacy: no private/shared fan-out happened.
+    expect(r.scopes).toHaveLength(2);
     expect(r.scopes![0]).toMatch(/^default:/);
 
     const legacy = await svc.search({ query: "anything at all", namespace: "default:default", threshold: 0.2 });

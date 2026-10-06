@@ -137,8 +137,26 @@ export function resolveScopeKeys(input: ScopeKeysInput = {}): string[] {
   // A caller with no agent identity is a legacy caller: it gets exactly the one
   // partition it always got, never a surprise two-layer fan-out. Layering is
   // opt-in by naming the agent (flag, `AI_MEMORY_AGENT`, or a detection marker).
-  if (agent === "default" || agent === SHARED_AGENT) return [own];
-  return [own, shared];
+  if (agent === "default" || agent === SHARED_AGENT) return withLegacy([own]);
+  return withLegacy([own, shared]);
+}
+
+/**
+ * Every read also covers the legacy partition, because that is where the memories
+ * written before layering existed actually are.
+ *
+ * Omitting it is not a narrower search, it is an empty one: with an agent marker in
+ * the environment the CLI resolved to `pi:frank` (0 rows) while all 46 of this
+ * user's rows sat in `default:default`, so the documented `ai-memory search "..."`
+ * answered "no memories matched" for data that was plainly there. A read must never
+ * lose sight of the partition the same user has been writing to all along.
+ *
+ * Writes are unaffected: `resolveWriteKey` passes `includeShared: false` and still
+ * lands in exactly one partition. An explicit `namespace` or `scope` is a caller
+ * stating its intent, so it still short-circuits above this.
+ */
+function withLegacy(keys: string[]): string[] {
+  return keys.includes(LEGACY_NAMESPACE) ? keys : [...keys, LEGACY_NAMESPACE];
 }
 
 /** The single partition a write lands in. */
