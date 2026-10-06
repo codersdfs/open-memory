@@ -184,6 +184,24 @@ export class SqliteVectorStore implements VectorStore {
     return row ? memoryFromRow(row) : null;
   }
 
+  async storedDim(): Promise<number | null> {
+    this.ensure();
+    // ponytail: one row, not a scan. A store written by a single provider has one
+    // dim, and this catches exactly the case the guard exists for (a swap). A
+    // half-migrated store reports whichever row lands first; add a MIN/MAX sweep
+    // here if partial re-embedding is ever implemented.
+    const row = this.db.prepare(`SELECT embedding FROM memories WHERE embedding IS NOT NULL LIMIT 1`).get() as
+      | { embedding: string }
+      | undefined;
+    if (!row) return null;
+    try {
+      const vec = JSON.parse(row.embedding) as number[];
+      return Array.isArray(vec) ? vec.length : null;
+    } catch {
+      return null;
+    }
+  }
+
   async list(opts: {
     namespace: string;
     type?: string;

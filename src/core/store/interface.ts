@@ -2,6 +2,15 @@ import type { Memory, MemoryInput } from "../types.js";
 
 export interface VectorStore {
   init(): Promise<void>;
+
+  /**
+   * Dimension of the vectors already in this store, or null when it is empty.
+   *
+   * Vector dimensions are load-bearing (the column holds raw JSON), so a provider
+   * swap has to be caught before the first search rather than returning cosine
+   * noise. `null` means "nothing written yet — any provider is fine".
+   */
+  storedDim(): Promise<number | null>;
   close(): void;
   insert(input: MemoryInput, embedding: number[]): Promise<Memory>;
   getById(id: string): Promise<Memory | null>;

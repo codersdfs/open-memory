@@ -1,9 +1,9 @@
-# AI Memory — local-first memory for pi agents
+# Open Memory — local-first memory for pi agents
 
 A **local-first, namespace-partitioned memory substrate** that stores *Episodic / Semantic / Procedural / Working* memories as vectors and retrieves them with **smart search + hard token budget** to prevent *Token Burning* (cost) and *Context Burning* (irrelevant dilution).
 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
-- **Smart Search**: 2-stage — `0.6*vector + 0.2*BM25 + 0.15*recency + 0.05*importance` → MMR diversify → threshold `0.72` (empty allowed) → **hard budget** (default 800 tokens) + overflow summarization (ADR-0002). Deterministic, zero extra LLM call.
+- **Smart Search**: 2-stage — `0.6*BM25 + 0.25*recency + 0.15*strength` (`vector` weight is `0` by default; see Embeddings) → MMR diversify → threshold `0.72` (empty allowed) → **hard budget** (default 800 tokens) + overflow summarization (ADR-0002). Deterministic, zero extra LLM call.
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
 - **Explainable recall** (R1): `?explain=1` (or `--explain`) returns where each score came from — `bm25 +0.37 · recency +0.24 · strength +0.12 = 0.737`. Off by default, because four extra numbers per hit is real payload on a response whose point is a token budget. Everyone returns results; this returns *why*.
 - **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95) and its clock resets, so decay reads age as time-since-last-use. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
@@ -109,11 +109,30 @@ This is a deliberate divergence, not drift. The agent is answering questions it 
 
 ## Embeddings
 
-One provider: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero download.
+Default: `HashEmbeddingProvider` — 384-d, deterministic, offline, zero download.
 
-**Be clear about what this is:** a hash embedder is a deterministic bucket of tokens, not a semantic model. It matches on shared vocabulary, not on meaning. It is the right default because it is instant, offline, free and needs no key — but if you expect "vector search" to mean "finds things that mean the same thing", that is the assumption to check. `.env.example` documents NVIDIA NIM and OpenAI keys; wiring one in is an interface, not a rewrite, but the `dim` change requires `rm memory.db*`.
+**Be clear about what this is:** a hash embedder is a deterministic bucket of tokens, not a semantic model. It matches on shared vocabulary, not on meaning. It is the right default because it is instant, offline, free and needs no key — but if you expect "vector search" to mean "finds things that mean the same thing", that is the assumption to check.
 
-It is the only provider that exists, on purpose: a hosted embedder means an API key, a network hop on every save, and a `dim` migration the moment the model changes. Add a real one only when recall measurably misses.
+Two real providers ship with it (ADR-0004), both over the same OpenAI-compatible `/embeddings` endpoint:
+
+```bash
+EMBEDDING_PROVIDER=openai  OPENAI_API_KEY=sk-...            # text-embedding-3-small, 1536d
+EMBEDDING_PROVIDER=nim     NVIDIA_API_KEY=nvapi-...         # nvidia/nemotron-3-embed-1b, 2048d
+EMBEDDING_DIM=1024                                          # for any other model
+```
+
+NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` body fields that E5/Nemotron score on; OpenAI rejects those, so they are sent only for NIM.
+
+**The dimension is load-bearing.** The vector column holds raw JSON, so a provider swap without clearing the store makes every search return noise rather than an error. Startup therefore refuses on a mismatch and names both dims:
+
+```
+embedding dim mismatch: /home/you/.ai-memory/memory.db holds 384-dim vectors,
+but the openai embedder produces 1536.
+```
+
+Move the file aside (`mv memory.db memory.db.bak`) to start fresh on the new provider. There is no automatic re-embed command yet — ticket `wayfinder/tickets/011`.
+
+Until a real provider is configured, set `MEMORY_VECTOR_WEIGHT=0.6` to put the vector term back into the score; with the hash embedder it is left at `0` because it returns ~0.9 cosine to everything (see "Retrieval").
 
 ## Retrieval
 
@@ -176,7 +195,7 @@ src/adapters/           # agent config writers (claude, codex, pi, dsh)
 src/mcp/ tools.ts       # memory_* MCP tools
 src/cli/                # the ai-memory command
 src/ui/ index.html, app.js, graph.html, graph.js, style.css   # static, no build step
-tests/                  # 155 tests
+tests/                  # 170 tests
 scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts
 memory.db               # created on first run, gitignored
 ```
@@ -199,7 +218,7 @@ memory.db               # created on first run
 
 ```bash
 ```bash
-npm test            # vitest — 155 tests, 18 files
+npm test            # vitest — 170 tests, 20 files
 npm run lint        # tsc --noEmit
 ```
 npm run lint        # tsc --noEmit

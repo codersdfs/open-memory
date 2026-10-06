@@ -50,6 +50,52 @@ the dim-mismatch cost table + the paraphrase probe result.
 
 ---
 
+## Done (2026-09-05) — implemented; the last item is blocked on a key
+
+**Decided (grilled):** dim mismatch **refuses at startup** and names both dims — not a
+per-row skip (which returns half the results as if they were all of them) and not an
+auto-re-embed (which is a bigger command than this ticket).
+
+**Shipped**
+- `src/core/embedding/openai.ts` — one OpenAI-compatible client. OpenAI and NIM differ
+  only in base URL, model, dimension, and whether the body carries `input_type` /
+  `truncate`, so they are one implementation with two configs. Validates the returned
+  vector length against `EMBEDDING_DIM`.
+- `createEmbeddingProvider()` reads the environment and **throws** on an unknown or
+  under-configured provider instead of falling back to hash. That fallback *was* the
+  bug: `.env.example` documented `EMBEDDING_PROVIDER=openai` and nothing read it, so
+  every install ran hash while the README claimed hybrid retrieval.
+- `VectorStore.storedDim()` + the guard in `MemoryService.init()`.
+- `/health` carries `version`; the CLI ignores a daemon whose version differs from its
+  own and warns once. Measured against a real stale daemon (started 2026-10-02, still
+  listening on 7331): before this, `ai-memory search` talked to it and printed
+  `search: not found`; now it logs `ignoring the running daemon (version unknown, this
+  CLI is 0.3.0)` and answers from the in-process store.
+- `src/version.ts` — walks up to the nearest `package.json` named `open-memory`. A fixed
+  `../../package.json` resolved to `dist/package.json`, which is not shipped, so
+  `ai-memory version` crashed on every installed copy.
+
+**Cost table (the ticket's item 3)**
+
+| Option | Cost | Failure mode |
+|---|---|---|
+| **(a) refuse at startup** — chosen | ~10 lines, no migration | user must move the file aside; recovery is one documented command |
+| (b) `reembed` command | migration + progress + partial-failure recovery | silent half-migrated store if it dies midway |
+| (c) skip mismatched rows | ~5 lines | **worst**: returns a subset as if complete |
+
+**Not done — blocked, not skipped:** the paraphrase probe (item 4). It needs a real
+embedding key and this machine has none (`OPENAI_API_KEY` / `NVIDIA_API_KEY` /
+`NIM_API_KEY` all unset), so there is no measurement of whether the vector term beats
+lexical recall with a real model. Until that number exists, `MEMORY_VECTOR_WEIGHT`
+stays `0` and the README says so. This is the one claim in the project that is still
+unverified.
+
+**Tests:** `tests/embedding.test.ts`, 13 cases — provider selection + refusals, the
+wire body for both providers, dim validation, API error text, and the startup guard
+(mismatch / empty store / matching store). 170 total.
+
+---
+
 ## Why this blocks the release
 
 The published package is now installable (`open-memory@0.3.0`), so the only

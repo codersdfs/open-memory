@@ -70,9 +70,14 @@ export class MemoryClient {
   }
 
   /** Liveness probe used to decide daemon-vs-in-process. Never throws. */
+  /** The daemon's self-report, or null when nothing answers there. */
+  async health(): Promise<{ ok?: boolean; embedding?: string; dim?: number; version?: string } | null> {
+    const r = await this.call<{ ok?: boolean; embedding?: string; dim?: number; version?: string }>("GET", "/health");
+    return r.ok ? r.data : null;
+  }
+
   async healthy(): Promise<boolean> {
-    const r = await this.call<unknown>("GET", "/health");
-    return r.ok;
+    return (await this.health())?.ok === true;
   }
 
   get<T>(path: string): Promise<HttpResult<T>> {

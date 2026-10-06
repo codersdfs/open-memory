@@ -4,6 +4,7 @@ import { MemoryClient, unwrapMemory } from "./http.js";
 import { resolveAgent, resolveRequestScope, resolveWriteKey, resolveUser, type MemoryScope } from "../core/scope.js";
 import { resolveDbPath, resolveHome, legacyDbPath, dbExists } from "../core/dbPath.js";
 import { MemoryService } from "../core/memoryService.js";
+import { appVersion } from "../version.js";
 import type { Memory, MemoryType, SearchResult } from "../core/types.js";
 
 /**
@@ -81,10 +82,30 @@ class Runner {
   client(): MemoryClient {
     return new MemoryClient(this.opts.server);
   }
+  private static warnedStaleDaemon = false;
+
   async useDaemon(): Promise<boolean> {
     if (this.opts.noDaemon) return false;
-    return this.client().healthy();
+    const health = await this.client().health();
+    if (!health?.ok) return false;
+    // Version, not just reachability. A daemon left running from an older install
+    // answers /health happily while serving the old build — after the fix to GET
+    // /memories/search, exactly that daemon made every search answer 404. Falling
+    // back to the in-process store keeps the command working; the warning says why.
+    const mine = await appVersion();
+    if (health.version !== mine) {
+      if (!Runner.warnedStaleDaemon) {
+        Runner.warnedStaleDaemon = true;
+        console.error(
+          `ai-memory: ignoring the running daemon (version ${health.version ?? "unknown"}, this CLI is ${mine}) — ` +
+          "it would serve the old code. Restart it, or pass --no-daemon to silence this.",
+        );
+      }
+      return false;
+    }
+    return true;
   }
+
   async close(): Promise<void> {
     if (this.svc) await this.svc.close();
   }
@@ -558,11 +579,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return a.command === "" && !flagBool(a, "help") ? 2 : 0;
   }
   if (flagBool(a, "version") || a.command === "version") {
-    const { readFile } = await import("node:fs/promises");
-    const { fileURLToPath } = await import("node:url");
-    const pkgPath = fileURLToPath(new URL("../../package.json", import.meta.url));
-    const pkg = JSON.parse(await readFile(pkgPath, "utf8")) as { version: string };
-    ctx.out(pkg.version);
+    ctx.out(await appVersion());
     return 0;
   }
 

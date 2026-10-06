@@ -43,6 +43,20 @@ export class MemoryService {
       (this.retriever as unknown as { store: VectorStore }).store = sqliteStore;
     }
     await this.store.init();
+    // Refuse to serve a store whose vectors do not match the embedder. Cosine over
+    // mismatched dims throws (or worse, silently compares the first N numbers), so
+    // the failure has to land here, where the message can name both dims and the
+    // file to move aside — not in a search result that looks merely wrong.
+    const stored = await this.store.storedDim();
+    if (stored !== null && stored !== this.embedder.dim) {
+      throw new Error(
+        `embedding dim mismatch: ${this.dbPath ?? "this store"} holds ${stored}-dim vectors, ` +
+        `but the ${this.embedder.name} embedder produces ${this.embedder.dim}.\n` +
+        `The vector column stores raw JSON, so searching across dimensions returns garbage, not an error.\n` +
+        `Fix: set EMBEDDING_PROVIDER back to what wrote this file, or move it aside and start fresh ` +
+        `(e.g. mv ${this.dbPath ?? "memory.db"} ${this.dbPath ?? "memory.db"}.bak).`,
+      );
+    }
   }
   close(): void {
     this.store.close();

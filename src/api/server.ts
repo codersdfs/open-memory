@@ -5,7 +5,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import { MemoryService } from "../core/memoryService.js";
 import { TYPES, STATUSES, type MemoryType, type MemoryStatus } from "../core/types.js";
+import { appVersion } from "../version.js";
 
+// Resolved relative to this file, so the built layout must keep `src/api/` next to
+// `src/ui/` — which is why the build copies the static UI into `dist/src/ui` rather
+// than shipping it only at the package root. Without that copy every page 404s from
+// an installed package while working fine from the repo.
 const UI_DIR = join(dirname(fileURLToPath(import.meta.url)), "../ui");
 const MIME: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json" };
 
@@ -107,7 +112,17 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   const method = req.method ?? "GET";
   const q = Object.fromEntries(url.searchParams);
 
-  if (path === "/health") return send(res, 200, { ok: true, embedding: service.embedder.name, dim: service.embedder.dim });
+  if (path === "/health") {
+    // `version` is what lets a CLI notice a daemon left running from an older
+    // install. Reachability alone is not enough: a stale daemon answers /health
+    // happily while serving old routes.
+    return send(res, 200, {
+      ok: true,
+      embedding: service.embedder.name,
+      dim: service.embedder.dim,
+      version: await appVersion(),
+    });
+  }
   if (path === "/stats" && method === "GET") {
     const ns = str(q.namespace, 200, 1) ?? "default:default";
     const total = (await service.list({ namespace: ns, limit: 1 })).total;

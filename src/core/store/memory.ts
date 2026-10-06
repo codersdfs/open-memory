@@ -38,6 +38,11 @@ export class InMemoryVectorStore implements VectorStore {
     return this.map.get(id) ?? null;
   }
 
+  async storedDim(): Promise<number | null> {
+    for (const memory of this.map.values()) return memory.embedding.length;
+    return null;
+  }
+
   async list(opts: {
     namespace: string;
     type?: string;
