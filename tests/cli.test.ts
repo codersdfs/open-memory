@@ -105,6 +105,28 @@ describe("ai-memory CLI", () => {
     expect(next.stdout).toContain("superseded");
   });
 
+  it("--all sweeps every partition this user owns", () => {
+    run(["save", "the staging key rotates on Fridays", "--agent", "claude", "--json"], db);
+    run(["save", "codex prefers short diffs", "--agent", "codex", "--json"], db);
+
+    const plain = JSON.parse(run(["list", "--no-daemon", "--json"], db).stdout) as {
+      memories: { namespace: string }[];
+    };
+    expect(
+      plain.memories.map((m) => m.namespace),
+      "another agent's partition stays out of a plain read"
+    ).not.toContain("claude:cli-test");
+
+    const swept = JSON.parse(run(["list", "--no-daemon", "--all", "--json"], db).stdout) as {
+      memories: { namespace: string }[];
+      scopes: string[];
+    };
+    const seen = swept.memories.map((m) => m.namespace);
+    expect(seen).toContain("claude:cli-test");
+    expect(seen).toContain("codex:cli-test");
+    expect(swept.scopes).toContain("claude:cli-test");
+  });
+
   it("lists and counts", () => {
     const list = run(["list", "--limit", "5", "--json"], db);
     expect(list.code).toBe(0);

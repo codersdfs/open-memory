@@ -25,6 +25,13 @@ export interface VectorStore {
     offset?: number;
     query?: string;
   }): Promise<{ memories: Memory[]; total: number }>;
+  /**
+   * Every partition holding at least one live memory. 
+   *
+   * A caller cannot guess these names, and guessing is exactly what made the CLI
+   * report an empty search for data that was sitting in a partition nobody named.
+   */
+  distinctNamespaces(): Promise<string[]>;
   deleteSoft(id: string): Promise<void>;
   updateEmbedding(id: string, embedding: number[], text: string): Promise<void>;
   updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number }): Promise<Memory | null>;

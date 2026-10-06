@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
+  allPartitions,
   resolveAgent,
   resolveUser,
   resolveScopeKeys,
@@ -73,6 +74,21 @@ describe("scope resolution", () => {
 
   it("explicit shared scope reads only the shared layer", () => {
     expect(resolveScopeKeys({ agent: "codex", user: "alice", scope: "shared" })).toEqual(["shared:alice"]);
+  });
+
+  it("--all sweeps every partition this user owns, and nobody else's", async () => {
+    const store = {
+      distinctNamespaces: async () => [
+        "pi:alice",
+        "coding-agent:alice",
+        "shared:alice",
+        "claude:bob",
+        "default:default"
+      ]
+    };
+    const keys = await allPartitions(store, "alice");
+    expect(keys).toEqual(["coding-agent:alice", "default:default", "pi:alice", "shared:alice"]);
+    expect(keys, "another person's partition is never in a sweep").not.toContain("claude:bob");
   });
 
   it("writes never merge layers", () => {

@@ -159,6 +159,27 @@ function withLegacy(keys: string[]): string[] {
   return keys.includes(LEGACY_NAMESPACE) ? keys : [...keys, LEGACY_NAMESPACE];
 }
 
+/**
+ * Every partition a `--all` sweep should touch: each one this user owns, plus the
+ * legacy bucket.
+ *
+ * Only the store knows these names, so this is the one part of scope resolution that
+ * cannot be pure. The user segment filters the list, so `--all` still cannot reach
+ * into another person's partition — within one human, the agent-owned partitions are
+ * theirs, and ADR-0007 keeps them apart by default (the layered read) rather than by
+ * making them unreachable on request.
+ */
+export async function allPartitions(
+  store: { distinctNamespaces(): Promise<string[]> },
+  user?: string
+): Promise<string[]> {
+  const u = resolveUser(user);
+  const held = (await store.distinctNamespaces()).filter(
+    (ns) => parseNamespaceKey(ns).userId === u
+  );
+  return [...new Set([...held, LEGACY_NAMESPACE])].sort();
+}
+
 /** The single partition a write lands in. */
 export function resolveWriteKey(input: Omit<ScopeKeysInput, "includeShared"> = {}): string {
   return resolveScopeKeys({ ...input, includeShared: false })[0]!;

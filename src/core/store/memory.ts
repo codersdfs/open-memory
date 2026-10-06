@@ -38,6 +38,13 @@ export class InMemoryVectorStore implements VectorStore {
     return this.map.get(id) ?? null;
   }
 
+  async distinctNamespaces(): Promise<string[]> {
+    const held = [...this.map.values()]
+      .filter((m) => m.isDeleted === 0)
+      .map((m) => m.namespace);
+    return [...new Set(held)].sort();
+  }
+
   async storedDim(): Promise<number | null> {
     for (const memory of this.map.values()) return memory.embedding.length;
     return null;

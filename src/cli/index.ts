@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs, flagBool, flagList, flagNumber, flagString, queryText } from "./args.js";
 import { MemoryClient, unwrapMemory } from "./http.js";
-import { resolveAgent, resolveRequestScope, resolveWriteKey, resolveUser, type MemoryScope } from "../core/scope.js";
+import { allPartitions, resolveAgent, resolveRequestScope, resolveWriteKey, resolveUser, scopeOfNamespace, type MemoryScope } from "../core/scope.js";
 import { resolveDbPath, resolveHome, legacyDbPath, dbExists } from "../core/dbPath.js";
 import { MemoryService } from "../core/memoryService.js";
 import { appVersion } from "../version.js";
@@ -185,6 +185,30 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   return 0;
 }
 
+/**
+ * Partitions for this call. `--all` means "everything this user owns", which only the
+ * store can enumerate; everything else is the pure resolution. An explicit
+ * `--namespace` still wins over both, and `--all` never goes through the daemon: it
+ * takes one namespace per request and has no way to sweep, so it would silently
+ * answer from a single partition.
+ */
+async function resolveNamespaces(
+  r: Runner,
+  a: ReturnType<typeof parseArgs>
+): Promise<{ namespaces: string[]; scopes: MemoryScope[] }> {
+  const namespace = flagString(a, "namespace");
+  if (flagBool(a, "all") && !namespace) {
+    const namespaces = await allPartitions((await r.service()).store, flagString(a, "user"));
+    return { namespaces, scopes: [...new Set(namespaces.map(scopeOfNamespace))] };
+  }
+  return resolveRequestScope({
+    namespace,
+    agent: flagString(a, "agent"),
+    scope: flagString(a, "scope") as MemoryScope | undefined,
+    all: flagBool(a, "all")
+  });
+}
+
 async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   const query = queryText(a, "query");
   if (!query) {
@@ -201,10 +225,10 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
   // R1: opt-in, because the default answer is meant to be read, not debugged.
   const explain = flagBool(a, "explain");
 
-  if (await r.useDaemon()) {
+  if (!flagBool(a, "all") && (await r.useDaemon())) {
     const res = await r.client().get<SearchResult>(
       "/memories/search" +
-        MemoryClient.query({ query, namespace, agent, scope, k, budgetTokens, threshold, type, explain, all: flagBool(a, "all") })
+        MemoryClient.query({ query, namespace, agent, scope, k, budgetTokens, threshold, type, explain })
     );
     if (!res.ok) {
       ctx.err(`search: ${res.error}`);
@@ -215,7 +239,7 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
     return 0;
   }
 
-  const { namespaces } = resolveRequestScope({ namespace, agent, scope, all: flagBool(a, "all") });
+  const { namespaces } = await resolveNamespaces(r, a);
   const svc = await r.service();
   const result = await svc.search({
     query,
@@ -284,10 +308,10 @@ async function cmdList(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   const type = flagString(a, "type") as MemoryType | undefined;
   const status = flagString(a, "status");
 
-  if (await r.useDaemon()) {
+  if (!flagBool(a, "all") && (await r.useDaemon())) {
     const res = await r.client().get<{ memories: Memory[]; total: number }>(
       "/memories" +
-        MemoryClient.query({ namespace, agent, scope, limit, type, status, all: flagBool(a, "all") })
+        MemoryClient.query({ namespace, agent, scope, limit, type, status })
     );
     if (!res.ok) {
       ctx.err(`list: ${res.error}`);
@@ -301,7 +325,7 @@ async function cmdList(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
     return 0;
   }
 
-  const { namespaces } = resolveRequestScope({ namespace, agent, scope, all: flagBool(a, "all") });
+  const { namespaces } = await resolveNamespaces(r, a);
   const svc = await r.service();
   const all: Memory[] = [];
   let total = 0;
@@ -426,11 +450,11 @@ async function cmdStats(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
   const namespace = flagString(a, "namespace");
   const agent = flagString(a, "agent");
   const scope = flagString(a, "scope") as MemoryScope | undefined;
-  const { namespaces, scopes } = resolveRequestScope({ namespace, agent, scope, all: flagBool(a, "all") });
+  const { namespaces, scopes } = await resolveNamespaces(r, a);
 
-  if (await r.useDaemon()) {
+  if (!flagBool(a, "all") && (await r.useDaemon())) {
     const res = await r.client().get<Record<string, unknown>>(
-      "/stats" + MemoryClient.query({ namespace: namespaces[0], agent, scope, all: flagBool(a, "all") })
+      "/stats" + MemoryClient.query({ namespace: namespaces[0], agent, scope })
     );
     if (!res.ok) {
       ctx.err(`stats: ${res.error}`);

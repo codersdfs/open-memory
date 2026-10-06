@@ -243,6 +243,16 @@ export class SqliteVectorStore implements VectorStore {
     return { memories: rows.map(memoryFromRow), total: totalRow.c };
   }
 
+  async distinctNamespaces(): Promise<string[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT namespace FROM memories WHERE is_deleted = 0 ORDER BY namespace`
+      )
+      .all() as { namespace: string }[];
+    return rows.map((r) => r.namespace);
+  }
+
   async deleteSoft(id: string): Promise<void> {
     this.ensure();
     const stmt = this.db.prepare(`UPDATE memories SET is_deleted = 1, updated_at = ? WHERE id = ?`);
