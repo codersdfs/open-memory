@@ -123,8 +123,28 @@ export class HybridRetriever {
       (s) => s.bm25Score > 0 || s.vectorScore >= VECTOR_FLOOR || s.memory.pin === 1
     );
 
-    // threshold allows empty result (prevents context pollution) — pin forces keep
-    return relevant.filter((s) => s.score >= threshold || s.memory.pin === 1);
+    // The gate is a floor on *relevance*, never on the total. Recency and strength
+    // decay and grow; folding them in made the gate harder the older a memory got,
+    // which is backwards. Measured on a real store: "user is a TypeScript engineer
+    // who hates boilerplate" answered the query "TypeScript engineer" with bm25
+    // 0.884 — near-perfect overlap — and still scored 0.710 against this 0.72 gate
+    // at 36 days old, so it was filtered. The effect compounds: the older a store
+    // is, the more of it goes dark, until search looks broken rather than strict.
+    // Relevance is a property of the match itself — lexical overlap, or cosine when
+    // a real embedder is in play — and the other signals only order the survivors.
+    // Pin still overrides. Threshold allows an empty result on purpose: a query the
+    // store cannot answer should return nothing rather than the least-bad row.
+    // Either kind of confidence clears it. Relevance alone is enough so that age
+    // cannot hide a match; the total is also enough so that a fresh, important
+    // memory that shares a term still answers a loosely-worded question — "where
+    // does user live?" reaching "user lives in Berlin" is one term of four, and it
+    // is the case the smart-search test exists to protect. Zero shared terms never
+    // gets this far: the `relevant` filter above is the hard floor.
+    const relevanceOf = (s: Scored) =>
+      Math.max(s.bm25Score, this.weights.vector > 0 ? s.vectorScore : 0);
+    return relevant.filter(
+      (s) => relevanceOf(s) >= threshold || s.score >= threshold || s.memory.pin === 1
+    );
   }
 
   /**

@@ -108,16 +108,27 @@ export class Extractor {
     // its steps, a question does not.
     // `may`/`might` are absent on purpose: "May 5 we decided..." is a date.
     const opensQuestion = /^(what|why|how|where|when|who|which|whose|can|could|should|would|will|do|does|did|is|are|give)\b/i.test(s);
-    const carriesItsAnswer = /^(how|what|where|when|who) to\b/i.test(s) && s.includes(":");
+    // One idea, used by both rules below: a sentence that states its own how (a
+    // colon, a command, "with/using/via") is knowledge. One that does not is
+    // scaffolding. This is what separates "How to deploy: npm run x" from "how to
+    // look at it", and "Start the daemon with \`ai-memory daemon start\`" from "start
+    // it please".
+    const statesTheHow = /[:\`]|\b(with|using|via)\b/i.test(s);
+    const carriesItsAnswer = /^(how|what|where|when|who) to\b/i.test(s) && statesTheHow;
     const isAnOrder = /^(do not|don't|does not|is not|are not|why not)\b/i.test(s);
-    if (opensQuestion && !carriesItsAnswer && !isAnOrder) return false;
+    // "When <something happens>, <do this>" is a standing rule, not a question —
+    // two such rules were already in the store when this rule first ran. The comma
+    // is the tell: a when-clause that continues into an instruction.
+    const isACondition = /^when(ever)?\s+[^,]{3,},\s*\S/i.test(s);
+    if (opensQuestion && !carriesItsAnswer && !isAnOrder && !isACondition) return false;
     // An instruction aimed at the agent ("read the file", "run npm test") is
     // task scaffolding that expires in one turn. A fact about how the user
     // wants things phrased survives.
     // A leading adverb is still the same shape: "now finish the task" is the same
     // scaffolding as "finish the task", and it leaked in a real store.
     if (
-      /^(please|now|then|first|just|ok|okay)?\s*(read|open|run|build|fix|make|add|remove|delete|create|show|list|explain|try|use|search|find|check|write|put|move|rename|update|change|install|deploy|commit|push|pull|merge|revert|stop|start|tag|release|continue|finish|ensure|verify|review|test|implement|refactor|document)\b/i.test(s)
+      /^(please|now|then|first|just|ok|okay)?\s*(read|open|run|build|fix|make|add|remove|delete|create|show|list|explain|try|use|search|find|check|write|put|move|rename|update|change|install|deploy|commit|push|pull|merge|revert|stop|start|tag|release|continue|finish|ensure|verify|review|test|implement|refactor|document)\b/i.test(s) &&
+      !statesTheHow
     ) {
       return false;
     }

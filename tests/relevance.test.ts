@@ -4,7 +4,7 @@
  * ~0.9 cosine, so "kubernetes ingress controller" scored 0.73 against
  * "user lives in Berlin" — above any usable threshold.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { HybridRetriever } from "../src/core/retrieval/hybrid.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
@@ -47,6 +47,29 @@ describe("relevance under hash embeddings", () => {
     await put("frank 跟 agent 说话用中文, 他自己输入用英文", 0.7);
     const r = await retriever.search({ query: "中文", namespace: NS, threshold: 0.35 });
     expect(r.memories).toHaveLength(1);
+  });
+
+  // Every test above passes an explicit threshold, which is exactly why this bug
+  // lived: the default 0.72 gate was never exercised. It gated the *total* score,
+  // and the total carries the recency term, so an exact match aged out of reach —
+  // 36 days was enough to drop a bm25 of 0.884 to 0.710 and hide the row.
+  it("retrieves an exact match with default options, however old it is", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+      await put("user is a TypeScript engineer who hates boilerplate", 0.7);
+      vi.setSystemTime(new Date("2026-03-01T00:00:00Z")); // 59 days later
+      const r = await retriever.search({ query: "TypeScript engineer", namespace: NS });
+      expect(r.memories.map((m) => m.text)).toEqual(["user is a TypeScript engineer who hates boilerplate"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still refuses an unrelated query with default options", async () => {
+    await put("user lives in Berlin and prefers answers in German", 0.6);
+    const r = await retriever.search({ query: "kubernetes ingress controller", namespace: NS });
+    expect(r.memories).toHaveLength(0);
   });
 
   it("excludes a zero-overlap memory entirely, not merely ranks it lower", async () => {

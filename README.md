@@ -3,7 +3,7 @@
 A **local-first, namespace-partitioned memory substrate** that stores *Episodic / Semantic / Procedural / Working* memories as vectors and retrieves them with **smart search + hard token budget** to prevent *Token Burning* (cost) and *Context Burning* (irrelevant dilution).
 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
-- **Smart Search**: 2-stage — `0.6*BM25 + 0.25*recency + 0.15*strength` (`vector` weight is `0` by default; see Embeddings) → MMR diversify → threshold `0.72` (empty allowed) → **hard budget** (default 800 tokens) + overflow summarization (ADR-0002). Deterministic, zero extra LLM call.
+- **Smart Search**: 2-stage — `0.6*BM25 + 0.25*recency + 0.15*strength` (`vector` weight is `0` by default; see Embeddings) → MMR diversify → relevance floor `0.72` (empty allowed, and it is a floor on *relevance*, not on the total — an old exact match must never age out of reach) → **hard budget** (default 800 tokens) + overflow summarization (ADR-0002). Deterministic, zero extra LLM call.
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
 - **Explainable recall** (R1): `?explain=1` (or `--explain`) returns where each score came from — `bm25 +0.37 · recency +0.24 · strength +0.12 = 0.737`. Off by default, because four extra numbers per hit is real payload on a response whose point is a token budget. Everyone returns results; this returns *why*.
 - **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95) and its clock resets, so decay reads age as time-since-last-use. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
@@ -96,7 +96,7 @@ Two defaults, on purpose:
 
 | Caller | Floor | Why |
 |---|---|---|
-| HTTP / UI (this server) | **0.72** | The ADR-0002 value, unchanged. Keeps context pollution out. |
+| HTTP / UI (this server) | **0.72** | The ADR-0002 value, unchanged. Cleared by BM25/vector relevance, or by the total for a fresh, important, partially-matching memory. Zero shared terms never qualifies, so context pollution stays out. |
 | pi `memory_search` (auto-memory extension) | **0.35** English / **0.2** Chinese | Measured against this corpus, 0.72 discarded real memories: an exact hit scores ~0.96, a reworded one ~0.33. A Chinese query scores structurally low because the hash embedder returns ~0 cosine for CJK and the vector term carries 0.6 weight. |
 
 This is a deliberate divergence, not drift. The agent is answering questions it was asked; the UI is you deciding what to inject into a prompt. Revisit when the corpus has enough real memories to judge `0.35` on its own.

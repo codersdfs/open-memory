@@ -46,6 +46,23 @@ describe("extraction gate", () => {
 
   // "how to X" is the hard pair: same opener, opposite meaning. The colon separates
   // a procedure carrying its steps from a question missing its answer.
+  it("keeps a when-clause that continues into an instruction", () => {
+    expect(Extractor.isWorthKeeping("When user says save this, call memory.save with importance 0.8")).toBe(true);
+    expect(Extractor.isWorthKeeping("Whenever the daemon is stale, restart it")).toBe(true);
+    expect(Extractor.isWorthKeeping("when to ship this")).toBe(false);
+    expect(Extractor.isWorthKeeping("what does agent.md tell u")).toBe(false);
+  });
+
+  // Same principle on the instruction rule: an instruction that carries its own
+  // how is a note worth keeping ("Start the daemon with `x`"), one that does not is
+  // scaffolding. A real entry in the store was the former.
+  it("keeps an instruction that carries its own how", () => {
+    expect(Extractor.isWorthKeeping("Start the daemon with `ai-memory daemon start`")).toBe(true);
+    expect(Extractor.isWorthKeeping("Start ai-memory with `npx tsx src/api/server.ts` in C:/memory")).toBe(true);
+    expect(Extractor.isWorthKeeping("Read the file first")).toBe(false);
+    expect(Extractor.isWorthKeeping("put the jev system into this repo")).toBe(false);
+  });
+
   it("drops 'how to' with no answer attached", () => {
     expect(Extractor.isWorthKeeping("how to look at it")).toBe(false);
     expect(Extractor.isWorthKeeping("what to do when the daemon is stale")).toBe(false);
