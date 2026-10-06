@@ -1,6 +1,6 @@
 {
   "name": "ai-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first memory for pi agents: SQLite + hybrid retrieval + hard token budget. One process, no UI framework.",
   "license": "MIT",
   "keywords": ["memory", "agents", "rag", "sqlite", "mcp", "vector-search", "local-first"],
