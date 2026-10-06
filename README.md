@@ -123,7 +123,16 @@ EMBEDDING_DIM=1024                                          # for any other mode
 
 NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` body fields that E5/Nemotron score on; OpenAI rejects those, so they are sent only for NIM.
 
-**Neither provider has a measured retrieval comparison yet.** They are wired end to end — save embeds, search embeds, `reembed` migrates a store, the weight follows the provider — but the claim that real embeddings find paraphrases the hash one misses has not been measured on this corpus, because that needs a key. Until it is measured, treat the vector term as *wired, not proven*: `wayfinder/tickets/011`.
+**Measured on this corpus** (53 live rows, `nvidia/nemotron-3-embed-1b` via NIM, 2026-10-06). Three memories, each asked twice — once in its own words, once paraphrased with no shared vocabulary — and scored by where the right memory lands in the whole store:
+
+| query | hash (384d) | nemotron (2048d) |
+|---|---|---|
+| literal | rank 1 / 2 / 6 of 53 | rank 1 / 1 / 1 of 53 |
+| **paraphrased** | rank **13 / 21 / 9** of 53 | rank **1 / 1 / 2** of 53 |
+
+That is the claim, confirmed in the direction that matters: a reworded query puts the right memory first with a real model, and mid-pack — effectively at random — with the hash embedder.
+
+**What it does not prove is cosine as a gate.** On the same corpus the noise ceiling (highest cosine for three unrelated queries) was 0.12–0.26, while the paraphrases that *should* match scored 0.20–0.30: overlapping ranges. Rank separates them, absolute similarity does not — which is why the relevance floor stays lexical and the vector term earns its weight by *ordering what already matched*, not by admitting new rows. Practical consequence: with a real provider, a paraphrase-only hit (cosine ~0.3) clears the CLI's `0.35` and is filtered by the HTTP/extension floor of `0.72`. Lower the floor if you configure a real provider and want those hits; see `wayfinder/tickets/011`.
 
 **The dimension is load-bearing.** The vector column holds raw JSON, so a provider swap without clearing the store makes every search return noise rather than an error. Startup therefore refuses on a mismatch and names both dims:
 

@@ -127,3 +127,52 @@ What is left is one measurement, and it needs a key rather than code:
    (it matches vocabulary, not meaning).
 3. Record the result here either way. If a real provider does not beat the hash
    embedder on this corpus, that is a finding, and the README should say so.
+
+---
+
+## Measured 2026-10-06 — `nvidia/nemotron-3-embed-1b` (2048d) vs hash (384d)
+
+Run on a **copy** of the live store (`VACUUM INTO`, 84 rows incl. deleted; 53 live), so
+the user's store stayed on hash. Six queries, three sessions:{literal}
+
+Three target memories (a TypeScript-engineer fact, a cat's name, the EMBEDDING_PROVIDER
+default note), each asked twice: once in its own words, once paraphrased with no shared
+vocabulary (`bm25 = 0.000`), and scored by the target's cosine rank among all 53 live
+rows — no threshold, no k, no gate in the way of the measurement:
+
+| target | literal: hash → nim | paraphrased: hash → nim |
+|---|---|---|
+| TypeScript engineer | 1 → 1 | **13 → 1** |
+| cat named Mimi | 2 → 1 | **21 → 1** |
+| EMBEDDING_PROVIDER default | 6 → 1 | **9 → 2** |
+
+**Verdict: the embedder delivers what the hash one structurally cannot.** A paraphrase
+the hash model ranks mid-pack (9th–21st of 53, i.e. indistinguishable from noise) is
+ranked 1st–2nd by the real model. The README now carries this table.
+
+**But cosine is not usable as the gate.** Noise ceiling for three unrelated queries
+(`kubernetes ingress controller…`, `sourdough bread`, `paris metro prices`) was 0.120,
+0.147, **0.256**; the paraphrases that should match scored 0.271 and 0.304. The ranges
+overlap, so *any* absolute floor either admits the kubernetes query (≥0.25) or drops a
+genuine paraphrase (≥0.30). Rank separates them; similarity does not.
+
+That is why the change this ticket blocked is only half-done on purpose: the relevance
+floor stays lexical, and the vector term's measured value is ordering (`vector` weight
+0.6 once a real provider is configured).
+
+**Still open, and now a concrete question rather than a vague one:** a semantic gate
+that uses *relative* evidence — cosine against the corpus distribution for that query
+(a margin over its median / a percentile), or a rank-based floor — instead of an
+absolute cosine. That is the R3/R4 shape (`wayfinder/ROADMAP.md`), and it is the only
+thing left between a real provider and a config that is worth paying for.
+
+**Cost of the measurement:** 2 batch requests to re-embed 84 rows, 11 single-text query
+embeddings.
+
+### Note for whoever runs this next
+
+- Git-bash `/tmp` and Node's `/tmp` on Windows are different directories: `cp memory.db
+  /tmp/x.db` then `MEMORY_DB_PATH=/tmp/x.db` reads a *different* file, which produced a
+  stale 65-row store and a confusing "provider X, 0 of 0 vectors" run before it was
+  spotted. Copy with `VACUUM INTO 'C:/tmp/…'` (a `cp` also misses whatever is still in
+  the WAL) and pass the same absolute path to both sides.
