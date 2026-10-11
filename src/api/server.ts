@@ -1,6 +1,7 @@
 import "../config.js";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { readFile, stat } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import { MemoryService } from "../core/memoryService.js";
@@ -79,6 +80,11 @@ function parseSearch(q: Record<string, unknown>) {
     data: {
       query,
       namespace: str(q.namespace, 200, 1) ?? "default:default",
+      // A read covers more than one partition — the caller's own plus the legacy one —
+      // and the CLI resolves that list where the agent and user are actually known. It
+      // has to be able to say so, or a daemon answers from its own default and reports
+      // nothing found for memories that are plainly there. Overrides `namespace`.
+      namespaces: str(q.namespaces, 2000, 1)?.split(",").map((s) => s.trim()).filter(Boolean),
       type: enumOf(q.type, TYPES),
       k: num(q.k, 1, 50) ?? 5,
       budgetTokens: num(q.budgetTokens, 10, 10000) ?? 800,
@@ -572,8 +578,16 @@ async function fileSize(path: string): Promise<number | null> {
   }
 }
 
+// Same real-path comparison as the CLI: a symlinked entry point is how a global install
+// reaches this file, and Node resolves `import.meta.url` through the link.
 const entry = process.argv[1];
-if (entry && import.meta.url === pathToFileURL(entry).href) {
+let runsAsMain = false;
+try {
+  runsAsMain = entry !== undefined && import.meta.url === pathToFileURL(realpathSync(entry)).href;
+} catch {
+  // no usable argv[1] — imported by a test or a runner, which is not the main case.
+}
+if (runsAsMain) {
   const port = Number(process.env.PORT ?? process.env.MEMORY_PORT ?? 3000);
   const host = process.env.HOST ?? "127.0.0.1";
   const { app } = await buildServer();

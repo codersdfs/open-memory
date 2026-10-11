@@ -52,12 +52,17 @@ jobs:
           open-memory db info
           open-memory version | grep -qv unknown
 
+          # A global install lands in <prefix>/lib/node_modules on POSIX and
+          # <prefix>/node_modules on Windows, so ask npm where it went rather than
+          # assuming — the first version of this step assumed, and stopped here.
+          PKG="$(npm root -g --prefix /tmp/inst)/open-memory"
+
           # 2. the static UI shipped. It is served, not imported, so tsc does not
           #    carry it into dist — only the copy-ui build step does.
-          test -f /tmp/inst/node_modules/open-memory/dist/src/ui/graph.html
+          test -f "$PKG/dist/src/ui/graph.html"
 
           # 2b. and the console did, which root `npm ci` alone cannot arrange.
-          test -f /tmp/inst/node_modules/open-memory/dist/src/ui-next/index.html
+          test -f "$PKG/dist/src/ui-next/index.html"
 
           # 3. save, then search it back through the in-process path
           open-memory save "ci smoke" --type semantic

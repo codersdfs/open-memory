@@ -90,7 +90,7 @@ Whole documents are not stored. One 1.5k-char blob is a file, not a memory: it m
 | `GET` | `/memories/:id` | |
 | `DELETE` | `/memories/:id` | soft-delete |
 | `POST` | `/memories/:id/supersede` | `{namespace,type,text,...}` creates new + soft-deletes old via `supersedesId` |
-| `POST` | `/memories/search` | `{query, namespace, k?, budgetTokens?, threshold?, type?, explain?}` |
+| `POST` | `/memories/search` | `{query, namespace, namespaces?, k?, budgetTokens?, threshold?, type?, explain?}` — `namespaces` is comma-separated and overrides `namespace`; it is how the CLI reads its own partition plus the legacy one |
 | `POST` | `/extract` | `{text, namespace}` — heuristic (no LLM) or LLM if `ENABLE_EXTRACTOR=true` + `OPENAI_API_KEY` |
 | `POST` | `/decay` | prunes `episodic >90d && importance<=0.3` + `working >7d` |
 | `GET` | `/graph` | wiki node graph: `{nodes, edges}` |

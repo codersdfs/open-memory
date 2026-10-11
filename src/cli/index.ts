@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { parseArgs, flagBool, flagList, flagNumber, flagString, queryText } from "./args.js";
 import { MemoryClient, unwrapMemory } from "./http.js";
 import { allPartitions, resolveAgent, resolveRequestScope, resolveWriteKey, resolveUser, scopeOfNamespace, type MemoryScope } from "../core/scope.js";
@@ -265,9 +267,15 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
   const explain = flagBool(a, "explain");
 
   if (!flagBool(a, "all") && (await r.useDaemon())) {
+    // Resolve the partitions here, where the caller's agent and user are known, and send
+    // the result: the daemon has no idea whose store this is. `agent` and `scope` used
+    // to be sent instead, and the server never read them, so a bare `search` against a
+    // running daemon asked about `default:default` and answered "no memories matched"
+    // for rows sitting in the caller's own partition.
+    const { namespaces } = await resolveNamespaces(r, a);
     const res = await r.client().get<SearchResult>(
       "/memories/search" +
-        MemoryClient.query({ query, namespace, agent, scope, k, budgetTokens, threshold, type, explain })
+        MemoryClient.query({ query, namespaces: namespaces.join(","), k, budgetTokens, threshold, type, explain })
     );
     if (!res.ok) {
       ctx.err(`search: ${res.error}`);
@@ -730,7 +738,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 }
 
-const isMain = process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, "/")}`).href;
+// A global install puts a symlink in bin/ on POSIX, and Node resolves `import.meta.url` to
+// the real file, so the two have to be compared as real paths. Comparing the literal
+// `argv[1]` against it meant the guard never matched when the command was run the way a
+// user runs it — a symlinked `open-memory version` printed nothing and exited 0.
+const entryPath = process.argv[1];
+let isMain = false;
+try {
+  isMain = entryPath !== undefined && import.meta.url === pathToFileURL(realpathSync(entryPath)).href;
+} catch {
+  // `argv[1]` is not a path (node -e, a REPL); there is nothing to compare against.
+}
 if (isMain || process.env.AI_MEMORY_CLI_FORCE_MAIN === "1") {
   main().then((code) => {
     process.exitCode = code;

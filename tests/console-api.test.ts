@@ -138,6 +138,29 @@ describe("console API", () => {
     expect((await fetch(`${base}/graph.html`)).status).toBe(200);
   });
 
+  it("a search can cover more than one partition, which is what the CLI asks for", async () => {
+    // The CLI resolves its own partition plus the legacy one and sends the list. Before
+    // `namespaces` existed it could only hand over one, so a daemon-backed `search`
+    // answered from the server's default partition and reported nothing found for rows
+    // that were sitting in the caller's own.
+    const save = (namespace: string, text: string) =>
+      fetch(`${base}/memories`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ namespace, type: "semantic", text })
+      });
+    await save("split:a", "the nightly job writes to the analytics bucket");
+    await save("split:b", "the nightly job writes to the analytics bucket");
+
+    const hits = async (qs: string) =>
+      ((await (await fetch(`${base}/memories/search?${qs}`)).json()) as { memories: { namespace: string }[] })
+        .memories.map((m) => m.namespace);
+
+    expect(await hits("query=nightly%20job&namespace=split:a&threshold=0")).toEqual(["split:a"]);
+    expect((await hits("query=nightly%20job&namespace=split:a&namespaces=split%3Aa,split%3Ab&threshold=0")).sort())
+      .toEqual(["split:a", "split:b"]);
+  });
+
   it("GET /namespaces lists every partition, including the ones holding only tombstones", async () => {
     const saved = await fetch(`${base}/memories`, {
       method: "POST",
