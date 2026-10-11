@@ -354,6 +354,8 @@ export interface EmbeddingInfo {
   needsRestart: boolean;
   presets: EmbeddingPreset[];
   keys: { env: string; present: boolean }[];
+  /** Settings keys the real environment already sets — a write of those is a 400. */
+  shadowed: string[];
   settingsPath: string;
   stored: { byVectorDim: Record<string, number>; unreadable: number };
   reembed: ReembedJob;

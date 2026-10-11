@@ -220,6 +220,12 @@ function EmbeddingsCard() {
   const progress = activeJob !== null && activeJob.total > 0 ? Math.min(100, (activeJob.done / activeJob.total) * 100) : 0;
   const migrated = activeJob !== null && activeJob.state === 'done' && !activeJob.dryRun;
 
+  // The environment beats the settings file, so a write of a key it already sets would
+  // be refused by the server. Knowing it here is the difference between a disabled button
+  // and a 400 the user has to interpret. `presetPatch` is the same body the write sends,
+  // so the keys cannot drift from the ones actually posted.
+  const blocked = preset === null ? [] : Object.keys(presetPatch(preset)).filter((k) => info.shadowed.includes(k));
+
   const writeSettings = () => {
     if (preset === null) return;
     setWriting(true);
@@ -397,8 +403,11 @@ function EmbeddingsCard() {
             <button
               type="button"
               className="btn"
-              disabled={busy || preset === null}
-              style={{ opacity: busy || preset === null ? 0.5 : 1, cursor: busy || preset === null ? 'not-allowed' : 'pointer' }}
+              disabled={busy || preset === null || blocked.length > 0}
+              style={{
+                opacity: busy || preset === null || blocked.length > 0 ? 0.5 : 1,
+                cursor: busy || preset === null || blocked.length > 0 ? 'not-allowed' : 'pointer',
+              }}
               onClick={writeSettings}
             >
               {writing ? 'writing…' : 'write settings'}
@@ -411,7 +420,13 @@ function EmbeddingsCard() {
             writing rewrites no vectors by itself. the order is write → dry run → migrate → restart, because the startup
             guard refuses a store that does not match the provider it is opened with.
           </div>
-          {switchError !== null ? (
+          {blocked.length > 0 ? (
+            <div style={{ fontSize: 11, color: 'var(--danger)', lineHeight: 1.6 }}>
+              {blocked.join(', ')} {blocked.length > 1 ? 'are' : 'is'} set in the environment, and the environment wins —
+              the write would be refused, which is why this button is off. unset {blocked.length > 1 ? 'them' : 'it'} (or
+              edit .env) and restart the server to switch here.
+            </div>
+          ) : switchError !== null ? (
             <div style={{ fontSize: 11, color: 'var(--danger)', whiteSpace: 'pre-wrap' }}>{switchError}</div>
           ) : null}
         </div>

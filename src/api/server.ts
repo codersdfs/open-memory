@@ -204,7 +204,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     // already set there makes this write a no-op. Answering "ok" while nothing moves is
     // the silent-fallback bug this project keeps writing comments about, so a shadowed
     // key is an error that names where the value actually lives.
-    const shadowed = Object.keys(patch).filter((key) => (process.env[key] ?? "").trim() !== "");
+    // `keyPresent` is the same predicate `GET /embedding` reports as `shadowed`, so the
+    // button the panel disables and the write this refuses cannot disagree.
+    const shadowed = Object.keys(patch).filter(keyPresent);
     if (shadowed.length > 0) {
       return send(res, 400, {
         error:
