@@ -46,7 +46,7 @@ jobs:
           npm pack --pack-destination /tmp
           npm i -g --prefix /tmp/inst /tmp/open-memory-*.tgz
           export AI_MEMORY_HOME=/tmp/inst-store
-          export PATH=/tmp/inst:$PATH
+          export PATH=/tmp/inst/bin:$PATH   # npm puts global bins in <prefix>/bin on POSIX
 
           # 1. the binary exists and answers
           open-memory db info
