@@ -1,6 +1,6 @@
 {
   "name": "open-memory",
-  "version": "0.3.0",
+  "version": "0.3.0-beta.1",
   "description": "Local-first memory for pi agents: SQLite + hybrid retrieval + hard token budget. One process, no UI framework.",
   "license": "MIT",
   "keywords": ["memory", "agents", "rag", "sqlite", "mcp", "vector-search", "local-first"],
@@ -22,7 +22,8 @@
     "seed": "tsx scripts/seed.ts",
     "wiki:ingest": "tsx scripts/wiki-ingest.ts",
     "wiki:links": "tsx scripts/wiki-links.ts",
-    "lint": "tsc -p tsconfig.lint.json"
+    "lint": "tsc -p tsconfig.lint.json",
+    "prepublishOnly": "npm run lint && npm test && npm run build"
   },
   "dependencies": {},
   "devDependencies": {

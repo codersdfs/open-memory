@@ -1,9 +1,11 @@
 # Changelog
 
-Notable changes. `0.3.0` is the first release under the `open-memory` package name;
-the command stays `ai-memory`.
+Notable changes. The package is `open-memory`; the command stays `ai-memory`.
 
-## 0.3.0 — unreleased
+Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
+on-disk format is the part that does not.
+
+## 0.3.0-beta.1 — 2026-10-11
 
 ### Fixed
 

@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, master] # master is the only branch that exists; no remote yet
   pull_request:
 
 jobs:

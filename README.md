@@ -1,5 +1,8 @@
 # Open Memory — local-first memory for pi agents
 
+> **Status: `0.3.0-beta.1`** — first published build. The storage format is settled; the
+> HTTP and MCP surfaces can still move between prereleases.
+
 A **local-first, namespace-partitioned memory substrate** that stores *Episodic / Semantic / Procedural / Working* memories as vectors and retrieves them with **smart search + hard token budget** to prevent *Token Burning* (cost) and *Context Burning* (irrelevant dilution).
 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
@@ -47,6 +50,13 @@ npm run ui:build && npm start
 ```
 
 An unbuilt console answers `/` with the command that builds it — an instruction, not a page.
+
+Installed from npm there is no clone to `npm start` in; the server is the same entry point,
+run directly:
+
+```bash
+node node_modules/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB_PATH
+```
 
 Five views:
 
