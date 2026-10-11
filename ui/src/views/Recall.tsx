@@ -122,13 +122,22 @@ function Hit({ hit }: { hit: SearchResultItem }) {
   );
 }
 
+/**
+ * The floor a search starts at: `agent EN`, not the HTTP 0.72.
+ *
+ * At 0.72 a first query against a hash store comes back empty often enough that it reads
+ * as a broken search rather than a high floor — measured on the demo store, the same
+ * query returns 0 hits at 0.72 and 7 at 0.35. The presets are still one click away.
+ */
+const DEFAULT_FLOOR = FLOOR_PRESETS.find((p) => p.key === 'agent-en')?.value ?? 0.35;
+
 export default function RecallView({ namespace }: { namespace: string }) {
   const { params, setParams } = useRoute();
 
   const query = params.get('q') ?? '';
   const typeFilter = typeParam(params.get('t'));
   const k = numParam(params, 'k', 5, 1, 20);
-  const threshold = numParam(params, 'th', 0.72, 0, 1);
+  const threshold = numParam(params, 'th', DEFAULT_FLOOR, 0, 1);
   const budget = numParam(params, 'bt', 800, 100, 4000);
 
   // What was actually searched: typing edits the hash, but only submitting (or a slider
