@@ -15,20 +15,23 @@ jobs:
           # DatabaseSync API needs, 24 is what the suite is developed against.
           node-version: 24
       - run: npm ci
-      # Types before tests: a broken signature is a cheaper failure to read
-      # than a test stack trace pointing at the same line.
-      - run: npm run lint
-      - run: npm test
-      # The published package is a build artifact, not the repo. A broken
-      # `build`, or tests leaking into the tarball, is a release bug that only
-      # shows up after someone installs it.
-      # The console IS the UI now (ADR-0008), and root `npm ci` deliberately does
-      # not install its dev deps — so the tarball carries a console only because
-      # this step builds one. `npm run build` still succeeds without it.
+      # The console build comes first because the suite needs it. `/` serves the console
+      # (ADR-0008) out of `ui/dist`, and answers 404 with "console not built" when it is
+      # absent — so `tests/api.test.ts > serves the UI from the same origin` fails on a
+      # clean checkout. It passed on the machine this was written on only because `ui/dist`
+      # was already there. Root `npm ci` deliberately does not install these dev deps.
       - run: npm --prefix ui ci
       - run: npm --prefix ui run typecheck
       - run: npm --prefix ui run build
 
+      # Types before tests: a broken signature is a cheaper failure to read
+      # than a test stack trace pointing at the same line.
+      - run: npm run lint
+      - run: npm test
+
+      # The published package is a build artifact, not the repo. A broken
+      # `build`, or tests leaking into the tarball, is a release bug that only
+      # shows up after someone installs it.
       - run: npm run build
       - run: npm pack --dry-run
 
