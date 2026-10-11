@@ -51,7 +51,8 @@ describe("ai-memory CLI", () => {
   it("reports the version from package.json", () => {
     const r = run(["version"], db);
     expect(r.code).toBe(0);
-    expect(r.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    // A prerelease is a version too: `0.3.0-beta.1` is what a beta publishes.
+    expect(r.stdout.trim()).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
   });
 
   it("saves and searches with --json, reporting the searched scopes", () => {

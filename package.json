@@ -10,7 +10,7 @@
     "open-memory": "dist/src/cli/index.js",
     "ai-memory": "dist/src/cli/index.js"
   },
-  "files": ["dist/src", "dist/scripts", "src/ui", "dist/src/ui-next", "README.md", "CONTEXT.md", "LICENSE", "docs", ".env.example"],
+  "files": ["dist/src", "dist/scripts", "src/ui", "dist/src/ui-next", "README.md", "CHANGELOG.md", "CONTEXT.md", "LICENSE", "docs", ".env.example"],
   "scripts": {
     "dev": "tsx watch src/api/server.ts",
     "ui:dev": "npm --prefix ui run dev",
