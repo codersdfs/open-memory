@@ -71,7 +71,9 @@ jobs:
           # 4. and through the daemon path, which is the one that was broken:
           #    the CLI queries with GET, so this fails if either the route ordering
           #    regresses or the version check stops recognising its own daemon.
-          PORT=7399 node /tmp/inst/node_modules/open-memory/dist/src/api/server.js &
+          PORT=7399 node "$PKG/dist/src/api/server.js" &
           sleep 3
-          curl -sf localhost:7399/health | grep -q '"version"'
-          AI_MEMORY_SERVER=http://127.0.0.1:7399 open-memory search "ci smoke" --threshold 0 | grep -q "ci smoke"
+          # No `-q`: grep exiting at the first match can SIGPIPE the writer, and with
+          # pipefail that fails the pipeline for a reason that has nothing to do with health.
+          curl -sf localhost:7399/health | grep '"version"' >/dev/null
+          AI_MEMORY_SERVER=http://127.0.0.1:7399 open-memory search "ci smoke" --threshold 0 | grep "ci smoke" >/dev/null
