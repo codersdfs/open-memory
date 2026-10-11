@@ -129,6 +129,6 @@ makes it improve.
 `wayfinder/map.md` names `EMBEDDING_PROVIDER=nim` as a standing preference, but
 `src/core/embedding/` contains only `hash.ts`. Real embeddings need a provider
 file plus a re-embed path (`memories reembed`), because changing the provider
-invalidates every stored vector. That is its own ticket — and it is the
+invalidates every stored vector. That is ticket 015 (shipped) — and it is the
 prerequisite for knowing whether R2/R3 actually help, or whether the hash
 embedder was the bottleneck all along.

@@ -1,6 +1,17 @@
 export interface EmbeddingProvider {
   readonly name: string;
   readonly dim: number;
+  /**
+   * The model this instance was built with, or null when it has none (hash).
+   *
+   * The instance is the only honest source for /embedding: re-resolving the
+   * environment would report what the *next* start would use, and the difference
+   * between those two answers is exactly what needsRestart measures.
+   *
+   * Optional so that implementing this interface stays a one-method job: null and
+   * absent mean the same thing, and every real provider here declares it.
+   */
+  readonly model?: string | null;
   embed(text: string, opts?: { inputType?: string }): Promise<number[]>;
   embedBatch(texts: string[], opts?: { inputType?: string }): Promise<number[][]>;
 }

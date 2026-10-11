@@ -7,8 +7,8 @@ A **local-first, namespace-partitioned memory substrate** that stores *Episodic 
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
 - **Explainable recall** (R1): `?explain=1` (or `--explain`) returns where each score came from — `bm25 +0.37 · recency +0.24 · strength +0.12 = 0.737`. Off by default, because four extra numbers per hit is real payload on a response whose point is a token budget. Everyone returns results; this returns *why*.
 - **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95) and its clock resets, so decay reads age as time-since-last-use. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
-- **Inspector UI**: plain `index.html` + `app.js` served by the same `node:http` process as the API. No bundler, no framework. List/filter by type, playground with `k / threshold / budget` sliders, budget preview, soft-delete, supersede chain.
-- **Wiki graph** (`/graph.html`): Obsidian-style node graph over your own markdown. Edges come from `[[wikilinks]]` written into page frontmatter at ingest — nothing is inferred, so the graph never lies about intent. Drag nodes; positions persist to `wiki/.positions.json`. Dangling links render as hollow nodes — hiding them would hide the maintenance debt.
+- **Console** (`ui/`, built to `dist/src/ui-next`, served at `/`): the one browser UI over the API below — Recall, Memories, Sessions, Graph, Stats — in two themes (dark default, warm-white light). The old inspector is gone.
+- **Vault graph** (`/graph.html`): Obsidian-style node graph over `vault/` — any markdown you point `VAULT_DIR` at. Edges come from `[[wikilinks]]` in the body plus the frontmatter `links:` that ingest writes — nothing is inferred, so the graph never lies about intent. Click a node for the local graph (depth 1-3), filter with `tag:x` / `path:x` / substring, colour by folder, drag nodes; positions persist to `vault/.positions.json`. Dangling and ambiguous links render as hollow nodes — hiding them would hide the maintenance debt.
 - **CLI** (`ai-memory`): every subcommand works non-interactively, because hooks call it. Uses the daemon when one answers, otherwise opens the store in-process.
 - **MCP server** (`src/mcp/tools.ts`): `memory_*` tools, every one accepting an explicit `scope`.
 - **Zero runtime dependencies.** `node:http`, `node:sqlite`, `node:crypto`. Dev-only: tsx, typescript, vitest.
@@ -30,15 +30,40 @@ From source, if you want the UI and the full suite:
 git clone <repo> && cd ai-memory
 npm ci
 npm run seed     # 8 demo memories into the store the server reads
-npm start        # API + UI on http://127.0.0.1:3000  (PORT / HOST override)
+npm start        # API on http://127.0.0.1:3000  (PORT / HOST override; the console needs a build — see Console)
 ```
 
-Dev with reload: `npm run dev`. Then open **http://127.0.0.1:3000** for the inspector, or **/graph.html** for the wiki graph.
+Dev with reload: `npm run dev`. Then open **http://127.0.0.1:3000**.
+
+### Console
+
+One UI, served by the same `node:http` process as the API, **at `/`**. `/app` still answers, kept for old deep links; the inspector is gone. Nothing is fetched from a CDN, so it renders fully with the network off.
+
+```bash
+npm --prefix ui install     # once
+npm run ui:dev              # Vite on 127.0.0.1:5173, proxying the API on :3000
+# or the served build at `/`:
+npm run ui:build && npm start
+```
+
+An unbuilt console answers `/` with the command that builds it — an instruction, not a page.
+
+Five views:
+
+- **Recall** — search, the per-hit score decomposition, and the token budget bar with its `truncated` badge and overflow summary. The `0.72` / `0.35` / `0.2` floors are preset buttons, so the same query visibly goes from zero hits to several.
+- **Memories** — list, filters, a detail drawer, the supersede chain in both directions, and create / pin / status / supersede / soft-delete / restore.
+- **Sessions** — a read-only timeline of pi's own `.jsonl` session files, with the memory tool calls marked.
+- **Graph** — frames `/graph.html`, read-only over `vault/`.
+- **Stats** — the `?full=1` numbers, histograms, the decay candidates and what a decay would prune.
+
+Two themes — dark (default) and warm-white light — behind an `auto | dark | light` control, `auto` following `prefers-color-scheme`. Keyboard: `/` focus search, `Esc` close drawer, `j`/`k` move selection, `Cmd`/`Ctrl`+`Enter` submit.
+
+One honest limit: there is no token-savings figure, because recall results are not persisted, so the console does not show one.
 
 ### Wiki to memory
 
 ```bash
-npm run wiki:ingest -- ./docs            # markdown -> ./wiki/*.md + semantic sections
+npm run wiki:ingest -- ./docs            # markdown -> ./vault/*.md + semantic sections
 npm run wiki:links                       # graph: nodes, degrees, dangling links
 npm run wiki:links -- --suggest <slug>   # link candidates (shared title terms, no model call)
 npm run wiki:links -- --add <from> <to>  # append [[to]] to <from>
@@ -123,6 +148,10 @@ EMBEDDING_DIM=1024                                          # for any other mode
 
 NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` body fields that E5/Nemotron score on; OpenAI rejects those, so they are sent only for NIM.
 
+**A third path, from the console.** `Embeddings` in the Stats view picks a provider and writes `~/.ai-memory/settings.json` — the non-secret keys only (`EMBEDDING_PROVIDER`, the dim, the model, the base URL), **never an API key**. Precedence is **real environment > that file > built-in default**: an `EMBEDDING_PROVIDER` exported in your shell — or in `.env`, which is a real env value — beats the file, and the card says which of the three is in play. The change takes effect on the **next start**; the running process keeps its embedder (ADR-0009).
+
+The order is fixed: **write → dry run → migrate → restart.** Neither middle step is optional. A restart right after a write is refused by the startup guard, which names both dims — that is the guard working, not a crash. And migrating without restarting is the worse state: every row is at the new width while the running process still embeds at the old one, so searches return nothing until it restarts. The card counts the rows the running provider cannot read for exactly that reason, and says `restart now to restore search` when the migration ends.
+
 **Measured on this corpus** (53 live rows, `nvidia/nemotron-3-embed-1b` via NIM, 2026-10-06). Three memories, each asked twice — once in its own words, once paraphrased with no shared vocabulary — and scored by where the right memory lands in the whole store:
 
 | query | hash (384d) | nemotron (2048d) |
@@ -148,7 +177,7 @@ EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... ai-memory reembed   # rewrite in
 ai-memory reembed --dry-run                                        # count first, write nothing
 ```
 
-It covers archived, draft and soft-deleted rows too, so a later `restore` cannot hand the retriever a vector of the wrong width; a row left stale by an interrupted run is skipped by search rather than crashing it. `mv memory.db memory.db.bak` remains the start-fresh option.
+It covers archived, draft and soft-deleted rows too, so a later `restore` cannot hand the retriever a vector of the wrong width; a row left stale by an interrupted run is skipped by search rather than crashing it. A key still has to come from the environment; `reembed` reads the same merged settings the console writes, so the CLI and the console's migrate agree on which provider they are migrating to. `mv memory.db memory.db.bak` remains the start-fresh option.
 
 The vector weight follows the embedder: `0.6` when a real provider is configured, `0` for hash (which returns ~0.9 cosine to everything, so the term would be noise). `MEMORY_VECTOR_WEIGHT` overrides either. A configured embedder that contributed nothing to ranking would cost a network hop per save and buy nothing — which is why this is not a number you have to discover.
 
@@ -212,7 +241,7 @@ src/api/ server.ts (node:http, routes inline, serves UI), tool.ts
 src/adapters/           # agent config writers (claude, codex, pi, dsh)
 src/mcp/ tools.ts       # memory_* MCP tools
 src/cli/                # the ai-memory command
-src/ui/ index.html, app.js, graph.html, graph.js, style.css   # static, no build step
+src/ui/                 # graph.html, graph.js — the vault graph, framed by the console
 tests/                  # 173 tests
 scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts
 memory.db               # created on first run, gitignored
@@ -226,7 +255,7 @@ src/core/
   lifecycle/ decay.ts
   memoryService.ts
 src/api/ server.ts (node:http, routes inline, serves UI), tool.ts
-src/ui/ index.html, app.js, style.css  # static, no build step
+src/ui/ graph.html, graph.js  # framed by the console
 tests/ store.test.ts, retrieval.test.ts, api.test.ts
 scripts/ seed.ts
 memory.db               # created on first run

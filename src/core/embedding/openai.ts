@@ -29,12 +29,14 @@ export type ApiEmbeddingConfig = {
 export class ApiEmbeddingProvider implements EmbeddingProvider {
   readonly name: string;
   readonly dim: number;
+  readonly model: string;
   private readonly cfg: ApiEmbeddingConfig;
 
   constructor(cfg: ApiEmbeddingConfig) {
     this.cfg = cfg;
     this.name = cfg.name;
     this.dim = cfg.dim;
+    this.model = cfg.model;
   }
 
   async embed(text: string, opts?: { inputType?: string }): Promise<number[]> {

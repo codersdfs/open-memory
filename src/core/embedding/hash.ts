@@ -8,6 +8,7 @@ import { type EmbeddingProvider, normalize } from "./provider.js";
 export class HashEmbeddingProvider implements EmbeddingProvider {
   readonly name = "hash";
   readonly dim = 384;
+  readonly model: string | null = null;
 
   async embed(text: string, _opts?: { inputType?: string }): Promise<number[]> {
     return this.hashEmbed(text);

@@ -1,0 +1,50 @@
+/* D1 — one token set, two value blocks. Dark is Vantablack (default), light is Paper. */
+
+:root {
+  --radius: 8px;
+  --radius-sm: 6px;
+  --motion: 150ms cubic-bezier(.2, .8, .2, 1);
+  --motion-slow: 220ms cubic-bezier(.2, .8, .2, 1);
+  --font-ui: ui-sans-serif, "SF Pro Display", Geist, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+  --font-serif: "Iowan Old Style", "Newsreader", Georgia, serif;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #08090B;
+  --panel: #0E1013;
+  --panel-2: #14171C;
+  --hairline: rgba(255, 255, 255, .06);
+  --hairline-strong: rgba(255, 255, 255, .11);
+  --fg: #E9EBEF;
+  --dim: #8A9099;
+  --faint: #5A6068;
+  --accent: #8FA6FF;
+  --accent-dim: rgba(143, 166, 255, .16);
+  --ok: #57C99A;
+  --warn: #E3B341;
+  --danger: #F0616D;
+  --shadow: 0 24px 48px -24px rgba(0, 0, 0, .6);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #FBFAF7;
+  --panel: #FFFFFF;
+  --panel-2: #F5F3EE;
+  --hairline: rgba(0, 0, 0, .07);
+  --hairline-strong: rgba(0, 0, 0, .14);
+  --fg: #17181A;
+  --dim: #6F6D68;
+  --faint: #9C9A94;
+  --accent: #2F5D50;
+  --accent-dim: rgba(47, 93, 80, .12);
+  --ok: #2E7D5B;
+  --warn: #8A6A15;
+  --danger: #B3261E;
+  /* Paper has no shadow: separation is a hairline, per D2. */
+  --shadow: 0 0 0 1px var(--hairline-strong);
+}

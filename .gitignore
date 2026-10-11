@@ -12,5 +12,7 @@ _asar/
 .codebase-memory/
 .pi/
 
-# another project that lives in this folder — not part of ai-memory
-pi-usage-ui/
+# the console's toolchain: dev-only, never published (ADR-0007/0008)
+ui/node_modules/
+ui/dist/
+.empryo

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>open-memory</title>
+    <!-- Runs before first paint, so the stored theme is on the root element before any
+         token resolves. No links, no imports: the console renders offline. -->
+    <script>
+      (function () {
+        var stored = null;
+        try {
+          stored = localStorage.getItem('om-theme');
+        } catch (e) {
+          stored = null;
+        }
+        var prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+        var dark = stored === 'dark' || (stored !== 'light' && !prefersLight);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

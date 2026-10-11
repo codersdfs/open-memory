@@ -10,9 +10,12 @@
     "open-memory": "dist/src/cli/index.js",
     "ai-memory": "dist/src/cli/index.js"
   },
-  "files": ["dist/src", "dist/scripts", "src/ui", "README.md", "CONTEXT.md", "LICENSE", "docs", ".env.example"],
+  "files": ["dist/src", "dist/scripts", "src/ui", "dist/src/ui-next", "README.md", "CONTEXT.md", "LICENSE", "docs", ".env.example"],
   "scripts": {
     "dev": "tsx watch src/api/server.ts",
+    "ui:dev": "npm --prefix ui run dev",
+    "ui:build": "npm --prefix ui run build",
+    "ui:typecheck": "npm --prefix ui run typecheck",
     "start": "tsx src/api/server.ts",
     "build": "tsc -p tsconfig.json && node scripts/copy-ui.mjs",
     "test": "vitest run",

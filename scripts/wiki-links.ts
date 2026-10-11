@@ -1,6 +1,6 @@
-import { loadPages, buildGraph, suggestPages, addLink } from "../src/core/graph.js";
+import { loadPages, buildGraph, suggestPages, addLink, vaultDir } from "../src/core/graph.js";
 
-const dir = process.env.WIKI_DIR ?? "wiki";
+const dir = vaultDir();
 const a = process.argv.slice(2);
 const flag = (n: string) => a.includes(n);
 const after = (n: string) => { const i = a.indexOf(n); return i === -1 ? [] : a.slice(i + 1); };
@@ -10,7 +10,7 @@ if (flag("--help") || flag("-h")) {
     "  tsx scripts/wiki-links.ts                     # nodes/edges table\n" +
     "  tsx scripts/wiki-links.ts --suggest <slug>    # link candidates, no write\n" +
     "  tsx scripts/wiki-links.ts --add <from> <to>   # append [[to]] to <from>\n" +
-    "\nWIKI_DIR overrides the wiki folder (default ./wiki)");
+    "\nVAULT_DIR (or the older WIKI_DIR) overrides the folder (default ./vault)");
   process.exit(0);
 }
 

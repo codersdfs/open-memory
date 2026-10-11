@@ -7,6 +7,7 @@ import type { Memory, MemoryInput, SearchOptions, SearchResult } from "./types.j
 import { Extractor } from "./extraction/extractor.js";
 import { InMemoryVectorStore } from "./store/memory.js";
 import { resolveDbPath } from "./dbPath.js";
+import { embedEnv } from "./settings.js";
 import { resolveScopeKeys, resolveWriteKey, type MemoryScope } from "./scope.js";
 
 export class MemoryService {
@@ -26,7 +27,8 @@ export class MemoryService {
       this.store = new InMemoryVectorStore();
       (this as unknown as { _needsSqlite: boolean })._needsSqlite = true;
     }
-    this.embedder = opts?.embedder ?? createEmbeddingProvider();
+    // Merged env, so a `settings.json` applies without a caller knowing it exists.
+    this.embedder = opts?.embedder ?? createEmbeddingProvider(embedEnv());
     this.retriever = new HybridRetriever(this.store, this.embedder);
     this.extractor = new Extractor();
     this.dedupThreshold = opts?.dedupThreshold ?? 0.92;

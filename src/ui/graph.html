@@ -1,19 +1,87 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Wiki graph</title>
+<title>Vault graph</title>
+<script>
+  // The theme lands on <html> before first paint, in the order the console resolves it:
+  // the frame's ?theme= (what makes a directly-visited graph correct), then the shared
+  // choice, then the OS. No attribute means dark, which is the :root default below.
+  (function () {
+    var q = new URLSearchParams(location.search).get("theme");
+    var stored = null;
+    try { stored = localStorage.getItem("om-theme"); } catch (e) { stored = null; }
+    var theme = q === "dark" || q === "light" ? q
+      : stored === "dark" || stored === "light" ? stored
+      : window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 <style>
-  body{margin:0;background:#09090b;color:#e4e4e7;font:13px ui-sans-serif,system-ui;display:flex;height:100vh}
+  /* D1 — one token set, two value blocks, the same values as the console's tokens.css.
+     graph.js reads these; no colour in it is a literal. `:root` alone is dark, so a
+     document with no data-theme still renders. */
+  :root,
+  :root[data-theme='dark'] {
+    color-scheme: dark;
+    --bg: #08090B;
+    --panel: #0E1013;
+    --panel-2: #14171C;
+    --hairline: rgba(255, 255, 255, .06);
+    --fg: #E9EBEF;
+    --dim: #8A9099;
+    --faint: #5A6068;
+    --accent: #8FA6FF;
+    /* Canvas-only knobs: edges are the dim token, a mutual edge is the accent, and a
+       folder hue is mixed with the theme's own saturation/lightness so it reads here. */
+    --edge: var(--dim);
+    --edge-hot: var(--accent);
+    --node-sat: 68%;
+    --node-lig: 62%;
+  }
+  :root[data-theme='light'] {
+    color-scheme: light;
+    --bg: #FBFAF7;
+    --panel: #FFFFFF;
+    --panel-2: #F5F3EE;
+    --hairline: rgba(0, 0, 0, .07);
+    --fg: #17181A;
+    --dim: #6F6D68;
+    --faint: #9C9A94;
+    --accent: #2F5D50;
+    --edge: var(--dim);
+    --edge-hot: var(--accent);
+    --node-sat: 55%;
+    --node-lig: 42%;
+  }
+  body{margin:0;background:var(--bg);color:var(--fg);font:13px ui-sans-serif,system-ui;display:flex;height:100vh}
+  #stage{flex:1;display:flex;flex-direction:column;min-width:0}
+  #bar{display:flex;gap:10px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--hairline);flex-wrap:wrap}
+  #filter{background:var(--panel-2);border:1px solid var(--hairline);color:var(--fg);border-radius:4px;padding:3px 8px;font-size:12px;width:230px}
+  #depth{width:80px}
+  label{font-size:11px;display:flex;gap:4px;align-items:center;color:var(--dim)}
+  #bar input[type=checkbox]{accent-color:var(--accent)}
+  #legend{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+  .chip{display:flex;gap:4px;align-items:center;cursor:pointer;font-size:11px;color:var(--dim)}
+  .chip:hover{color:var(--fg)}
+  .dot{width:8px;height:8px;border-radius:50%}
   #canvas{flex:1;display:block;cursor:grab} #canvas.panning{cursor:grabbing}
-  #side{width:300px;border-left:1px solid #27272a;padding:16px;overflow:auto;background:#0c0c0e}
-  h2{font-size:13px;margin:0 0 4px} .muted{color:#71717a;font-size:11px}
+  #side{width:300px;border-left:1px solid var(--hairline);padding:16px;overflow:auto;background:var(--panel)}
+  h2{font-size:13px;margin:0 0 4px} .muted{color:var(--faint);font-size:11px}
   ul{list-style:none;padding:0;margin:8px 0} li{padding:2px 0}
-  a{color:#a5b4fc;cursor:pointer;text-decoration:none} a:hover{text-decoration:underline}
-  button{background:#27272a;border:0;color:#e4e4e7;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px}
-  button:hover{background:#3f3f46}
-  svg text{font-size:10px;fill:#a1a1aa;pointer-events:none;user-select:none}
+  a{color:var(--accent);cursor:pointer;text-decoration:none} a:hover{text-decoration:underline}
+  .tag{display:inline-block;font-size:10px;color:var(--dim);background:var(--panel-2);border:1px solid var(--hairline);border-radius:3px;padding:0 4px;margin:0 3px 3px 0}
+  svg text{font-size:10px;fill:var(--dim);pointer-events:none;user-select:none}
 </style></head>
 <body>
-<svg id="canvas"></svg>
+<div id="stage">
+  <div id="bar">
+    <input id="filter" type="search" placeholder="tag:x · path:x · substring" />
+    <label><input id="local" type="checkbox" /> local</label>
+    <label for="depth">depth</label><input id="depth" type="range" min="1" max="3" value="1" disabled />
+    <span id="count" class="muted"></span>
+    <div id="legend"></div>
+  </div>
+  <svg id="canvas"></svg>
+</div>
 <div id="side"><p class="muted">click a node</p></div>
 <script src="./graph.js"></script>
 </body></html>

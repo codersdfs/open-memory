@@ -2,6 +2,7 @@ import "../src/config.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { MemoryService } from "../src/core/memoryService.js";
+import { vaultDir } from "../src/core/graph.js";
 
 const ns = process.env.NAMESPACE ?? "default:default";
 const dbPath = process.env.MEMORY_DB_PATH ?? "memory.db";
@@ -73,7 +74,7 @@ async function collectFiles(p: string): Promise<string[]> {
   for (const e of entries) {
     const full = path.join(p, e.name);
     if (e.isDirectory()) {
-      if (e.name.startsWith(".") || e.name === "node_modules" || e.name === ".codegraph" || e.name === "wiki") continue;
+      if (e.name.startsWith(".") || e.name === "node_modules" || e.name === ".codegraph" || e.name === "wiki" || e.name === "vault") continue;
       out.push(...(await collectFiles(full)));
     } else if (e.isFile() && (e.name.endsWith(".md") || e.name.endsWith(".txt"))) {
       out.push(full);
@@ -85,16 +86,17 @@ async function collectFiles(p: string): Promise<string[]> {
 async function main() {
   const args = process.argv.slice(2);
   if (args.length === 0 || args.includes("--help")) {
-    console.log(`wiki-ingest — 003 hybrid: docs → ./wiki/*.md + semantic scope:wiki
+    console.log(`wiki-ingest — 003 hybrid: docs → the vault/*.md + semantic scope:wiki
 
-Usage: npx tsx scripts/wiki-ingest.ts <file|dir> [--out ./wiki] [--ns default:default]
+Usage: npx tsx scripts/wiki-ingest.ts <file|dir> [--out ./vault] [--ns default:default]
+       VAULT_DIR (or WIKI_DIR) sets the default --out
        npm run wiki:ingest -- ./docs/foo.md
        npm run wiki:ingest -- ./docs
 `);
     process.exit(0);
   }
   const outIdx = args.indexOf("--out");
-  const outDir = outIdx !== -1 ? args[outIdx + 1] : "wiki";
+  const outDir = outIdx !== -1 ? args[outIdx + 1] : vaultDir();
   const nsIdx = args.indexOf("--ns");
   const effNs = nsIdx !== -1 ? args[nsIdx + 1] : ns;
   // positional

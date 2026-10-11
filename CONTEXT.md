@@ -38,3 +38,12 @@ _Avoid_: tenant, workspace
 
 **Layer (solo alias)**: Tencent L0-L3 mapped onto flat types without a new column — `L0 raw conversation ~= episodic (source: chat)`, `L1 Atom ~= semantic fact (importance >=0.7)`, `L2 Scenario ~= semantic|procedural with tags scope:scenario:* / scope:repo:*`, `L3 Persona ~= semantic with tags scope:persona`. Layers are simulated via `tags` + `importance`; retrieval stays one flat `HybridRetriever` call.
 _Avoid_: L0/L1/L2/L3 as separate types
+
+**Console**: The one browser UI (`ui/`, built to `dist/src/ui-next`, served at `/`). It is a client of the store, not part of it — distinct from the store, the CLI and the MCP server.
+_Avoid_: inspector, dashboard, front-end
+
+**Theme (Vantablack / Paper)**: One token set with two values — Vantablack (dark, the default) and Paper (warm-white light). Anything that hardcodes a colour is a bug.
+_Avoid_: dark mode, skin
+
+**Embedding switch**: The non-secret settings file the console writes (`~/.ai-memory/settings.json`) plus the migration and restart that apply it — the provider is never swapped in place, because one process serves one vector space. A real environment variable, `.env` included, beats the file, and the file beats the built-in default.
+_Avoid_: hot swap, live provider

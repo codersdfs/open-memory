@@ -1,6 +1,6 @@
 # Node graph — Obsidian-like connections in ai-memory
 
-Status: design only. No code yet.
+Status: v1 shipped — `src/core/graph.ts`, `/graph`, `/positions`, `src/ui/graph.{html,js}`. v2 (body wikilinks, `vault/` root, local graph, filters, colour groups) is planned in `wayfinder/tickets/012-task-vault-knowledge-graph.md`; that ticket supersedes the Open section below.
 
 ## Problem
 
