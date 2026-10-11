@@ -11,6 +11,12 @@ _asar/
 .codegraph/
 .codebase-memory/
 .pi/
+bench/            # benchmark workspace; a clone of another repo lives inside it
+downloads/        # scratch downloads
+vault/            # your own markdown, pointed at by VAULT_DIR — not sample data
+rea-usage.md      # local reading notes
+_vfy.sh           # local helper scripts
+_wslsetup.sh
 
 # the console's toolchain: dev-only, never published (ADR-0007/0008)
 ui/node_modules/
