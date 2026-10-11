@@ -9,6 +9,7 @@ import { embedEnv } from "../core/settings.js";
 import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
 import type { Memory, MemoryType, SearchResult } from "../core/types.js";
+import { stripEmbedding } from "../core/types.js";
 
 /**
  * `ai-memory` — the one command every agent uses (ADR-0007).
@@ -113,11 +114,6 @@ class Runner {
   async close(): Promise<void> {
     if (this.svc) await this.svc.close();
   }
-}
-
-function stripEmbedding(m: Memory): Omit<Memory, "embedding"> {
-  const { embedding: _drop, ...rest } = m;
-  return rest;
 }
 
 function renderMemories(result: SearchResult, ctx: Ctx): void {

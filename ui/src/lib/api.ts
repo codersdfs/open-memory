@@ -22,7 +22,11 @@ export interface Memory {
   namespace: string;
   type: MemoryType;
   text: string;
-  embedding: number[];
+  /**
+   * Absent on every HTTP response unless the call passes `embedding=1` — a 384-float
+   * vector is ~9 kB and both in-repo consumers discard it after receipt.
+   */
+  embedding?: number[];
   importance: number;
   strength: number;
   lastUsedAt: number | null;

@@ -4,7 +4,7 @@ import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import { MemoryService } from "../core/memoryService.js";
-import { TYPES, STATUSES, type MemoryType, type MemoryStatus } from "../core/types.js";
+import { stripEmbedding, TYPES, STATUSES, type MemoryType, type MemoryStatus } from "../core/types.js";
 import { appVersion } from "../version.js";
 import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding, type EmbeddingProvider } from "../core/embedding/index.js";
 import { reembedAll, type ReembedResult } from "../core/embedding/reembed.js";
@@ -117,6 +117,19 @@ export async function buildServer(opts?: { dbPath?: string; service?: MemoryServ
   });
   app.on("close", () => service.close());
   return { app, service };
+}
+
+/**
+ * HTTP responses carry no vectors unless asked (`?embedding=1`).
+ *
+ * A 384-float embedding is ~9 kB per memory and a search returns five of them — for a
+ * payload whose point is text, a score and a token budget. Both consumers inside this
+ * repo already discard the field after receiving it (the MCP tools and the CLI), so
+ * stripping here removes bytes nothing was reading. The flag exists because whoever
+ * does want raw vectors should not have to open the store to get them.
+ */
+function wantsEmbedding(query: Record<string, string | undefined>): boolean {
+  return boolish(query.embedding) === true;
 }
 
 function send(res: ServerResponse, status: number, body: unknown) {
@@ -285,7 +298,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   if (/^\/memories\/search$/.test(path)) {
     const p = parseSearch(method === "GET" ? q : await readJson(req));
     if ("status" in p) return send(res, p.status, p.body);
-    return send(res, 200, await service.search(p.data));
+    const result = await service.search(p.data);
+    return send(res, 200, wantsEmbedding(q) ? result : { ...result, memories: result.memories.map(stripEmbedding) });
   }
 
   const mem = new RegExp("^/memories(/[^/]+)?(/supersede)?$").exec(path);
@@ -314,7 +328,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     }
     if (id && !mem[2] && method === "GET") {
       const found = await service.get(id);
-      return found ? send(res, 200, found) : send(res, 404, { error: "not found" });
+      if (!found) return send(res, 404, { error: "not found" });
+      return send(res, 200, wantsEmbedding(q) ? found : stripEmbedding(found));
     }
     if (id && !mem[2] && method === "DELETE") {
       await service.delete(id);
@@ -326,7 +341,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       return send(res, 201, await service.save(p.data));
     }
     if (!id && method === "GET") {
-      return send(res, 200, await service.list({
+      const listed = await service.list({
         namespace: str(q.namespace, 200, 1) ?? "default:default",
         type: enumOf(q.type, TYPES),
         includeDeleted: boolish(q.includeDeleted),
@@ -336,7 +351,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
         limit: num(q.limit, 1, 1000) ?? 50,
         offset: num(q.offset, 0, 1e9) ?? 0,
         query: str(q.q ?? q.query, 2000, 1),
-      } as never));
+      } as never);
+      return send(res, 200, wantsEmbedding(q) ? listed : { ...listed, memories: listed.memories.map(stripEmbedding) });
     }
   }
 

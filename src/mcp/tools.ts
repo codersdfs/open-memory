@@ -1,5 +1,6 @@
 import type { MemoryService } from "../core/memoryService.js";
 import type { Memory, MemoryType, SearchResult } from "../core/types.js";
+import { stripEmbedding } from "../core/types.js";
 import { resolveAgent, resolveRequestScope, resolveWriteKey, type MemoryScope } from "../core/scope.js";
 
 /**
@@ -124,11 +125,6 @@ export interface McpToolResult {
 }
 
 const asScope = (v: unknown): MemoryScope | undefined => (v === "shared" ? "shared" : v === "private" ? "private" : undefined);
-
-function stripEmbedding<T extends { embedding?: number[] }>(m: T): Omit<T, "embedding"> {
-  const { embedding: _drop, ...rest } = m;
-  return rest;
-}
 
 function renderSearch(r: SearchResult, budget: number): string {
   if (r.memories.length === 0) return "no memories matched";

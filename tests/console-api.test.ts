@@ -362,4 +362,25 @@ describe("embedding switch", () => {
     expect(after.stored.byVectorDim).toEqual({ "384": 1 });
     expect(after.stored.unreadable).toBe(0);
   });
+
+  it("keeps vectors off the wire unless asked for them", async () => {
+    // ~9 kB per memory, discarded by both in-repo consumers after receipt. The flag
+    // exists for whoever genuinely wants raw vectors.
+    const list = (await (await fetch(`${base}/memories?namespace=test:9`)).json()) as { memories: (Record<string, unknown> & { id: string })[] };
+    expect(list.memories).toHaveLength(1);
+    expect(list.memories[0]).not.toHaveProperty("embedding");
+    const id = list.memories[0]!.id;
+
+    const withVec = (await (await fetch(`${base}/memories?namespace=test:9&embedding=1`)).json()) as { memories: { embedding: number[] }[] };
+    expect(withVec.memories[0]!.embedding).toHaveLength(384);
+
+    const one = (await (await fetch(`${base}/memories/${id}`)).json()) as Record<string, unknown>;
+    expect(one).not.toHaveProperty("embedding");
+    const oneVec = (await (await fetch(`${base}/memories/${id}?embedding=1`)).json()) as { embedding: number[] };
+    expect(oneVec.embedding).toHaveLength(384);
+
+    const hits = (await (await post("/memories/search", { namespace: "test:9", query: "Berlin", threshold: 0, k: 5 })).json()) as { memories: Record<string, unknown>[] };
+    expect(hits.memories.length).toBeGreaterThan(0);
+    expect(hits.memories[0]).not.toHaveProperty("embedding");
+  });
 });

@@ -116,6 +116,19 @@ export interface ScoreBreakdown {
   final: number;
 }
 
+/**
+ * Drop the vector from a memory on its way out.
+ *
+ * A 384-float embedding is ~9 kB of a response whose point is text and a score, and
+ * both consumers inside this repo already discard it — the MCP tools and the CLI strip
+ * it after receipt, so this only ever removed wasted bytes on the wire. It lives here
+ * because three layers need the same three lines, and a fourth copy is how they drift.
+ */
+export function stripEmbedding<T extends { embedding?: unknown }>(memory: T): Omit<T, "embedding"> {
+  const { embedding: _drop, ...rest } = memory;
+  return rest;
+}
+
 export interface SearchResult {
   memories: SearchResultItem[];
   tokensUsed: number;
