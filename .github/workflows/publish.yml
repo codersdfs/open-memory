@@ -1,0 +1,54 @@
+name: publish
+
+# Trusted publishing: GitHub mints a short-lived OIDC token and npm exchanges it for a
+# publish token, so there is no NPM_TOKEN secret to store, leak or rotate. That is why
+# this workflow needs `id-token: write` and nothing else. The one-time npmjs.com side of
+# this is written down in docs/releasing.md.
+on:
+  push:
+    tags: ['v*']
+  # Retry path: the first tag push happens before a trusted publisher can exist (the
+  # package has to be on npm first), and a rerun also covers a transient failure.
+  workflow_dispatch:
+
+permissions:
+  id-token: write # required: without it npm cannot authenticate over OIDC
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest # trusted publishing does not support self-hosted runners
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false # a release build must not reuse a cache
+
+      - run: npm ci
+
+      # The console is in the tarball (`files` -> dist/src/ui-next) and root
+      # `npm run build` only copies a console that already exists: `copy-ui.mjs` is
+      # best-effort, so a release that skips these two steps ships without the UI and
+      # says nothing about it.
+      - run: npm --prefix ui ci
+      - run: npm --prefix ui run build
+
+      - run: npm run build
+
+      # `prepublishOnly` (package.json) runs lint, tests and the build before the
+      # upload, so a red suite stops the release instead of reaching the registry.
+      - name: publish
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json $version"
+            exit 1
+          fi
+          case "$version" in
+            *-*) tag=beta ;; # 0.3.0-beta.1 -> npm i open-memory@beta
+            *)   tag=latest ;;
+          esac
+          echo "publishing $version with dist-tag $tag"
+          npm publish --tag "$tag"

@@ -3,6 +3,8 @@
   "version": "0.3.0-beta.1",
   "description": "Local-first memory for pi agents: SQLite + hybrid retrieval + hard token budget. One process, no UI framework.",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/codersdfs/open-memory.git" },
+  "homepage": "https://github.com/codersdfs/open-memory#readme",
   "keywords": ["memory", "agents", "rag", "sqlite", "mcp", "vector-search", "local-first"],
   "engines": { "node": ">=22.5.0" },
   "type": "module",
