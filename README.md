@@ -208,6 +208,34 @@ Score = `0.6*bm25 + 0.25*recency + 0.15*strength` (`vector` weight 0 by default 
 
 **`MEMORY_VECTOR_WEIGHT`** defaults to `0.6` once a real embedder is configured and `0` for hash: the hash provider returns ~0.9 cosine to everything, so the vector term would be noise, and with it lexical overlap is the only relevance signal that exists. Set the variable to override either way.
 
+## Benchmarks
+
+![LoCoMo conv-26: accuracy, context fed per question, retrieval latency, reader and judge input
+ tokens, and ingest time for open-memory, OpenViking 0.4.23 and mem0 OSS 2.2.1](docs/images/locomo-memory-shootout.png)
+
+Three memory systems, one reading model, one set of questions: LoCoMo `conv-26`, 152 questions
+(the adversarial category 5 excluded, as OpenViking's own harness excludes it), the same pinned
+answering model and the same embeddings everywhere. open-memory answers **50.7%** of them against
+**39.5%** for OpenViking 0.4.23 and **14.5%** for mem0 OSS 2.2.1, while feeding each question
+2,588 characters of context (OpenViking 17,701, mem0 748 — the trade that makes mem0 cheap and
+least accurate) and ingesting the conversation in **15.1 s** instead of 140 s or ~2.5 h. The chart
+carries retrieval latency and reader tokens as well; each bar has its own axis and unit.
+
+The ordering is not an artifact of the LLM judge: a model-free string-hit audit agrees with it
+(19.7% / 10.5% / 3.3%), every row has non-empty retrieved context, and the paired comparisons are
+significant (open-memory vs OpenViking 37/20, p=0.033; vs mem0 62/7, p<0.001).
+
+Read it with the caveats, which matter more than the bars:
+
+- **One conversation, 152 questions.** Enough for this ordering to be significant; not a full
+  LoCoMo result.
+- **The answering model judges itself.** Symmetric across the three systems, and still a bias.
+- **These are not the vendors' published numbers.** OpenViking reports 80-83% with a different
+  reader; the mem0 figure here is what this harness reproduced, not what mem0 claims. Compare
+  inside the table, never against their READMEs.
+- The per-question rows and the harness that produced them are not published yet.
+
+
 ## Smart write gate
 
 Extraction is two stages, cheapest first.
