@@ -3,6 +3,9 @@
 > **Status: `0.3.0-beta.1`** — first published build. The storage format is settled; the
 > HTTP and MCP surfaces can still move between prereleases.
 
+![the console: a query, the floor preset that made seven hits appear, the token budget,
+and the score decomposition behind every hit](docs/images/console-recall-dark.png)
+
 A **local-first, namespace-partitioned memory substrate** that stores *Episodic / Semantic / Procedural / Working* memories as vectors and retrieves them with **smart search + hard token budget** to prevent *Token Burning* (cost) and *Context Burning* (irrelevant dilution).
 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
@@ -19,6 +22,10 @@ A **local-first, namespace-partitioned memory substrate** that stores *Episodic 
 ## Quick start
 
 **Requires Node 22+** — `node:sqlite` is still flagged experimental (Node 24 is what this is developed against).
+
+**Platforms:** developed and used on Windows, and verified on Linux by CI, which installs
+the packed tarball on a clean Ubuntu runner and exercises the CLI, the daemon and the
+console there. **macOS is untested** — reports welcome.
 
 ```bash
 npm i -g open-memory    # the package; the command is still `ai-memory`
@@ -57,6 +64,8 @@ run directly:
 ```bash
 node node_modules/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB_PATH
 ```
+
+![the same view in the light theme](docs/images/console-recall-light.png)
 
 Five views:
 

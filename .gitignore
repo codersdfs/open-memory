@@ -11,11 +11,13 @@ _asar/
 .codegraph/
 .codebase-memory/
 .pi/
-bench/            # benchmark workspace; a clone of another repo lives inside it
-downloads/        # scratch downloads
-vault/            # your own markdown, pointed at by VAULT_DIR — not sample data
-rea-usage.md      # local reading notes
-_vfy.sh           # local helper scripts
+# .gitignore has no end-of-line comments — the first version of these lines ended with
+# "# ..." and therefore matched nothing. Comments go on their own line.
+bench/
+downloads/
+vault/
+rea-usage.md
+_vfy.sh
 _wslsetup.sh
 
 # the console's toolchain: dev-only, never published (ADR-0007/0008)

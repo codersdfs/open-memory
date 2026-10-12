@@ -5,7 +5,7 @@ Notable changes. The package is `open-memory`; the command stays `ai-memory`.
 Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
 on-disk format is the part that does not.
 
-## 0.3.0-beta.1 — 2026-10-11
+## 0.3.0-beta.1 — 2026-10-12
 
 ### Fixed
 
@@ -35,6 +35,19 @@ on-disk format is the part that does not.
   ("Do not force push"), procedures ("How to deploy the UI: npm run …") and
   when-clauses ("When user says save, call …") are kept.
 
+- **The CLI did nothing at all on Linux.** A global install puts a symlink in `bin/`, and the
+  entry guard compared the path that was typed against the path Node resolves through the
+  link, so the two never matched: `open-memory version` printed zero bytes and exited 0, and
+  every command was a silent no-op for anyone who installed this from npm on a POSIX system.
+  The guard compares real paths now. Found by the smoke test below on the first runner it
+  ever saw, which is the reason that step exists.
+- **A daemon-backed `search` looked in the wrong partition.** The CLI resolves the caller's
+  partition plus the legacy one before searching, but the request carried only the raw flags
+  — including `agent` and `scope`, which the server has never read — so the daemon answered
+  from its own default scope and reported "no memories matched" for rows that were plainly
+  there. `GET`/`POST /memories/search` takes a comma-separated `namespaces` now, the CLI
+  sends the list it resolved, and a test covers that case.
+
 ### Added
 
 - **A semantic gate.** A memory with no shared words is admitted when it is the
@@ -53,5 +66,3 @@ on-disk format is the part that does not.
 
 - No measured comparison between the hash embedder and a real provider yet; that
   needs a key (`wayfinder/tickets/011`). The vector path is wired, not proven.
-- `repository` and `author` are still unset, so the npm page cannot link to the
-  source yet.
