@@ -226,7 +226,8 @@ describe("two whitelists", () => {
     writeFileSync(tmp, "{}", "utf8");
     chmodSync(tmp, 0o644);
     await writeSettings({ OPENAI_API_KEY: "sk-test" }, home);
+    // Only the mode is asserted: the rename consumes the tmp either way, so "the tmp is
+    // gone" holds with or without the fix and would never fail.
     expect(statSync(settingsPath(home)).mode & 0o777).toBe(0o600);
-    expect(existsSync(tmp)).toBe(false);
   });
 });

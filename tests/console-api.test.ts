@@ -305,6 +305,15 @@ describe("embedding switch", () => {
     expect(((await res.json()) as { error: string }).error).toContain("is not an embedding setting");
   });
 
+  it("refuses several non-switch keys with a plural", async () => {
+    // One key reads as a sentence, more than one has to agree with the verb. Both keys
+    // here are whitelisted secrets, so `writeSettings` would take them: the scope guard
+    // is the only thing standing between them and settings.json.
+    const res = await post("/embedding", { OPENAI_API_KEY: "sk-not-really", JEV_API_KEY: "a" });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("are not embedding settings");
+  });
+
   it("refuses a write the environment would override", async () => {
     // The precedence is real env > file, so a key already set in the environment makes
     // this write a no-op. Measured on the real machine: this repo's .env sets
