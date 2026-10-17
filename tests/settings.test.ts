@@ -247,6 +247,7 @@ describe("adoptEnvKeys", () => {
 
     expect(result).toEqual({
       adopted: ["JEV_API_KEY", "MEMORY_JEV"],
+      notAdopted: [],
       backupPath: `${envFile()}.bak`,
       restartRequired: true,
     });
@@ -269,9 +270,49 @@ describe("adoptEnvKeys", () => {
 
     const result = await adoptEnvKeys({ home, envFile: envFile() });
 
-    expect(result).toEqual({ adopted: [], backupPath: null, restartRequired: true });
+    expect(result).toEqual({ adopted: [], notAdopted: [], backupPath: null, restartRequired: true });
     expect(readFileSync(envFile()).equals(before)).toBe(true);
     expect(existsSync(settingsPath(home))).toBe(false);
     expect(existsSync(`${envFile()}.bak`)).toBe(false);
+  });
+
+  it("writes settings before it touches .env, so a failed write leaves the key enabled", async () => {
+    // A `home` whose parent is a regular file: mkdir/writeSettings cannot succeed, so this is
+    // where the order of the two writes becomes visible. With them swapped, `.env` would be
+    // commented, .env.bak written, and the value the line held would exist nowhere —
+    // settings.json never got it.
+    const blocker = path.join(home, "blocker");
+    writeFileSync(blocker, "not a directory", "utf8");
+    const blockedHome = path.join(blocker, "home");
+    putEnv("JEV_API_KEY=abc\n");
+
+    await expect(adoptEnvKeys({ home: blockedHome, envFile: envFile() })).rejects.toThrow();
+
+    expect(readFileSync(envFile(), "utf8")).toBe("JEV_API_KEY=abc\n");
+    expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["JEV_API_KEY"]);
+    expect(existsSync(settingsPath(blockedHome))).toBe(false);
+    expect(existsSync(`${envFile()}.bak`)).toBe(false);
+  });
+
+  it("leaves a line .env cannot read back exactly enabled, and reports it", async () => {
+    // `parseValue` does not interpret escapes, so this reads as `ab\` — adopting it would
+    // persist the wrong key and comment the real line out.
+    putEnv('JEV_API_KEY="ab\\"cd"\nMEMORY_JEV=true\n');
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({
+      adopted: ["MEMORY_JEV"],
+      notAdopted: ["JEV_API_KEY"],
+      backupPath: `${envFile()}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).toEqual({ MEMORY_JEV: "true" });
+    expect(readSettings(home)).not.toHaveProperty("JEV_API_KEY");
+
+    const lines = readFileSync(envFile(), "utf8").split("\n");
+    expect(lines).toContain('JEV_API_KEY="ab\\"cd"');
+    expect(lines).toContain("#MEMORY_JEV=true");
+    expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["JEV_API_KEY"]);
   });
 });

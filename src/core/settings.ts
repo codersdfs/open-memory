@@ -134,12 +134,30 @@ export interface AdoptOptions {
 }
 
 export interface AdoptResult {
-  /** The names that moved, in `.env` order. */
+  /**
+   * The names `commentOutEnvKeys` actually commented, in `.env` order — the `.env` rewrite's
+   * report, not the list settings.json recorded, so it can be shorter than that list when the
+   * file no longer matched.
+   */
   adopted: string[];
+  /**
+   * Enabled whitelisted names left in `.env` because their line could not be read exactly —
+   * see `adoptEnvKeys`. Empty when every value present was adopted.
+   */
+  notAdopted: string[];
   /** Where the pre-edit `.env` copy lives; `null` when `.env` was not touched. */
   backupPath: string | null;
   /** Always `true`: the running process still holds what it read at boot. */
   restartRequired: boolean;
+}
+
+/**
+ * Whether `.env`'s parser reproduces this line's value exactly. `parseValue` strips the
+ * quotes and drops an inline comment but interprets no escapes, so a backslash — the shape
+ * `\"` and every other quote-escaped character takes — marks a value adopt would get wrong.
+ */
+function hasEscape(raw: string | undefined): boolean {
+  return raw !== undefined && raw.includes("\\");
 }
 
 /**
@@ -154,25 +172,47 @@ export interface AdoptResult {
  * Settings are written first and `.env` commented second: a failure between the two
  * leaves the value in both places, which the next call finishes, where the reverse order
  * would lose it.
+ *
+ * A line whose value `.env` cannot be read back exactly is not moved at all, because
+ * commenting it out would make `settings.json` the only copy and the value there would be
+ * wrong. `parseValue` strips the quotes but does not interpret escapes, so
+ * `JEV_API_KEY="ab\"cd"` reads as `ab\`. A name with such a line stays enabled in `.env`
+ * and is reported in `notAdopted`; making the file explainable beats silently rewriting a key.
  */
 export async function adoptEnvKeys(opts: AdoptOptions = {}): Promise<AdoptResult> {
   const file = opts.envFile ?? envFilePath();
-  const patch: Settings = {};
-  const names: WritableKey[] = [];
+  const entries: { name: WritableKey; value: string; line: number }[] = [];
 
   for (const entry of readEnvFile(file)) {
-    const name = entry.name;
     // A commented line is already doing nothing, and an empty value reads as unset on both
     // sides of the merge — neither has a value to move or a shadow to clear.
-    if (!entry.enabled || !isWritableKey(name) || entry.value === "") continue;
-    patch[name] = entry.value;
-    if (!names.includes(name)) names.push(name);
+    if (!entry.enabled || !isWritableKey(entry.name) || entry.value === "") continue;
+    entries.push({ name: entry.name, value: entry.value, line: entry.line });
   }
-  if (names.length === 0) return { adopted: [], backupPath: null, restartRequired: true };
+  if (entries.length === 0) return { adopted: [], notAdopted: [], backupPath: null, restartRequired: true };
+
+  // `readEnvFile` splits the same latin-1 text on the same newline, so `line - 1` indexes it.
+  const lines = readFileSync(file, "latin1").split("\n");
+  // One unreadable line makes its name unadoptable: `commentOutEnvKeys` comments every
+  // enabled line of a name it is given, which would take the unreadable value with it.
+  const lossy = new Set<string>();
+  for (const entry of entries) {
+    if (hasEscape(lines[entry.line - 1])) lossy.add(entry.name);
+  }
+
+  const patch: Settings = {};
+  const names: WritableKey[] = [];
+  for (const entry of entries) {
+    if (lossy.has(entry.name)) continue;
+    patch[entry.name] = entry.value;
+    if (!names.includes(entry.name)) names.push(entry.name);
+  }
+  const notAdopted = [...lossy];
+  if (names.length === 0) return { adopted: [], notAdopted, backupPath: null, restartRequired: true };
 
   await writeSettings(patch, opts.home);
   const { commented, backupPath } = await commentOutEnvKeys(file, names);
-  return { adopted: commented, backupPath, restartRequired: true };
+  return { adopted: commented, notAdopted, backupPath, restartRequired: true };
 }
 
 /** An empty string is an absent value, on either side of the merge. */
