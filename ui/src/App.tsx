@@ -6,6 +6,7 @@ import MemoriesView from './views/Memories';
 import SessionsView from './views/Sessions';
 import GraphView from './views/Graph';
 import StatsView from './views/Stats';
+import SettingsView from './views/Settings';
 
 const NAV: readonly { view: ViewName; label: string }[] = [
   { view: 'recall', label: 'Recall' },
@@ -13,6 +14,7 @@ const NAV: readonly { view: ViewName; label: string }[] = [
   { view: 'sessions', label: 'Sessions' },
   { view: 'graph', label: 'Graph' },
   { view: 'stats', label: 'Stats' },
+  { view: 'settings', label: 'Settings' },
 ];
 
 const THEMES: readonly ThemeChoice[] = ['auto', 'dark', 'light'];
@@ -114,6 +116,7 @@ export default function App() {
         {route.view === 'sessions' && <SessionsView namespace={namespace} />}
         {route.view === 'graph' && <GraphView namespace={namespace} />}
         {route.view === 'stats' && <StatsView namespace={namespace} />}
+        {route.view === 'settings' && <SettingsView />}
       </div>
     </div>
   );

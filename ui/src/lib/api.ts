@@ -319,6 +319,28 @@ export const api = {
 
   /** GET /embedding/reembed — the in-memory job, polled while it runs (no SSE). */
   reembedJob: (): Promise<ReembedJob> => request("/embedding/reembed"),
+
+  /**
+   * GET /settings — src/api/server.ts:298-307. Credentials arrive masked (`…` plus the last
+   * four characters, src/core/settings.ts:314-316); there is no route that echoes a value.
+   */
+  getSettings: (): Promise<SettingsPayload> => request("/settings"),
+
+  /**
+   * POST /settings — src/api/server.ts:309-336. A flat body of names to values; the route
+   * refuses a key the environment already sets (`400 … is set in the environment`) rather
+   * than writing a value nothing would read.
+   */
+  patchSettings: (patch: Record<string, string>): Promise<{ saved: string[]; restartRequired: boolean }> =>
+    request("/settings", sendInit("POST", patch)),
+
+  /**
+   * POST /settings/adopt-env — src/api/server.ts:341-349, fed by `adoptEnvKeys`
+   * (src/core/settings.ts:230). `notAdopted` is what stayed in `.env`; `backupPath` is the
+   * `.env.bak` written before anything was commented out.
+   */
+  adoptEnv: (): Promise<{ adopted: string[]; notAdopted: string[]; backupPath: string | null; restartRequired: true }> =>
+    request("/settings/adopt-env", sendInit("POST", {})),
 };
 
 /** One entry of `GET /embedding`'s `presets` — the factory's own defaults (ticket 015 D3). */
@@ -342,6 +364,31 @@ export interface ReembedJob {
   startedAt: number | null;
   finishedAt: number | null;
   error: string | null;
+}
+
+/**
+ * src/core/settings.ts:343-357 SettingsEntry — one line of `GET /settings`.
+ *
+ * `masked` is null for every non-secret key (there is no `value` field at all: a plain
+ * setting is not read back either) and for a credential with nothing behind it.
+ */
+export interface SettingsEntry {
+  /** A writable key for every console field; env-only keys appear too, with `writable: false`. */
+  name: string;
+  kind: "secret" | "plain";
+  source: "env" | "file" | "default" | "absent";
+  masked: string | null;
+  effect: "immediate" | "restart";
+  writable: boolean;
+}
+
+/** `GET /settings` — src/api/server.ts:298-307. */
+export interface SettingsPayload {
+  entries: SettingsEntry[];
+  settingsPath: string;
+  envPath: string;
+  /** Measured against what this process serves, the same way `/embedding` measures it. */
+  restartRequired: boolean;
 }
 
 /**

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 
-export type ViewName = 'recall' | 'memories' | 'sessions' | 'graph' | 'stats';
+export type ViewName = 'recall' | 'memories' | 'sessions' | 'graph' | 'stats' | 'settings';
 
-const VIEWS: readonly ViewName[] = ['recall', 'memories', 'sessions', 'graph', 'stats'];
+const VIEWS: readonly ViewName[] = ['recall', 'memories', 'sessions', 'graph', 'stats', 'settings'];
 const DEFAULT_VIEW: ViewName = 'recall';
 
 type Route = { view: ViewName; params: URLSearchParams };
