@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   SETTING_KEYS,
+  adoptEnvKeys,
   settingsPath,
   readSettings,
   writeSettings,
   runtimeEnv,
   embeddingSource,
 } from "../src/core/settings.js";
+import { readEnvFile } from "../src/core/envFile.js";
 import { EMBEDDING_PRESETS, createEmbeddingProvider, previewEmbedding } from "../src/core/embedding/index.js";
 import { summarize } from "../src/core/stats.js";
 import type { Memory } from "../src/core/types.js";
@@ -229,5 +231,47 @@ describe("two whitelists", () => {
     // Only the mode is asserted: the rename consumes the tmp either way, so "the tmp is
     // gone" holds with or without the fix and would never fail.
     expect(statSync(settingsPath(home)).mode & 0o777).toBe(0o600);
+  });
+});
+
+// One temp `home` and one temp `.env` per case: neither the real ~/.ai-memory nor the
+// repo's own .env is ever in reach.
+describe("adoptEnvKeys", () => {
+  const envFile = () => path.join(home, ".env");
+  const putEnv = (text: string) => writeFileSync(envFile(), text, "utf8");
+
+  it("adopts the whitelisted lines and leaves every other name in .env", async () => {
+    putEnv("JEV_API_KEY=abc\nMEMORY_JEV=true\nTYPESAFE_API_KEY=legacy\nHOME_THING=x\n");
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({
+      adopted: ["JEV_API_KEY", "MEMORY_JEV"],
+      backupPath: `${envFile()}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).toEqual({ JEV_API_KEY: "abc", MEMORY_JEV: "true" });
+
+    const lines = readFileSync(envFile(), "utf8").split("\n");
+    expect(lines).toContain("#JEV_API_KEY=abc");
+    expect(lines).toContain("#MEMORY_JEV=true");
+    // The whitelist boundary is the point: a credential-shaped name on neither list stays
+    // enabled in .env and never reaches settings.json.
+    expect(lines).toContain("TYPESAFE_API_KEY=legacy");
+    expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["TYPESAFE_API_KEY", "HOME_THING"]);
+    expect(readSettings(home)).not.toHaveProperty("TYPESAFE_API_KEY");
+    expect(existsSync(`${envFile()}.bak`)).toBe(true);
+  });
+
+  it("does nothing, and writes nothing, when no whitelisted key is present", async () => {
+    putEnv("TYPESAFE_API_KEY=legacy\nHOME_THING=x\n");
+    const before = readFileSync(envFile());
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({ adopted: [], backupPath: null, restartRequired: true });
+    expect(readFileSync(envFile()).equals(before)).toBe(true);
+    expect(existsSync(settingsPath(home))).toBe(false);
+    expect(existsSync(`${envFile()}.bak`)).toBe(false);
   });
 });

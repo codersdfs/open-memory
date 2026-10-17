@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveHome } from "./dbPath.js";
+import { commentOutEnvKeys, envFilePath, readEnvFile } from "./envFile.js";
 
 /** Every non-secret key `settings.json` may hold. A setting key is an env var name — nothing else. */
 export const SETTING_KEYS = [
@@ -124,6 +125,54 @@ export async function writeSettings(patch: Settings, home?: string): Promise<Set
     throw err;
   }
   return merged;
+}
+
+export interface AdoptOptions {
+  home?: string;
+  /** The `.env` to read; defaults to the one this process would load. */
+  envFile?: string;
+}
+
+export interface AdoptResult {
+  /** The names that moved, in `.env` order. */
+  adopted: string[];
+  /** Where the pre-edit `.env` copy lives; `null` when `.env` was not touched. */
+  backupPath: string | null;
+  /** Always `true`: the running process still holds what it read at boot. */
+  restartRequired: boolean;
+}
+
+/**
+ * Move the whitelisted `.env` keys into `settings.json` and comment their lines out.
+ *
+ * The environment wins the merge, so a key sitting in `.env` shadows every console write:
+ * this is how a user gets out of that without hand-editing. Only `SETTING_KEYS ∪
+ * SECRET_KEYS` move — `TYPESAFE_API_KEY` and `JEV_API_KEY_FILE` are readable from the
+ * environment but are not console fields, so they stay in `.env` untouched and never
+ * reach `settings.json`.
+ *
+ * Settings are written first and `.env` commented second: a failure between the two
+ * leaves the value in both places, which the next call finishes, where the reverse order
+ * would lose it.
+ */
+export async function adoptEnvKeys(opts: AdoptOptions = {}): Promise<AdoptResult> {
+  const file = opts.envFile ?? envFilePath();
+  const patch: Settings = {};
+  const names: WritableKey[] = [];
+
+  for (const entry of readEnvFile(file)) {
+    const name = entry.name;
+    // A commented line is already doing nothing, and an empty value reads as unset on both
+    // sides of the merge — neither has a value to move or a shadow to clear.
+    if (!entry.enabled || !isWritableKey(name) || entry.value === "") continue;
+    patch[name] = entry.value;
+    if (!names.includes(name)) names.push(name);
+  }
+  if (names.length === 0) return { adopted: [], backupPath: null, restartRequired: true };
+
+  await writeSettings(patch, opts.home);
+  const { commented, backupPath } = await commentOutEnvKeys(file, names);
+  return { adopted: commented, backupPath, restartRequired: true };
 }
 
 /** An empty string is an absent value, on either side of the merge. */
