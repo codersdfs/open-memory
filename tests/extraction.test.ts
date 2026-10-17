@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { Extractor } from "../src/core/extraction/extractor.js";
+import { writeSettings } from "../src/core/settings.js";
+import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 describe("extraction gate", () => {
   const ex = new Extractor();
@@ -72,5 +77,36 @@ describe("extraction gate", () => {
   it("caps one turn at maxPerTurn", async () => {
     const many = "I like tea. I like coffee. I like water. I like juice. I like milk. I like soda.";
     expect((await ex.extract(many)).length).toBeLessThanOrEqual(3);
+  });
+
+  // ENABLE_EXTRACTOR is a setting the console can write, so turning it on and off in
+  // the file has to win over a key still sitting in the environment. The "true" phase
+  // is the proof the flag is read from the file at all: before, the path was gated on
+  // the process environment and no request went out.
+  it("honors ENABLE_EXTRACTOR=false from settings.json even with an env key present", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "extractor-home-"));
+    const savedEnv = { ...process.env };
+    const realFetch = globalThis.fetch;
+    const urls: string[] = [];
+    process.env.AI_MEMORY_HOME = home;
+    process.env.OPENAI_API_KEY = "sk-in-the-environment";
+    globalThis.fetch = (async (url: unknown) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "{\"memories\":[]}" } }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const llmCalls = () => urls.filter((u) => u.includes("api.openai.com")).length;
+    try {
+      await writeSettings({ ENABLE_EXTRACTOR: "true" }, home);
+      expect(await ex.extract("I live in Berlin.")).toEqual([]);
+      expect(llmCalls()).toBe(1);
+      await writeSettings({ ENABLE_EXTRACTOR: "false" }, home);
+      const kept = await ex.extract("I live in Berlin.");
+      expect(kept.map((m) => m.text)).toContain("I live in Berlin");
+      expect(llmCalls()).toBe(1);
+    } finally {
+      globalThis.fetch = realFetch;
+      process.env = { ...savedEnv };
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });

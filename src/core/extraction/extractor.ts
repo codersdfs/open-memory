@@ -1,5 +1,6 @@
 import type { MemoryType } from "../types.js";
 import { jevKeep, jevEnabled, importanceFor, JEV_MIN_KEEP } from "../judgment/judge.js";
+import { runtimeEnv } from "../settings.js";
 
 export interface ExtractedMemory {
   text: string;
@@ -27,11 +28,15 @@ export class Extractor {
    * LLM path would be: call OpenAI with JSON schema, then same dedup.
    */
   async extract(turnText: string): Promise<ExtractedMemory[]> {
-    const apiKey = process.env.OPENAI_API_KEY;
-    const enabled = process.env.ENABLE_EXTRACTOR === "true";
+    // Read the merged seam once per turn: the console writes ENABLE_EXTRACTOR and
+    // OPENAI_API_KEY to settings.json, and a value written there must apply without
+    // a restart.
+    const env = runtimeEnv();
+    const apiKey = env.OPENAI_API_KEY;
+    const enabled = env.ENABLE_EXTRACTOR === "true";
     if (enabled && apiKey) {
       try {
-        return await this.llmExtract(turnText);
+        return await this.llmExtract(turnText, env);
       } catch (e) {
         console.warn("[extractor] LLM failed, falling back to heuristic", e);
       }
@@ -151,15 +156,15 @@ export class Extractor {
     }
   }
 
-  private async llmExtract(text: string): Promise<ExtractedMemory[]> {
+  private async llmExtract(text: string, env: NodeJS.ProcessEnv): Promise<ExtractedMemory[]> {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: process.env.EXTRACTOR_MODEL ?? "gpt-4o-mini",
+        model: env.EXTRACTOR_MODEL ?? "gpt-4o-mini",
         temperature: 0,
         response_format: { type: "json_object" },
         messages: [

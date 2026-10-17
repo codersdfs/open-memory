@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { runtimeEnv } from "../settings.js";
 
 /**
  * The write-side gate, asked of a model instead of a regex.
@@ -23,7 +24,7 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_RETRIES = 1;
 
 /** Below this, the memory is not stored. */
-export const JEV_MIN_KEEP = (): number => Number(process.env.MEMORY_JEV_MIN ?? 0.5);
+export const JEV_MIN_KEEP = (): number => Number(runtimeEnv().MEMORY_JEV_MIN ?? 0.5);
 
 export interface Verdict {
   /** Probability this is still useful to an assistant weeks from now. */
@@ -31,16 +32,33 @@ export interface Verdict {
   model?: string;
 }
 
+// The knobs come from the merged seam (real environment > settings.json > default),
+// read per call and never at module load: a value written by the console has to apply
+// to the next memory without a restart.
+
+function isJevEnabled(env: NodeJS.ProcessEnv): boolean {
+  return env.MEMORY_JEV !== "false";
+}
+
 export function jevEnabled(): boolean {
-  return process.env.MEMORY_JEV !== "false";
+  return isJevEnabled(runtimeEnv());
 }
 
 /**
- * The key lives in a file, not in .env, so .env can stay shareable and the
- * secret stays out of anything someone pastes into a chat.
+ * Precedence: the key itself, then a file holding it, then the TypeSafe env var.
+ *
+ * Direct first because this deployment keeps it in .env; the file form stays for
+ * a checkout whose .env is shareable, where the secret stays out of anything
+ * someone pastes into a chat.
  */
 export function jevApiKey(): string | undefined {
-  const file = process.env.JEV_API_KEY_FILE?.trim();
+  return apiKeyFrom(runtimeEnv());
+}
+
+function apiKeyFrom(env: NodeJS.ProcessEnv): string | undefined {
+  const direct = env.JEV_API_KEY?.trim();
+  if (direct) return direct;
+  const file = env.JEV_API_KEY_FILE?.trim();
   if (file) {
     const p = file === "~" ? homedir()
       : file.startsWith("~/") || file.startsWith("~\\") ? join(homedir(), file.slice(2))
@@ -52,7 +70,7 @@ export function jevApiKey(): string | undefined {
     console.warn("[jev] JEV_API_KEY_FILE not readable: " + p);
     return undefined;
   }
-  return process.env.TYPESAFE_API_KEY?.trim() || undefined;
+  return env.TYPESAFE_API_KEY?.trim() || undefined;
 }
 
 export interface JudgeOptions {
@@ -66,12 +84,13 @@ export async function jevKeep(
   text: string,
   opts: JudgeOptions = {},
 ): Promise<Verdict | null> {
-  if (!jevEnabled()) return null;
-  const apiKey = jevApiKey();
+  const env = runtimeEnv();
+  if (!isJevEnabled(env)) return null;
+  const apiKey = apiKeyFrom(env);
   if (!apiKey) return null;
 
-  const endpoint = process.env.JEV_ENDPOINT ?? DEFAULT_ENDPOINT;
-  const model = process.env.JEV_MODEL ?? DEFAULT_MODEL;
+  const endpoint = env.JEV_ENDPOINT ?? DEFAULT_ENDPOINT;
+  const model = env.JEV_MODEL ?? DEFAULT_MODEL;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retries = opts.retries ?? DEFAULT_RETRIES;
   const doFetch = opts.fetchImpl ?? fetch;

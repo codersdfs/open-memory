@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { jevKeep, jevApiKey, jevEnabled, importanceFor } from "../src/core/judgment/judge.js";
-import { promises as fs } from "node:fs";
+import { writeSettings } from "../src/core/settings.js";
+import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -97,5 +98,32 @@ describe("jev judge", () => {
     process.env.JEV_API_KEY_FILE = path.join(os.tmpdir(), "definitely-not-here", "key.txt");
     delete process.env.TYPESAFE_API_KEY;
     expect(jevApiKey()).toBeUndefined();
+  });
+
+  // The console writes credentials and knobs to settings.json, so the judge reads the
+  // same merged environment the embedding factory does — at call time, so a key typed
+  // into the console judges the next write without a restart.
+  it("honors a key written in settings.json, not just the environment", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "jev-home-"));
+    process.env.AI_MEMORY_HOME = home;
+    delete process.env.JEV_API_KEY;
+    await writeSettings({ JEV_API_KEY: "jev-from-file" }, home);
+    let sent: Record<string, string> = {};
+    const spy = (async (_u: unknown, init: RequestInit) => {
+      sent = init.headers as Record<string, string>;
+      return new Response(JSON.stringify({ model: "jev-test", answers: { keep: { type: "noul", noul: 0.9 } } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await jevKeep("anything", { fetchImpl: spy });
+    expect(Object.values(sent).join(" ")).toContain("jev-from-file");
+    await fs.rm(home, { recursive: true, force: true });
+  });
+
+  it("reads MEMORY_JEV from settings.json", async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "jev-home-"));
+    process.env.AI_MEMORY_HOME = home;
+    delete process.env.MEMORY_JEV;
+    await writeSettings({ MEMORY_JEV: "false" }, home);
+    expect(jevEnabled()).toBe(false);
+    await fs.rm(home, { recursive: true, force: true });
   });
 });
