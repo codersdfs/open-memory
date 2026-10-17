@@ -51,13 +51,15 @@ export const SECRET_KEYS = ["OPENAI_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY", "
  * them, because an empty JEV field would otherwise read as "no key anywhere" while a live
  * one sits in the environment. The kind is per name: a key is a secret, a path is not.
  */
-export const ENV_ONLY_KEYS: Record<string, "secret" | "plain"> = {
+export const ENV_ONLY_KEYS = {
   TYPESAFE_API_KEY: "secret",
   JEV_API_KEY_FILE: "plain",
-};
+} as const satisfies Record<string, "secret" | "plain">;
 
 export type SettingKey = (typeof SETTING_KEYS)[number];
 export type SecretKey = (typeof SECRET_KEYS)[number];
+/** The names only the environment provides: reported by the inventory, refused by `writeSettings`. */
+export type EnvOnlyKey = keyof typeof ENV_ONLY_KEYS;
 
 /** The two whitelists as one vocabulary: what may be written, read back and merged. */
 export type WritableKey = SettingKey | SecretKey;
@@ -159,7 +161,11 @@ export interface AdoptResult {
    * see `adoptEnvKeys`. Empty when every value present was adopted.
    */
   notAdopted: string[];
-  /** Where the pre-edit `.env` copy lives; `null` when `.env` was not touched. */
+  /**
+   * Where the `.bak` copy lives — written once, on the first adopt that changed the file, and
+   * kept — so on a later adopt this is still that first copy; `null` when `.env` was not
+   * touched at all.
+   */
   backupPath: string | null;
   /** Always `true`: the running process still holds what it read at boot. */
   restartRequired: boolean;
@@ -226,6 +232,12 @@ function hasEscape(raw: string | undefined): boolean {
  * real loader expands `\n` inside double quotes while `parseValue` does not. A name with
  * such a line stays enabled in `.env` and is reported in `notAdopted`; making the file
  * explainable beats silently rewriting a key.
+ *
+ * The file is `MEMORY_ENV_FILE` when it is set, otherwise `cwd/.env` (see `envFilePath`),
+ * and that is only the right file when the daemon loads it: `config.ts` calls
+ * `process.loadEnvFile()` with no argument, which reads `.env` from the cwd and ignores
+ * `MEMORY_ENV_FILE`. So if that variable is set it must point at the file the daemon
+ * actually loads, or the values adopt moves into `settings.json` never shadowed anything.
  */
 export async function adoptEnvKeys(opts: AdoptOptions = {}): Promise<AdoptResult> {
   const file = opts.envFile ?? envFilePath();
@@ -342,11 +354,11 @@ export function keyEffect(name: WritableKey): "immediate" | "restart" {
 /** One line of `GET /settings`: where a value comes from, and what changing it costs. */
 export interface SettingsEntry {
   /**
-   * A `WritableKey` for every console field. The `ENV_ONLY_KEYS` that happen to be set are
+   * A `WritableKey` for every console field. The `EnvOnlyKey`s that happen to be set are
    * reported here too, marked `writable: false`, so a value the environment provides under
    * another name is visible rather than implied absent.
    */
-  name: string;
+  name: WritableKey | EnvOnlyKey;
   kind: "secret" | "plain";
   source: "env" | "file" | "default" | "absent";
   /** `…` plus the last four characters, or null when there is no value or nothing secret. */
@@ -383,7 +395,8 @@ export function settingsInventory(base: NodeJS.ProcessEnv = process.env, home?: 
       writable: true,
     };
   });
-  for (const [name, kind] of Object.entries(ENV_ONLY_KEYS)) {
+  for (const name of Object.keys(ENV_ONLY_KEYS) as EnvOnlyKey[]) {
+    const kind = ENV_ONLY_KEYS[name];
     const value = env[name];
     if (value === undefined) continue;
     entries.push({

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { AddressInfo } from "node:net";
 import { createServer, request, type Server } from "node:http";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { summarize } from "../src/core/stats.js";
@@ -597,6 +597,25 @@ describe("settings routes", () => {
     expect((await res.text()).includes("NOPE")).toBe(true);
   });
 
+  it("treats an empty patch as a no-op and writes nothing", async () => {
+    // `writeSettings({})` merges nothing and rewrites settings.json anyway, so a request that
+    // changes nothing answered with a restart it did not ask for. A home with no settings
+    // file is the only place the difference shows: once a file exists, "unchanged" and
+    // "rewritten with the same bytes" look alike.
+    const empty = mkdtempSync(path.join(tmpdir(), "ai-memory-console-empty-"));
+    process.env.AI_MEMORY_HOME = empty;
+    try {
+      const res = await post("/settings", {});
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ saved: [], restartRequired: false });
+      expect(existsSync(settingsPath(empty))).toBe(false);
+    } finally {
+      process.env.AI_MEMORY_HOME = home;
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
   it("validates a judge key with one call, then stores it", async () => {
     const res = await post("/settings", { JEV_API_KEY: JEV_GOOD });
 
@@ -687,6 +706,33 @@ describe("settings routes", () => {
     expect(shutdowns).toBe(0);
   });
 
+  it("refuses a shutdown from an origin spelled as a hex-mapped IPv6 loopback", async () => {
+    // `::ffff:7f00:1` is this machine written another way, so a future widening of the
+    // check towards IPv6 spellings could accept it without any test noticing. Refused is the
+    // contract: no console sends this, and the gate only knows the spellings it accepts.
+    const res = await fetch(`${base}/admin/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://[::ffff:7f00:1]:7331" },
+    });
+
+    expect(res.status).toBe(403);
+    expect(shutdowns).toBe(0);
+  });
+
+  it("refuses a shutdown from an origin with an IPv6 zone tag", async () => {
+    // `[::1%25lo]` is refused earlier still: a zone id is not part of a URL `new URL`
+    // parses, so this never reaches the loopback comparison — and a widening must not begin
+    // by accepting the hostname half of a spelling the parser does not read.
+    const res = await fetch(`${base}/admin/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://[::1%25lo]:7331" },
+    });
+
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("origin not allowed");
+    expect(shutdowns).toBe(0);
+  });
+
   it("refuses an adopt-env asked for by a lookalike of a loopback address, leaving .env alone", async () => {
     writeFileSync(envFile, "NIM_API_KEY=nvapi-not-adopted-4477\n", "utf8");
     const beforeEnv = readFileSync(envFile, "utf8");
@@ -734,6 +780,16 @@ describe("settings routes", () => {
       // Answered as if the route were not there: a stranger learns nothing by asking.
       expect(res.status).toBe(404);
       expect(await res.text()).toContain("not found");
+      expect(ran).toBe(0);
+
+      // With the header the Origin tier would answer 403 for: the peer is checked first, so a
+      // non-loopback caller still gets the 404 of a route that does not exist rather than a
+      // 403 that confirms it does.
+      const hostile = await fetch(`${remote}/admin/shutdown`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "https://evil.example" },
+      });
+      expect(hostile.status).toBe(404);
       expect(ran).toBe(0);
     } finally {
       await new Promise<void>((r) => app.close(() => r()));

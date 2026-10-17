@@ -165,6 +165,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   const method = req.method ?? "GET";
   const q = Object.fromEntries(url.searchParams);
 
+  // `/admin/shutdown` has to answer a stranger as if the route were not there, and that
+  // answer has to come before the Origin tier: tier A's 403 would confirm the route exists.
+  // Its `Origin` is still checked below — this only settles the peer, which decides between
+  // a 404 and a gate that says something.
+  if (path === "/admin/shutdown" && method === "POST" && !isLoopbackAddress(req.socket.remoteAddress)) {
+    return notFound(res);
+  }
+
   // Tier A of the mutation gate, before any route looks at the request (see
   // `foreignOriginProblem` for why only `Origin` and not the content type is global).
   if (method === "POST" || method === "PATCH" || method === "DELETE") {
@@ -269,6 +277,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, {
       entries: settingsInventory(),
       settingsPath: settingsPath(),
+      // The file adopt reads and comments out. The daemon does not read it: `config.ts`
+      // calls `process.loadEnvFile()` with no argument, which loads `.env` from the cwd
+      // only. So an `MEMORY_ENV_FILE` that names anything else makes this field name a file
+      // nothing loads — it must point at the file the daemon actually reads, or adopt
+      // moves keys the running process never saw.
       envPath: envFilePath(),
       // Measured the way /embedding measures it: is there a difference between what this
       // process serves and what the next start would build?
@@ -300,6 +313,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       return send(res, 400, { error: `${named} — this route writes only: ${WRITABLE_KEYS.join(", ")}` });
     }
 
+    // Nothing to save is not a write: `writeSettings({})` would rewrite settings.json for a
+    // patch that changes nothing, and report a restart the request did not ask for.
+    if (Object.keys(patch).length === 0) return send(res, 200, { saved: [], restartRequired: false });
+
     const guarded = await guardSettingsWrite(patch);
     if (!guarded.ok) return send(res, guarded.status, { error: guarded.error });
     return send(res, 200, { saved: Object.keys(patch), restartRequired: restartPending(service) });
@@ -323,8 +340,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   // the loopback address is answered as if the route were not there: a 403 would confirm
   // it is, and this is not a route to advertise.
   if (path === "/admin/shutdown" && method === "POST") {
-    if (!isLoopbackAddress(req.socket.remoteAddress)) return notFound(res);
-    // A loopback peer is still only half the question: a page open in the user's own
+    // The peer is settled above, before the Origin tier, so a non-loopback caller is 404 by
+    // now. A loopback peer is still only half the question: a page open in the user's own
     // browser is one too. Its `Origin` was already refused above if it named another
     // machine; what is left is this route's own JSON requirement (tier B).
     const refused = notJsonProblem(req);

@@ -148,9 +148,11 @@ describe("commentOutEnvKeys", () => {
 
   it.skipIf(process.platform === "win32")("keeps an unusual file mode across the rewrite", async () => {
     put("JEV_API_KEY=abc\n");
-    chmodSync(file, 0o640);
+    // 0o660 has group write, which the usual 0o022 umask strips: `writeFile` alone would
+    // land on 0o640, so this mode survives only because of the explicit chmod.
+    chmodSync(file, 0o660);
     await commentOutEnvKeys(file, ["JEV_API_KEY"]);
-    expect(statSync(file).mode & 0o777).toBe(0o640);
+    expect(statSync(file).mode & 0o777).toBe(0o660);
   });
 
   it("leaves .env byte-for-byte and no tmp behind when the write is interrupted", async () => {

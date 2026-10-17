@@ -15,7 +15,12 @@ import path from "node:path";
 
 export interface EnvEntry {
   name: string;
-  /** The value as a shell would read it: quotes stripped, inline comment dropped. */
+  /**
+   * The decoded value: quotes stripped and an inline comment dropped, the bytes kept as they
+   * were read and never interpreted the way a shell would. The decode is latin-1, so a UTF-8
+   * value arrives as its bytes — one character per byte — not as the characters a shell
+   * would produce.
+   */
   value: string;
   /** 1-based line number, so a caller can point at the line it means. */
   line: number;
@@ -108,7 +113,11 @@ export interface CommentOutOptions {
 export interface CommentOutResult {
   /** The names actually commented, in the order given, once each. */
   commented: string[];
-  /** Where the pre-edit copy lives; `null` when the file was not touched at all. */
+  /**
+   * Where the `.bak` copy lives — written once, on the first rewrite, and kept — so after a
+   * second adopt this is still that first pre-edit copy; `null` when the file was not touched
+   * at all.
+   */
   backupPath: string | null;
 }
 

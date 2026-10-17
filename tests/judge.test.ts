@@ -15,12 +15,14 @@ const ok = (noul: number): typeof fetch =>
 const saved = { ...process.env };
 afterEach(() => { process.env = { ...saved }; });
 
-// Key precedence is JEV_API_KEY, then JEV_API_KEY_FILE, then TYPESAFE_API_KEY. A case
-// that exercises the fallback has to clear the two names that win over it, or it only
-// passes while the developer's shell happens not to have them set.
+// Key precedence is JEV_API_KEY, then JEV_API_KEY_FILE, then TYPESAFE_API_KEY, and a
+// judgement switched off is not one either. A case that exercises a fallback has to clear
+// all four names, or it only passes while the developer's shell happens not to set them:
+// `MEMORY_JEV=false` in a shell makes every `jevKeep` below answer null without a call.
 function useTypesafeKey(): void {
   delete process.env.JEV_API_KEY;
   delete process.env.JEV_API_KEY_FILE;
+  delete process.env.MEMORY_JEV;
   process.env.TYPESAFE_API_KEY = "k";
 }
 
@@ -49,6 +51,7 @@ describe("jev judge", () => {
 
   it("is disabled by MEMORY_JEV=false without touching the network", async () => {
     useTypesafeKey();
+    // After the helper, which deletes it: setting this first would be undone there.
     process.env.MEMORY_JEV = "false";
     expect(jevEnabled()).toBe(false);
     let called = false;
@@ -133,6 +136,7 @@ describe("jev judge", () => {
   it("reads MEMORY_JEV from settings.json", async () => {
     const home = mkdtempSync(path.join(os.tmpdir(), "jev-home-"));
     process.env.AI_MEMORY_HOME = home;
+    // The environment wins the merge, so MEMORY_JEV has to be unset for the file to answer.
     delete process.env.MEMORY_JEV;
     await writeSettings({ MEMORY_JEV: "false" }, home);
     expect(jevEnabled()).toBe(false);
