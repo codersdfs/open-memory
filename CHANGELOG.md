@@ -5,6 +5,19 @@ Notable changes. The package is `open-memory`; the command stays `ai-memory`.
 Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
 on-disk format is the part that does not.
 
+## Unreleased
+
+### Added
+
+- **The console can hold your keys.** `#/settings` writes `OPENAI_API_KEY`, `NVIDIA_API_KEY`, `NIM_API_KEY` and `JEV_API_KEY` — plus the judge and extractor knobs — into `~/.ai-memory/settings.json` instead of asking you to hand-edit `.env`. Settings stay flat (a setting key is still an env-var name), a secret is never echoed back (only an ellipsis and the last four characters), and every row says whether it takes effect on save or needs a restart. A key the real environment already provides is refused with the name of where it lives, rather than silently shadowed by it. [ADR-0010](docs/adr/0010-console-writes-credentials.md) supersedes ADR-0009's "never an API key".
+- **Adopt.** A key sitting in `.env` shadows every console write, so `POST /settings/adopt-env` copies the whitelisted ones into `settings.json`, comments those lines out (never deletes, never reorders), keeps a one-time `.env.bak`, and reports the entries it could not read back exactly instead of persisting a value that is subtly wrong.
+- **`ai-memory daemon restart`** — probe, stop, start, and confirm the replacement answers `/health` before claiming success; a restart that cannot start one says so and exits non-zero. From a source checkout it prints the exact command instead of pretending.
+
+### Fixed
+
+- **A credential written for the judge reached only the processes that load `.env`.** The judge and the extractor read `process.env` directly while the embedder read the merged settings, so `MEMORY_JEV`, `JEV_API_KEY_FILE` and `ENABLE_EXTRACTOR` in `settings.json` did nothing. One seam (`runtimeEnv`) now serves all three, and each reads it per call rather than at module load, which is what makes a change take effect without a restart.
+- **The console's write routes could be driven by any page in your browser.** A loopback-only server is not a trust boundary: a simple request from a web page is a loopback peer and could `POST /admin/shutdown`. Every mutating method now refuses a non-loopback `Origin`, and the console routes additionally require a JSON content type — the CLI, hooks and adapters send neither an `Origin` nor always JSON, so their requests are unchanged.
+
 ## 0.3.0-beta.1 — 2026-10-12
 
 ### Fixed
