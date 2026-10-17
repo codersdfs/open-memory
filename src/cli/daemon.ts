@@ -3,8 +3,9 @@
  *
  * The daemon is one process serving one vector space (ADR-0009), so a settings change
  * that touches the embedder or a credential only lands after the process is replaced.
- * That is what this file does: probe, stop, start — in that order, because spawning
- * before the old listener is gone is a port clash.
+ * That is what this file does: probe, stop, start, probe again — start before stop is a
+ * port clash, and stop after start without the second probe is a success claim nobody
+ * checked.
  *
  * Every step is injectable. A restart is the one CLI command that acts on a live
  * process, and the tests for it must not touch one.
@@ -29,8 +30,13 @@ export interface DaemonDeps {
   probe?: () => Promise<boolean>;
   /** Stops the daemon, resolving only once it stopped answering. Throws when it does not. */
   shutdown?: () => Promise<void>;
-  /** Starts a detached replacement. Throws when no replacement could be started. */
-  spawn?: () => void;
+  /**
+   * Starts a detached replacement. Throws when no replacement could be started at all;
+   * reports a launcher that failed after the call returned (ENOENT, EACCES) to `onError`.
+   */
+  spawn?: (onError: (err: Error) => void) => void;
+  /** The pause between polls while waiting for the replacement. Injected so tests do not wait. */
+  sleep?: (ms: number) => Promise<void>;
   stdout?: (s: string) => void;
 }
 
@@ -39,6 +45,15 @@ const PROBE_TIMEOUT_MS = 500;
 const SHUTDOWN_TIMEOUT_MS = 1500;
 const STOP_WAIT_MS = 5000;
 const STOP_POLL_MS = 100;
+/** How long the replacement gets to start answering before the restart is a failure. */
+const START_WAIT_MS = 5000;
+const START_POLL_MS = 100;
+/**
+ * The window closes on either bound. Attempts keep a test honest and fast: it fakes the
+ * sleep, so only the cap can end the loop in one tick. The clock is what keeps the real
+ * command to "a few seconds" — a probe that hangs on its own timeout never eats the cap.
+ */
+const START_ATTEMPTS = Math.ceil(START_WAIT_MS / START_POLL_MS);
 
 async function probeDaemon(): Promise<boolean> {
   const health = await new MemoryClient(defaultServerUrl(), PROBE_TIMEOUT_MS).health();
@@ -79,16 +94,22 @@ async function shutdownDaemon(): Promise<void> {
  * built entry to exec, and pretending otherwise would report a restart over a process
  * that never began. That case throws with the exact command to run instead.
  */
-function startReplacement(): void {
+function startReplacement(onError: (err: Error) => void): void {
   const apiDir = join(dirname(fileURLToPath(import.meta.url)), "..", "api");
   const builtEntry = join(apiDir, "server.js");
   const sourceEntry = join(apiDir, "server.ts");
   if (existsSync(builtEntry)) {
     const child = spawnProcess(process.execPath, [builtEntry], {
       detached: true,
+      // stdio stays ignored: `/health` answering is what proves the replacement came up,
+      // so the child's output has nothing to add and would hold onto the terminal.
       stdio: "ignore",
       env: process.env
     });
+    // A launcher that never got as far as a process reports ENOENT/EACCES as an async
+    // `error` event. With nobody subscribed that crashes the CLI; routing it into the
+    // restart result makes it the failure it is.
+    child.on("error", onError);
     child.unref();
     return;
   }
@@ -101,14 +122,16 @@ function startReplacement(): void {
 }
 
 /**
- * Probe → stop → start. A restart that could not start a replacement answers
- * `restarted: false` with the reason; it never reports success it did not achieve.
+ * Probe → stop → start → probe. A restart that could not start a replacement, or started
+ * one that never answered, answers `restarted: false` with the reason; it never reports
+ * success it did not achieve.
  */
 export async function restartDaemon(deps: DaemonDeps = {}): Promise<RestartResult> {
   const stdout = deps.stdout ?? ((s: string) => process.stdout.write(s + "\n"));
   const probe = deps.probe ?? probeDaemon;
   const shutdown = deps.shutdown ?? shutdownDaemon;
   const spawn = deps.spawn ?? startReplacement;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
   if (!(await probe())) {
     stdout(NO_DAEMON_RUNNING);
@@ -119,19 +142,40 @@ export async function restartDaemon(deps: DaemonDeps = {}): Promise<RestartResul
   } catch (err) {
     return { restarted: false, reason: `could not stop the daemon: ${(err as Error).message}` };
   }
+
+  // The spawn returns the moment the process is forked, which is not the moment the
+  // daemon listens — and a child that dies on startup (EADDRINUSE is the usual one) says
+  // so on a stdio nobody reads. Only the port answering makes "restarted" a fact.
+  let launcherError: Error | undefined;
   try {
-    spawn();
+    spawn((err) => {
+      launcherError ??= err;
+    });
   } catch (err) {
     return { restarted: false, reason: (err as Error).message };
   }
-  stdout("daemon restarted");
-  return { restarted: true };
+  const deadline = Date.now() + START_WAIT_MS;
+  for (let attempt = 0; attempt < START_ATTEMPTS && Date.now() < deadline; attempt++) {
+    if (launcherError) {
+      return { restarted: false, reason: `could not start a replacement: ${launcherError.message}` };
+    }
+    if (await probe()) {
+      stdout("daemon restarted");
+      return { restarted: true };
+    }
+    await sleep(START_POLL_MS);
+  }
+  return {
+    restarted: false,
+    reason: `the new daemon did not answer at ${defaultServerUrl()} within ${START_WAIT_MS / 1000}s — check that its port is free and that the settings it now runs with are valid`
+  };
 }
 
 /**
  * The `daemon` subcommand, shaped like the repo's other command modules: positionals in,
  * exit code out. "No daemon was running" is a success — the daemon the caller asked for
- * is exactly what they have — while a stop or a start that failed is not.
+ * is exactly what they have — while a stop that failed, a start that failed, or a
+ * replacement that never answered is not.
  */
 export async function runDaemonCommand(
   positionals: string[],

@@ -197,13 +197,36 @@ describe("cli entrypoint file", () => {
  *
  * Nothing here probes a real daemon, stops one or starts a process: the machine this
  * runs on has a live daemon serving memory. What is pinned is the decision — probe,
- * then stop, then start — and the exit code the command leaves behind.
+ * then stop, then start, then probe again — and the exit code the command leaves behind.
  */
 describe("daemon restart", () => {
   function channel() {
     const lines: string[] = [];
     const errors: string[] = [];
     return { out: (s: string) => lines.push(s), err: (s: string) => errors.push(s), lines, errors };
+  }
+
+  /**
+   * A restart whose stop works and whose replacement is forked but never listens.
+   * `polls` counts the post-spawn `probe()` calls, so a test can tell polling apart
+   * from a single check, and the fake sleep keeps the 5s window from being real.
+   */
+  function silentReplacement() {
+    let spawned = false;
+    let polls = 0;
+    const deps = {
+      probe: async () => {
+        if (!spawned) return true;
+        polls++;
+        return false;
+      },
+      shutdown: async () => {},
+      spawn: () => {
+        spawned = true;
+      },
+      sleep: async () => {}
+    };
+    return { deps, polls: () => polls };
   }
 
   it("reports that nothing is running, and exits 0, when the probe finds no daemon", async () => {
@@ -240,26 +263,91 @@ describe("daemon restart", () => {
     expect(io.errors).toEqual([]);
   });
 
-  it("stops the daemon that answers, starts a replacement, and exits 0", async () => {
+  it("stops the daemon that answers, starts a replacement, and exits 0 once it answers", async () => {
     const order: string[] = [];
+    let probes = 0;
+    const sleeps: number[] = [];
     const deps = {
-      probe: async () => true,
+      probe: async () => {
+        probes++;
+        // 1: the old daemon answers. 2: the replacement is still binding. 3: it is up.
+        return probes === 1 || probes >= 3;
+      },
       shutdown: async () => {
         order.push("shutdown");
       },
       spawn: () => {
         order.push("spawn");
+      },
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
       }
     };
 
     const result = await restartDaemon(deps);
     expect(result).toEqual({ restarted: true });
-    // Order is the point: spawning before the old process is gone is a port clash.
+    // Order is the point: spawning before the old process is gone is a port clash, and
+    // probe 2 is the replacement not answering yet — success waits it out instead of
+    // calling the fork a restart.
     expect(order).toEqual(["shutdown", "spawn"]);
+    expect(probes).toBe(3);
+    expect(sleeps.length).toBe(1);
 
     const io = channel();
     expect(await runDaemonCommand(["restart"], io, deps)).toBe(0);
-    expect(io.lines.join("\n")).toContain("restarted");
+    expect(io.lines.join("\n")).toContain("daemon restarted");
+  });
+
+  it("reports a failure, and exits non-zero, when the replacement never answers", async () => {
+    const silent = silentReplacement();
+    const result = await restartDaemon(silent.deps);
+
+    expect(result.restarted).toBe(false);
+    expect(result.reason).toContain("did not answer");
+    // A single check would have reported the same failure for a daemon merely slow to
+    // bind; the window is what makes "never" a fact.
+    expect(silent.polls()).toBeGreaterThan(1);
+
+    const io = channel();
+    const again = silentReplacement();
+    expect(await runDaemonCommand(["restart"], io, again.deps)).not.toBe(0);
+    // Nothing was claimed as success: the message names the replacement that is missing.
+    expect(io.lines.join("\n")).not.toContain("daemon restarted");
+    expect(io.errors.join("\n")).toContain("the new daemon did not answer");
+  });
+
+  it("reports a launcher failure the child emits, and exits non-zero", async () => {
+    // `spawn` cannot throw an ENOENT — node emits it on the child as an async `error`
+    // event, which without a listener takes the whole CLI down.
+    const order: string[] = [];
+    let probes = 0;
+    const deps = {
+      probe: async () => {
+        probes++;
+        return true;
+      },
+      shutdown: async () => {
+        order.push("shutdown");
+      },
+      spawn: (onError: (err: Error) => void) => {
+        order.push("spawn");
+        onError(new Error("spawn /opt/ai-memory/dist/src/api/server.js EACCES"));
+      },
+      sleep: async () => {}
+    };
+
+    const result = await restartDaemon(deps);
+    expect(result.restarted).toBe(false);
+    expect(result.reason).toContain("EACCES");
+    expect(result.reason).toContain("could not start a replacement");
+    expect(order).toEqual(["shutdown", "spawn"]);
+    // The error ends the wait instead of being polled over for 5s: nothing was launched.
+    expect(probes).toBe(1);
+
+    const io = channel();
+    expect(await runDaemonCommand(["restart"], io, deps)).not.toBe(0);
+    expect(io.lines.join("\n")).not.toContain("daemon restarted");
+    expect(io.errors.join("\n")).toContain("EACCES");
   });
 
   it("starts nothing, and exits non-zero, when the shutdown throws", async () => {
