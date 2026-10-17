@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
-import { rename, rm, writeFile } from "node:fs/promises";
+import { chmod, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export interface EnvEntry {
@@ -49,10 +49,12 @@ function parseValue(raw: string): string {
   const quote = trimmed[0];
   if (quote === '"' || quote === "'") {
     // Inside quotes a `#` is part of the value, so the closing quote is the whole story.
+    // The quotes are stripped and escapes are not interpreted: `A="a\"b"` reads `a\`.
     const end = trimmed.indexOf(quote, 1);
     if (end > 0) return trimmed.slice(1, end);
   }
-  // Unquoted: `#` starts a comment only after whitespace, so `A=1#2` keeps its value.
+  // Unquoted: `#` starts a comment at the start of the value or after whitespace, so
+  // `A=1#2` keeps its value while `A=#abc` is the empty string.
   return trimmed.replace(/(^|\s+)#.*$/, "");
 }
 
@@ -65,15 +67,22 @@ export function envFilePath(cwd?: string): string {
 }
 
 /**
- * Tolerant read: a missing or unreadable file is an empty list, never a throw. A `.env`
- * this process cannot read is also not one it may rewrite, so `commentOutEnvKeys` treats
- * the same result as "nothing to do".
+ * `latin1`, not `utf8`, on both sides of every read and write: it is the one single-byte
+ * encoding whose decode always succeeds, and it maps each byte to exactly one character
+ * and back. A `.env` with a latin-1 accent would otherwise gain U+FFFD on rewrite, which
+ * breaks the byte-for-byte promise this module makes about untouched lines.
+ *
+ * A `.env` that is not there yet is the only empty one: ENOENT is no file, ENOTDIR is a
+ * path through a file. Everything else (EACCES, EISDIR) throws, because reporting an
+ * unreadable `.env` as empty would have the caller rewrite it as if it had no keys.
  */
 function readText(file: string): string | null {
   try {
-    return readFileSync(file, "utf8");
-  } catch {
-    return null;
+    return readFileSync(file, "latin1");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw err;
   }
 }
 
@@ -103,22 +112,26 @@ export interface CommentOutResult {
   backupPath: string | null;
 }
 
-/** A tmp+rename resets the mode to the umask default; `.env` holds keys, so it keeps its own. */
-function modeOf(file: string): number | undefined {
+/**
+ * The mode the rewritten file must keep. A `.env` was just read, so this normally answers;
+ * the fallback is owner-only because the file holds keys.
+ */
+function modeOf(file: string): number {
   try {
     return statSync(file).mode & 0o777;
   } catch {
-    return undefined;
+    return 0o600;
   }
 }
 
 /**
  * Comment out every enabled line assigning one of `names` and return what changed.
  *
- * `.env.bak` is written first, then the new `.env` goes tmp + rename, removing the tmp on
- * failure — the same discipline `writeSettings` uses, because a half-written `.env` is the
- * one write a user cannot recover from. Nothing is written when no line matched: no
- * backup, no tmp, byte-identical file.
+ * `.env.bak` is written first and only once, then the new `.env` goes tmp + rename,
+ * removing the tmp on failure — the same backup-once discipline `backupOnce` keeps for the
+ * agent configs, because a half-written `.env` is the one write a user cannot recover from
+ * and a second backup would overwrite the first pre-edit copy. Nothing is written when no
+ * line matched: no backup, no tmp, byte-identical file.
  */
 export async function commentOutEnvKeys(
   file: string,
@@ -146,10 +159,20 @@ export async function commentOutEnvKeys(
   const tmp = `${file}.tmp`;
   const doRename = opts.rename ?? rename;
 
-  await writeFile(backupPath, original, "utf8");
+  // `wx` refuses an existing `.bak`, so the first pre-edit copy survives every later adopt.
+  try {
+    await writeFile(backupPath, original, { encoding: "latin1", flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+
+  const mode = modeOf(file);
   try {
     await rm(tmp, { force: true });
-    await writeFile(tmp, lines.join("\n"), { encoding: "utf8", mode: modeOf(file) });
+    await writeFile(tmp, lines.join("\n"), { encoding: "latin1", mode });
+    // `writeFile`'s `mode` is masked by the umask; an explicit chmod is not, so `.env`
+    // keeps exactly the mode it had instead of drifting to whatever the umask allows.
+    await chmod(tmp, mode);
     await doRename(tmp, file);
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => {});

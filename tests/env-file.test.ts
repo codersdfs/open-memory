@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { commentOutEnvKeys, envFilePath, readEnvFile } from "../src/core/envFile.js";
@@ -75,6 +75,10 @@ describe("readEnvFile", () => {
   it("reads a file that does not exist as empty", () => {
     expect(readEnvFile(file)).toEqual([]);
   });
+
+  it("throws on an unreadable path instead of reporting no keys", () => {
+    expect(() => readEnvFile(dir)).toThrow();
+  });
 });
 
 describe("commentOutEnvKeys", () => {
@@ -121,6 +125,32 @@ describe("commentOutEnvKeys", () => {
     put("#JEV_API_KEY=abc\n");
     expect(await commentOutEnvKeys(file, ["JEV_API_KEY"])).toEqual({ commented: [], backupPath: null });
     expect(readFileSync(file, "utf8")).toBe("#JEV_API_KEY=abc\n");
+  });
+
+  it("keeps the first pre-edit bytes when a second adopt writes .bak again", async () => {
+    const first = "JEV_API_KEY=one\nOTHER=keep\n";
+    put(first);
+    await commentOutEnvKeys(file, ["JEV_API_KEY"]);
+    // A second, different adopt sees the already-commented key out and OTHER still in.
+    expect(await commentOutEnvKeys(file, ["OTHER"])).toMatchObject({
+      commented: ["OTHER"],
+      backupPath: `${file}.bak`,
+    });
+    expect(readFileSync(`${file}.bak`, "utf8")).toBe(first);
+  });
+
+  it("round-trips a non-UTF-8 byte unchanged", async () => {
+    writeFileSync(file, Buffer.from("JEV_API_KEY=abc\nNAME=caf\xe9\n", "latin1"));
+    await commentOutEnvKeys(file, ["JEV_API_KEY"]);
+    expect(readFileSync(file)).toEqual(Buffer.from("#JEV_API_KEY=abc\nNAME=caf\xe9\n", "latin1"));
+    expect(readFileSync(file).includes(0xef)).toBe(false); // no U+FFFD in UTF-8
+  });
+
+  it.skipIf(process.platform === "win32")("keeps an unusual file mode across the rewrite", async () => {
+    put("JEV_API_KEY=abc\n");
+    chmodSync(file, 0o640);
+    await commentOutEnvKeys(file, ["JEV_API_KEY"]);
+    expect(statSync(file).mode & 0o777).toBe(0o640);
   });
 
   it("leaves .env byte-for-byte and no tmp behind when the write is interrupted", async () => {
