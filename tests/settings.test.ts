@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -217,5 +217,16 @@ describe("two whitelists", () => {
   it.skipIf(process.platform === "win32")("creates the file 0600 on POSIX", async () => {
     await writeSettings({ OPENAI_API_KEY: "sk-test" }, home);
     expect(statSync(settingsPath(home)).mode & 0o777).toBe(0o600);
+  });
+
+  it.skipIf(process.platform === "win32")("replaces a stale 0644 tmp file instead of inheriting its mode", async () => {
+    // `writeFile`'s mode applies only when it creates the file, so a tmp left behind by an
+    // interrupted write is the case that decides whether settings.json really ends up 0600.
+    const tmp = `${settingsPath(home)}.tmp`;
+    writeFileSync(tmp, "{}", "utf8");
+    chmodSync(tmp, 0o644);
+    await writeSettings({ OPENAI_API_KEY: "sk-test" }, home);
+    expect(statSync(settingsPath(home)).mode & 0o777).toBe(0o600);
+    expect(existsSync(tmp)).toBe(false);
   });
 });

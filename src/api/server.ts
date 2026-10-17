@@ -211,9 +211,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     // does not own is a 400 naming it, never a write into settings.json.
     const outside = Object.keys(patch).filter((key) => !(SETTING_KEYS as readonly string[]).includes(key));
     if (outside.length > 0) {
-      return send(res, 400, {
-        error: `${outside.join(", ")} is not an embedding setting — this route writes only: ${SETTING_KEYS.join(", ")}`,
-      });
+      // One key reads as a sentence; more than one has to agree with its verb.
+      const named =
+        outside.length === 1
+          ? `${outside[0]} is not an embedding setting`
+          : `${outside.join(", ")} are not embedding settings`;
+      return send(res, 400, { error: `${named} — this route writes only: ${SETTING_KEYS.join(", ")}` });
     }
 
     // The environment wins over the file — that is the precedence, and it means a key

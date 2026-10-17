@@ -96,7 +96,9 @@ function readJson(file: string): unknown {
  *
  * The file is created `0600` so only its owner can read it. That is a POSIX mode: on
  * Windows `mode` is largely inert and the protection is the user profile ACL, so this
- * is not a promise that the file is locked there.
+ * is not a promise that the file is locked there. `mode` only applies to a file
+ * `writeFile` creates, so the tmp is removed first: a stale `settings.json.tmp` from an
+ * interrupted write would otherwise be reused at its old mode and renamed into place.
  */
 export async function writeSettings(patch: Settings, home?: string): Promise<Settings> {
   for (const key of Object.keys(patch)) {
@@ -114,6 +116,7 @@ export async function writeSettings(patch: Settings, home?: string): Promise<Set
   const target = settingsPath(home);
   const tmp = `${target}.tmp`;
   try {
+    await rm(tmp, { force: true });
     await writeFile(tmp, `${JSON.stringify(merged, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(tmp, target);
   } catch (err) {
