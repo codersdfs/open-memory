@@ -321,13 +321,13 @@ export const api = {
   reembedJob: (): Promise<ReembedJob> => request("/embedding/reembed"),
 
   /**
-   * GET /settings — src/api/server.ts:298-307. Credentials arrive masked (`…` plus the last
-   * four characters, src/core/settings.ts:314-316); there is no route that echoes a value.
+   * GET /settings — src/api/server.ts:306-320. Credentials arrive masked (`…` plus the last
+   * four characters, src/core/settings.ts:326-328); there is no route that echoes a value.
    */
   getSettings: (): Promise<SettingsPayload> => request("/settings"),
 
   /**
-   * POST /settings — src/api/server.ts:309-336. A flat body of names to values; the route
+   * POST /settings — src/api/server.ts:322-353. A flat body of names to values; the route
    * refuses a key the environment already sets (`400 … is set in the environment`) rather
    * than writing a value nothing would read.
    */
@@ -335,8 +335,8 @@ export const api = {
     request("/settings", sendInit("POST", patch)),
 
   /**
-   * POST /settings/adopt-env — src/api/server.ts:341-349, fed by `adoptEnvKeys`
-   * (src/core/settings.ts:230). `notAdopted` is what stayed in `.env`; `backupPath` is the
+   * POST /settings/adopt-env — src/api/server.ts:358-366, fed by `adoptEnvKeys`
+   * (src/core/settings.ts:242). `notAdopted` is what stayed in `.env`; `backupPath` is the
    * `.env.bak` written before anything was commented out.
    */
   adoptEnv: (): Promise<{ adopted: string[]; notAdopted: string[]; backupPath: string | null; restartRequired: true }> =>
@@ -367,7 +367,7 @@ export interface ReembedJob {
 }
 
 /**
- * src/core/settings.ts:343-357 SettingsEntry — one line of `GET /settings`.
+ * src/core/settings.ts:355-369 SettingsEntry — one line of `GET /settings`.
  *
  * `masked` is null for every non-secret key (there is no `value` field at all: a plain
  * setting is not read back either) and for a credential with nothing behind it.
@@ -382,7 +382,7 @@ export interface SettingsEntry {
   writable: boolean;
 }
 
-/** `GET /settings` — src/api/server.ts:298-307. */
+/** `GET /settings` — src/api/server.ts:306-320. */
 export interface SettingsPayload {
   entries: SettingsEntry[];
   settingsPath: string;

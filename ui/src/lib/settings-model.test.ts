@@ -50,8 +50,14 @@ describe("needsAdoptBanner", () => {
     expect(needsAdoptBanner([entry({ kind: "secret", source: "env" })])).toBe(true);
   });
 
-  it("is false for an env-sourced key that is not secret-shaped", () => {
-    expect(needsAdoptBanner([entry({ name: "JEV_MODEL", kind: "plain", masked: null, source: "env" })])).toBe(false);
+  it("is true for a plain knob the environment shadows, because adopt moves it too", () => {
+    expect(needsAdoptBanner([entry({ name: "MEMORY_JEV", kind: "plain", masked: null, source: "env" })])).toBe(true);
+  });
+
+  it("is false for an env-sourced key the console may not write, which adopt cannot move", () => {
+    // `TYPESAFE_API_KEY` is read by the judge but is on neither whitelist, so the banner would
+    // offer a button that changes nothing.
+    expect(needsAdoptBanner([entry({ name: "TYPESAFE_API_KEY", source: "env", writable: false })])).toBe(false);
   });
 
   it("is false for a secret already living in the settings file", () => {

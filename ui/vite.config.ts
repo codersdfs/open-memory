@@ -20,6 +20,8 @@ export default defineConfig({
       '/decay': { target: TARGET, changeOrigin: true },
       '/sessions': { target: TARGET, changeOrigin: true },
       '/namespaces': { target: TARGET, changeOrigin: true },
+      '/settings': { target: TARGET, changeOrigin: true },
+      '/embedding': { target: TARGET, changeOrigin: true },
       '/app': { target: TARGET, changeOrigin: true },
     },
   },

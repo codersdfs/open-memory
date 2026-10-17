@@ -11,11 +11,11 @@ import { effectBadge, maskedDisplay, needsAdoptBanner, sourceBadge } from '../li
  * Three rules hold the whole view together:
  *
  * 1. A secret is never rendered in clear. The only value on the page is the masked tail
- *    `GET /settings` returns (src/core/settings.ts:314-316); an input is empty until the
+ *    `GET /settings` returns (src/core/settings.ts:326-328); an input is empty until the
  *    user types into it and is emptied again on save, so the console never holds a stored
  *    key long enough to print one.
  * 2. What a row *says* comes from the row: `source` and `effect` are reported per key by
- *    `settingsInventory` (src/core/settings.ts:371-398) and the words for them live in
+ *    `settingsInventory` (src/core/settings.ts:383-413) and the words for them live in
  *    settings-model.ts, not in this JSX.
  * 3. The environment beats `settings.json`, so a row whose `source` is `env` cannot be
  *    written here — the server answers 400 naming it, and the row says so first.
@@ -198,7 +198,7 @@ function PlainRow({
 /**
  * The banner is the only way out of the shadowed case without a text editor: `adoptEnvKeys`
  * copies the whitelisted `.env` entries into `settings.json` and comments their lines out
- * (never deletes them), writing `.env.bak` first (src/core/settings.ts:230). The process
+ * (never deletes them), writing `.env.bak` first (src/core/settings.ts:242). The process
  * running now still holds what it read at boot, so the banner ends in "restart required".
  */
 function AdoptBanner({
@@ -214,7 +214,7 @@ function AdoptBanner({
   );
   const [error, setError] = useState<string | null>(null);
 
-  const shadowedSecrets = entries.filter((e) => e.kind === 'secret' && e.source === 'env').map((e) => e.name);
+  const shadowed = entries.filter((e) => e.writable && e.source === 'env').map((e) => e.name);
 
   const adopt = () => {
     setBusy(true);
@@ -243,8 +243,8 @@ function AdoptBanner({
       }}
     >
       <div>
-        {shadowedSecrets.length === 1 ? 'One credential comes' : `${shadowedSecrets.length} credentials come`} from the
-        environment: <span className="mono">{shadowedSecrets.join(', ')}</span>. The environment wins over{' '}
+        {shadowed.length === 1 ? 'One setting comes' : `${shadowed.length} settings come`} from the
+        environment: <span className="mono">{shadowed.join(', ')}</span>. The environment wins over{' '}
         <span className="mono">settings.json</span>, so nothing saved here can change them.
       </div>
       <div style={{ color: 'var(--dim)' }}>
@@ -254,7 +254,7 @@ function AdoptBanner({
       </div>
       <div className="row">
         <button type="button" className="btn btn-primary" disabled={busy} onClick={adopt}>
-          {busy ? 'adopting…' : 'adopt .env keys'}
+          {busy ? 'adopting…' : 'adopt .env values'}
         </button>
       </div>
       {result !== null ? (
@@ -271,7 +271,7 @@ function AdoptBanner({
               . restart required.
             </div>
           ) : (
-            <div>nothing to adopt — no whitelisted key was sitting in .env.</div>
+            <div>nothing to adopt — no whitelisted name was sitting in .env.</div>
           )}
           {result.notAdopted.length > 0 ? (
             <div>
@@ -366,9 +366,12 @@ export default function SettingsView() {
       // the write that needed it.
       .then((r) => {
         setDraft((d) => ({ ...d, [entry.name]: '' }));
+        // `restartRequired` is the server's measurement of the whole settings file against the
+        // live process, not a verdict on the row just saved — every row on this page is an
+        // immediate key, so a pending restart here belongs to the embedding settings.
         setNotice(
           r.restartRequired
-            ? `${r.saved.join(', ')} saved — this process keeps the old value until it restarts.`
+            ? `${r.saved.join(', ')} saved — live on the next call; the restart the embedding settings ask for is still pending.`
             : `${r.saved.join(', ')} saved — live on the next call, no restart needed.`,
         );
         refresh();

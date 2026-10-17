@@ -5,12 +5,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { summarize } from "../src/core/stats.js";
-import { readSettings, settingsPath, writeSettings } from "../src/core/settings.js";
+import { readSettings, runtimeEnv, settingsPath, writeSettings } from "../src/core/settings.js";
 import { readEnvFile } from "../src/core/envFile.js";
 import { buildServer } from "../src/api/server.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import { previewEmbedding } from "../src/core/embedding/index.js";
 import type { Memory } from "../src/core/types.js";
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -486,6 +487,7 @@ describe("settings routes", () => {
   const ENV_ONLY = "typesafe-env-only-3310";
   const JEV_GOOD = "jev-candidate-9001";
   const JEV_BAD = "jev-rejected-0042";
+  const PROVIDER_KEY = "sk-console-openai-5501";
 
   // Captured and restored: this suite points the settings file at a temp home, refuses to
   // inherit the developer's own keys, and stands a local JEV endpoint up so validation is
@@ -635,6 +637,36 @@ describe("settings routes", () => {
     // A rejected key must not come back in the error body either.
     expect(text).not.toContain(JEV_BAD);
     expect(readSettings(home)).toEqual(before);
+  });
+
+  it("saves a provider key through POST /settings, and the factory builds from it", async () => {
+    // Acceptance item 1 of the credentials work, and the one thing no other case here shows:
+    // every other successful write is JEV_API_KEY, and this suite sets OPENAI_API_KEY in the
+    // environment, so a *provider* credential had never been seen making it from the console
+    // to the embedder. A home of its own keeps the switch in the file only.
+    const switchHome = mkdtempSync(path.join(tmpdir(), "ai-memory-console-provider-"));
+    const savedKey = process.env.OPENAI_API_KEY;
+    process.env.AI_MEMORY_HOME = switchHome;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      await writeSettings({ EMBEDDING_PROVIDER: "openai" }, switchHome);
+
+      // The route previews every patch that changes the switch, and `resolveEmbedding` asks
+      // the key only to be present — so a fake one is enough to prove the path, with no call
+      // leaving this process.
+      const res = await post("/settings", { OPENAI_API_KEY: PROVIDER_KEY });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ saved: ["OPENAI_API_KEY"], restartRequired: true });
+      expect(readSettings(switchHome).OPENAI_API_KEY).toBe(PROVIDER_KEY);
+      // What `MemoryService` and the CLI do at construction: the merge seam, not the file.
+      expect(previewEmbedding(runtimeEnv({}, switchHome))).toMatchObject({ ok: true, provider: "openai" });
+    } finally {
+      process.env.AI_MEMORY_HOME = home;
+      if (savedKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = savedKey;
+      rmSync(switchHome, { recursive: true, force: true });
+    }
   });
 
   it("adopts the .env keys into the file and comments them out, once", async () => {

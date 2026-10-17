@@ -2,7 +2,7 @@
  * The words the settings view puts on a row, kept out of the JSX so they can be tested and
  * so two cards cannot describe the same field differently.
  *
- * Every string here is derived from what `GET /settings` reported (src/core/settings.ts:343-357);
+ * Every string here is derived from what `GET /settings` reported (src/core/settings.ts:355-369);
  * nothing re-derives a value's source or its effect locally, because a second copy of that rule
  * is how the badge and the server start disagreeing.
  */
@@ -45,9 +45,13 @@ export function maskedDisplay(entry: SettingsEntry): string {
 }
 
 /**
- * Whether the adopt banner belongs on the page: at least one secret is being supplied by the
- * environment, so a save into `settings.json` would land where nothing reads it.
+ * Whether the adopt banner belongs on the page: at least one writable entry is being supplied
+ * by the environment, so a save into `settings.json` would land where nothing reads it.
+ *
+ * The gate is `writable`, not `kind === "secret"`: `adoptEnvKeys` moves any whitelisted name,
+ * so a plain knob shadowed in `.env` (`MEMORY_JEV=true`) has the same problem and the same way
+ * out, while an env-only key (`TYPESAFE_API_KEY`) cannot be adopted and gets no banner.
  */
 export function needsAdoptBanner(entries: SettingsEntry[]): boolean {
-  return entries.some((entry) => entry.kind === "secret" && entry.source === "env");
+  return entries.some((entry) => entry.writable && entry.source === "env");
 }
