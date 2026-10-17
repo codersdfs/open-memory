@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { jevKeep, jevApiKey, jevEnabled, importanceFor } from "../src/core/judgment/judge.js";
+import { jevKeep, jevApiKey, jevEnabled, importanceFor, validateJevKey } from "../src/core/judgment/judge.js";
 import { writeSettings } from "../src/core/settings.js";
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -137,5 +137,45 @@ describe("jev judge", () => {
     await writeSettings({ MEMORY_JEV: "false" }, home);
     expect(jevEnabled()).toBe(false);
     await fs.rm(home, { recursive: true, force: true });
+  });
+});
+
+// The console validates a candidate key before it stores it: the judge fails open, so a
+// stored-but-wrong key would silently store every memory unjudged.
+describe("validateJevKey", () => {
+  it("makes exactly one call, carrying the candidate key", async () => {
+    let calls = 0;
+    let auth = "";
+    const spy = (async (_url: unknown, init: RequestInit) => {
+      calls++;
+      auth = String((init.headers as Record<string, string>).Authorization);
+      return new Response(JSON.stringify({ model: "jev-test", answers: { keep: { type: "noul", noul: 0.9 } } }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    expect(await validateJevKey("jev-candidate-9001", { fetchImpl: spy })).toEqual({ ok: true });
+    expect(calls).toBe(1);
+    expect(auth).toBe("Bearer jev-candidate-9001");
+  });
+
+  it("answers instead of throwing when the key is rejected, and never echoes it", async () => {
+    const rejected = (async () => new Response("unauthorized", { status: 401 })) as unknown as typeof fetch;
+
+    const verdict = await validateJevKey("jev-candidate-9001", { fetchImpl: rejected });
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.error).toContain("401");
+    // This string can reach an HTTP response body, so the key must not be in it.
+    expect(verdict.error).not.toContain("jev-candidate-9001");
+  });
+
+  it("treats an unreachable endpoint as a failed validation", async () => {
+    const offline = (async () => {
+      throw new Error("getaddrinfo ENOTFOUND api.typesafe.ai");
+    }) as unknown as typeof fetch;
+
+    const verdict = await validateJevKey("jev-candidate-9001", { fetchImpl: offline });
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.error).toContain("ENOTFOUND");
   });
 });

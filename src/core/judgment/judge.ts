@@ -79,22 +79,12 @@ export interface JudgeOptions {
   retries?: number;
 }
 
-/** One noul against the sentence. null = no verdict (disabled, no key, or failed). */
-export async function jevKeep(
-  text: string,
-  opts: JudgeOptions = {},
-): Promise<Verdict | null> {
-  const env = runtimeEnv();
-  if (!isJevEnabled(env)) return null;
-  const apiKey = apiKeyFrom(env);
-  if (!apiKey) return null;
-
-  const endpoint = env.JEV_ENDPOINT ?? DEFAULT_ENDPOINT;
-  const model = env.JEV_MODEL ?? DEFAULT_MODEL;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const retries = opts.retries ?? DEFAULT_RETRIES;
-  const doFetch = opts.fetchImpl ?? fetch;
-  const body = JSON.stringify({
+/**
+ * The wire body for one systemOne call. One question, so the judge and the console's
+ * key check ask the endpoint the same thing — the protocol is not duplicated.
+ */
+function systemOneBody(text: string, model: string): string {
+  return JSON.stringify({
     state: text,
     model,
     questions: {
@@ -113,6 +103,24 @@ export async function jevKeep(
       },
     },
   });
+}
+
+/** One noul against the sentence. null = no verdict (disabled, no key, or failed). */
+export async function jevKeep(
+  text: string,
+  opts: JudgeOptions = {},
+): Promise<Verdict | null> {
+  const env = runtimeEnv();
+  if (!isJevEnabled(env)) return null;
+  const apiKey = apiKeyFrom(env);
+  if (!apiKey) return null;
+
+  const endpoint = env.JEV_ENDPOINT ?? DEFAULT_ENDPOINT;
+  const model = env.JEV_MODEL ?? DEFAULT_MODEL;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const retries = opts.retries ?? DEFAULT_RETRIES;
+  const doFetch = opts.fetchImpl ?? fetch;
+  const body = systemOneBody(text, model);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const ctl = new AbortController();
@@ -161,4 +169,51 @@ export async function jevKeep(
  */
 export function importanceFor(keep: number): number {
   return Number((0.4 + 0.5 * keep).toFixed(2));
+}
+
+export interface ValidateJevKeyOptions {
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+  endpoint?: string;
+  model?: string;
+}
+
+/**
+ * One real systemOne call with a candidate key, before the console writes it.
+ *
+ * The judge fails open on purpose, so a wrong key is the quietest failure in the project:
+ * every memory is stored unjudged and nothing says why. This is the one moment the user
+ * can be told, so it is a real call, not a shape check. It answers instead of throwing,
+ * because a 401 and an unreachable host are the same instruction to the caller — do not
+ * save this — and the message is built from the status alone: it can reach an HTTP
+ * response body, and the key never may.
+ */
+export async function validateJevKey(
+  key: string,
+  opts: ValidateJevKeyOptions = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const env = runtimeEnv();
+  const endpoint = opts.endpoint ?? env.JEV_ENDPOINT ?? DEFAULT_ENDPOINT;
+  const model = opts.model ?? env.JEV_MODEL ?? DEFAULT_MODEL;
+  const doFetch = opts.fetchImpl ?? fetch;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const res = await doFetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+      body: systemOneBody("a candidate key, checked before the console saves it", model),
+      signal: ctl.signal,
+    });
+    if (res.ok) return { ok: true };
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: `the JEV endpoint rejected the key (HTTP ${res.status})` };
+    }
+    return { ok: false, error: `the JEV endpoint answered HTTP ${res.status}` };
+  } catch (e) {
+    // No retry: a save the user is waiting on reports the network failure it saw.
+    return { ok: false, error: `the JEV endpoint could not be reached — ${(e as Error).message}` };
+  } finally {
+    clearTimeout(timer);
+  }
 }

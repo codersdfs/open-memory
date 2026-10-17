@@ -42,6 +42,20 @@ export const SETTING_KEYS = [
  */
 export const SECRET_KEYS = ["OPENAI_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY", "JEV_API_KEY"] as const;
 
+/**
+ * Credential names the environment is read for but the console may not write.
+ *
+ * `TYPESAFE_API_KEY` is the judge's third choice, after `JEV_API_KEY` and the path in
+ * `JEV_API_KEY_FILE` — and the path form exists for a checkout whose `.env` is shareable.
+ * Neither is a console field, so `writeSettings` refuses both; the inventory still reports
+ * them, because an empty JEV field would otherwise read as "no key anywhere" while a live
+ * one sits in the environment. The kind is per name: a key is a secret, a path is not.
+ */
+export const ENV_ONLY_KEYS: Record<string, "secret" | "plain"> = {
+  TYPESAFE_API_KEY: "secret",
+  JEV_API_KEY_FILE: "plain",
+};
+
 export type SettingKey = (typeof SETTING_KEYS)[number];
 export type SecretKey = (typeof SECRET_KEYS)[number];
 
@@ -51,9 +65,9 @@ export type WritableKey = SettingKey | SecretKey;
 export type Settings = Partial<Record<WritableKey, string>>;
 
 /** Both lists in one place, so nothing can add a key to one and forget the other. */
-const WRITABLE_KEYS: readonly WritableKey[] = [...SETTING_KEYS, ...SECRET_KEYS];
+export const WRITABLE_KEYS: readonly WritableKey[] = [...SETTING_KEYS, ...SECRET_KEYS];
 
-function isWritableKey(key: string): key is WritableKey {
+export function isWritableKey(key: string): key is WritableKey {
   return (WRITABLE_KEYS as readonly string[]).includes(key);
 }
 
@@ -288,6 +302,101 @@ function pickSettingKeys(settings: Settings): NodeJS.ProcessEnv {
  */
 export function mergeEnv(base: NodeJS.ProcessEnv, settings: Settings): NodeJS.ProcessEnv {
   return { ...nonEmpty(pickSettingKeys(settings)), ...nonEmpty(base) };
+}
+
+/**
+ * The masked form of a secret: `…` plus its last four characters.
+ *
+ * The tail is what lets a user recognise which key is saved. A value no longer than the
+ * tail gets the ellipsis alone, because "…" plus four characters of a four-character value
+ * is the value — and "never in clear" has no exception for short keys.
+ */
+export function maskSecret(value: string): string {
+  return value.length > 4 ? `…${value.slice(-4)}` : "…";
+}
+
+/**
+ * The keys the embedder reads when it is built, so saving one changes what the *next*
+ * start serves and never the process running now (ADR-0009: one process, one vector
+ * space). Everything else on either whitelist is read through `runtimeEnv` per call — the
+ * keys by the code that uses them, the judge and extractor knobs at each use — which is
+ * what makes those `immediate`.
+ */
+const RESTART_KEYS: ReadonlySet<string> = new Set<WritableKey>([
+  "EMBEDDING_PROVIDER",
+  "EMBEDDING_DIM",
+  "NIM_DIM",
+  "OPENAI_EMBED_MODEL",
+  "NIM_EMBED_MODEL",
+  "OPENAI_BASE_URL",
+  "NIM_BASE_URL",
+  "NIM_INPUT_TYPE",
+  "NIM_TRUNCATE",
+]);
+
+/** What applying a saved value costs: a restart, or nothing at all. */
+export function keyEffect(name: WritableKey): "immediate" | "restart" {
+  return RESTART_KEYS.has(name) ? "restart" : "immediate";
+}
+
+/** One line of `GET /settings`: where a value comes from, and what changing it costs. */
+export interface SettingsEntry {
+  /**
+   * A `WritableKey` for every console field. The `ENV_ONLY_KEYS` that happen to be set are
+   * reported here too, marked `writable: false`, so a value the environment provides under
+   * another name is visible rather than implied absent.
+   */
+  name: string;
+  kind: "secret" | "plain";
+  source: "env" | "file" | "default" | "absent";
+  /** `…` plus the last four characters, or null when there is no value or nothing secret. */
+  masked: string | null;
+  effect: "immediate" | "restart";
+  /** False for `ENV_ONLY_KEYS`: reported by the inventory, refused by `writeSettings`. */
+  writable: boolean;
+}
+
+function isSecret(name: string): boolean {
+  return (SECRET_KEYS as readonly string[]).includes(name);
+}
+
+/**
+ * Every key the console may show, with its source, its masked tail and its effect.
+ *
+ * A non-secret setting with no value anywhere is `default`, not `absent`: the embedder,
+ * the judge and the extractor each supply a fallback, and duplicating those values here
+ * would be a second copy of their rules that could drift. `absent` is what a credential
+ * with no value anywhere is — there is nothing behind it.
+ */
+export function settingsInventory(base: NodeJS.ProcessEnv = process.env, home?: string): SettingsEntry[] {
+  const env = nonEmpty(base);
+  const file = nonEmpty(readSettings(home) as NodeJS.ProcessEnv);
+  const entries: SettingsEntry[] = WRITABLE_KEYS.map((name) => {
+    const secret = isSecret(name);
+    const value = env[name] ?? file[name];
+    return {
+      name,
+      kind: secret ? "secret" : "plain",
+      source: env[name] !== undefined ? "env" : file[name] !== undefined ? "file" : secret ? "absent" : "default",
+      masked: secret && value !== undefined ? maskSecret(value) : null,
+      effect: keyEffect(name),
+      writable: true,
+    };
+  });
+  for (const [name, kind] of Object.entries(ENV_ONLY_KEYS)) {
+    const value = env[name];
+    if (value === undefined) continue;
+    entries.push({
+      name,
+      kind,
+      source: "env",
+      masked: kind === "secret" ? maskSecret(value) : null,
+      // Read per call by `judge.ts`, like every other credential.
+      effect: "immediate",
+      writable: false,
+    });
+  }
+  return entries;
 }
 
 /** Where the effective `EMBEDDING_PROVIDER` comes from. */

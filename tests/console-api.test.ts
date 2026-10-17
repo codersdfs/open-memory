@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { AddressInfo } from "node:net";
+import { createServer, type Server } from "node:http";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { summarize } from "../src/core/stats.js";
+import { readSettings, settingsPath, writeSettings } from "../src/core/settings.js";
+import { readEnvFile } from "../src/core/envFile.js";
 import { buildServer } from "../src/api/server.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
@@ -415,5 +421,218 @@ describe("embedding switch", () => {
     const hits = (await (await post("/memories/search", { namespace: "test:9", query: "Berlin", threshold: 0, k: 5 })).json()) as { memories: Record<string, unknown>[] };
     expect(hits.memories.length).toBeGreaterThan(0);
     expect(hits.memories[0]).not.toHaveProperty("embedding");
+  });
+});
+
+// The console's credential routes. Two things decide whether this feature is safe, and
+// each has its own case here: no response or error body may carry a full key value, and
+// `/admin/shutdown` must not act for anything but the loopback address.
+describe("settings routes", () => {
+  interface Entry {
+    name: string;
+    kind: "secret" | "plain";
+    source: "env" | "file" | "default" | "absent";
+    masked: string | null;
+    effect: "immediate" | "restart";
+    writable: boolean;
+  }
+  interface Inventory {
+    entries: Entry[];
+    settingsPath: string;
+    envPath: string;
+    restartRequired: boolean;
+  }
+
+  const ENV_KEY = "sk-env-openai-4821";
+  const FILE_KEY = "jev-file-secret-7734";
+  const ENV_ONLY = "typesafe-env-only-3310";
+  const JEV_GOOD = "jev-candidate-9001";
+  const JEV_BAD = "jev-rejected-0042";
+
+  // Captured and restored: this suite points the settings file at a temp home, refuses to
+  // inherit the developer's own keys, and stands a local JEV endpoint up so validation is
+  // one HTTP call to a stub rather than one to api.typesafe.ai.
+  const TOUCHED = [
+    "AI_MEMORY_HOME", "MEMORY_ENV_FILE",
+    "OPENAI_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY", "JEV_API_KEY", "JEV_API_KEY_FILE",
+    "TYPESAFE_API_KEY", "JEV_ENDPOINT",
+    "EMBEDDING_PROVIDER", "EMBEDDING_DIM", "NIM_DIM",
+  ] as const;
+
+  let base = "";
+  let home = "";
+  let envFile = "";
+  let jev: Server;
+  let close: () => Promise<void> = async () => {};
+  let shutdowns = 0;
+  let shutdownFired: () => void = () => {};
+  const shutdownCalled = new Promise<void>((resolve) => { shutdownFired = resolve; });
+  const savedEnv: Record<string, string | undefined> = {};
+
+  const post = (p: string, body: unknown) =>
+    fetch(`${base}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  beforeAll(async () => {
+    for (const key of TOUCHED) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    home = mkdtempSync(path.join(tmpdir(), "ai-memory-console-"));
+    envFile = path.join(home, ".env");
+    process.env.AI_MEMORY_HOME = home;
+    process.env.MEMORY_ENV_FILE = envFile;
+    // Two "real environment" keys: one whitelisted, one that only the judge reads.
+    process.env.OPENAI_API_KEY = ENV_KEY;
+    process.env.TYPESAFE_API_KEY = ENV_ONLY;
+
+    jev = createServer((req, res) => {
+      req.on("data", () => {});
+      req.on("end", () => {
+        if (req.headers.authorization === `Bearer ${JEV_BAD}`) {
+          res.writeHead(401, { "content-type": "text/plain" });
+          res.end("unauthorized");
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ model: "jev-test", answers: { keep: { type: "noul", noul: 0.9 } } }));
+      });
+    });
+    await new Promise<void>((r) => jev.listen(0, "127.0.0.1", r));
+    process.env.JEV_ENDPOINT = `http://127.0.0.1:${(jev.address() as AddressInfo).port}/v1/systemone`;
+
+    const svc = new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider() });
+    const { app } = await buildServer({ service: svc, onShutdown: () => { shutdowns++; shutdownFired(); } });
+    await new Promise<void>((r) => app.listen(0, "127.0.0.1", r));
+    base = `http://127.0.0.1:${(app.address() as AddressInfo).port}`;
+    close = () => new Promise<void>((r) => app.close(() => r()));
+  });
+
+  afterAll(async () => {
+    await close();
+    await new Promise<void>((r) => jev.close(() => r()));
+    for (const key of TOUCHED) {
+      const value = savedEnv[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("inventories every key by source, and never puts a full secret on the wire", async () => {
+    await writeSettings({ JEV_API_KEY: FILE_KEY }, home);
+
+    const res = await fetch(`${base}/settings`);
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    // The whole point of the masked form: this body cannot be pasted into a chat.
+    for (const clear of [ENV_KEY, FILE_KEY, ENV_ONLY]) expect(text).not.toContain(clear);
+
+    const body = JSON.parse(text) as Inventory;
+    const byName = Object.fromEntries(body.entries.map((entry) => [entry.name, entry]));
+    expect(byName.OPENAI_API_KEY).toMatchObject({ kind: "secret", source: "env", masked: "…4821", effect: "immediate" });
+    expect(byName.JEV_API_KEY).toMatchObject({ kind: "secret", source: "file", masked: "…7734", effect: "immediate" });
+    // Read by the judge from the environment, outside both whitelists: the console has to
+    // say so rather than show a blank field that reads as "nothing is set".
+    expect(byName.TYPESAFE_API_KEY).toMatchObject({ source: "env", masked: "…3310", writable: false });
+    expect(byName.EMBEDDING_PROVIDER).toMatchObject({ source: "default", effect: "restart" });
+
+    expect(body.settingsPath).toBe(settingsPath(home));
+    expect(body.envPath).toBe(envFile);
+    // Nothing pending: the live embedder is what a restart would build.
+    expect(body.restartRequired).toBe(false);
+  });
+
+  it("refuses a key the real environment already provides, naming where it lives", async () => {
+    const res = await post("/settings", { OPENAI_API_KEY: "sk-console-attempt" });
+
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).toContain("is set in the environment");
+    expect(text).not.toContain(ENV_KEY);
+  });
+
+  it("refuses a name outside both whitelists", async () => {
+    const res = await post("/settings", { NOPE: "x" });
+
+    expect(res.status).toBe(400);
+    expect((await res.text()).includes("NOPE")).toBe(true);
+  });
+
+  it("validates a judge key with one call, then stores it", async () => {
+    const res = await post("/settings", { JEV_API_KEY: JEV_GOOD });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ saved: ["JEV_API_KEY"], restartRequired: false });
+    expect(readSettings(home).JEV_API_KEY).toBe(JEV_GOOD);
+  });
+
+  it("refuses a judge key the endpoint rejects, and leaves the file alone", async () => {
+    const before = readSettings(home);
+
+    const res = await post("/settings", { JEV_API_KEY: JEV_BAD });
+
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).toContain("401");
+    // A rejected key must not come back in the error body either.
+    expect(text).not.toContain(JEV_BAD);
+    expect(readSettings(home)).toEqual(before);
+  });
+
+  it("adopts the .env keys into the file and comments them out, once", async () => {
+    writeFileSync(
+      envFile,
+      "NIM_API_KEY=nvapi-from-dotenv-6612\nJEV_API_KEY=jev-from-dotenv-2288\nTYPESAFE_API_KEY=typesafe-from-dotenv-5566\n",
+      "utf8",
+    );
+
+    const first = await post("/settings/adopt-env", {});
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({
+      adopted: ["NIM_API_KEY", "JEV_API_KEY"],
+      notAdopted: [],
+      backupPath: `${envFile}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).toMatchObject({ NIM_API_KEY: "nvapi-from-dotenv-6612", JEV_API_KEY: "jev-from-dotenv-2288" });
+    // Commented, never deleted: a wrong adopt is undone by removing a `#`.
+    expect(readFileSync(envFile, "utf8")).toBe(
+      "#NIM_API_KEY=nvapi-from-dotenv-6612\n#JEV_API_KEY=jev-from-dotenv-2288\nTYPESAFE_API_KEY=typesafe-from-dotenv-5566\n",
+    );
+    // The name outside both whitelists stays enabled in .env, where the loader reads it.
+    expect(readEnvFile(envFile).filter((entry) => entry.enabled).map((entry) => entry.name)).toEqual(["TYPESAFE_API_KEY"]);
+
+    const second = await post("/settings/adopt-env", {});
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual({ adopted: [], notAdopted: [], backupPath: null, restartRequired: true });
+  });
+
+  it("shuts down for a loopback caller only", async () => {
+    // A second listener whose peer address is rewritten to a public one. `remoteAddress`
+    // is the only thing the route may trust, and this is the only way to reach that branch
+    // from a test that can only talk to its own machine.
+    const svc = new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider() });
+    let ran = 0;
+    const { app } = await buildServer({ service: svc, onShutdown: () => { ran++; } });
+    app.on("connection", (socket) => {
+      Object.defineProperty(socket, "remoteAddress", { value: "203.0.113.9", configurable: true });
+    });
+    await new Promise<void>((r) => app.listen(0, "127.0.0.1", r));
+    const remote = `http://127.0.0.1:${(app.address() as AddressInfo).port}`;
+    try {
+      const res = await fetch(`${remote}/admin/shutdown`, { method: "POST" });
+      // Answered as if the route were not there: a stranger learns nothing by asking.
+      expect(res.status).toBe(404);
+      expect(await res.text()).toContain("not found");
+      expect(ran).toBe(0);
+    } finally {
+      await new Promise<void>((r) => app.close(() => r()));
+    }
+
+    const res = await fetch(`${base}/admin/shutdown`, { method: "POST" });
+    expect(res.status).toBe(204);
+    await shutdownCalled;
+    expect(shutdowns).toBe(1);
   });
 });

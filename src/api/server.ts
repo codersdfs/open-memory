@@ -9,7 +9,12 @@ import { stripEmbedding, TYPES, STATUSES, type MemoryType, type MemoryStatus } f
 import { appVersion } from "../version.js";
 import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding, type EmbeddingProvider } from "../core/embedding/index.js";
 import { reembedAll, type ReembedResult } from "../core/embedding/reembed.js";
-import { runtimeEnv, embeddingSource, mergeEnv, readSettings, SETTING_KEYS, settingsPath, writeSettings, type Settings } from "../core/settings.js";
+import {
+  runtimeEnv, embeddingSource, mergeEnv, readSettings, isWritableKey, keyEffect, settingsInventory,
+  adoptEnvKeys, SETTING_KEYS, WRITABLE_KEYS, settingsPath, writeSettings, type Settings,
+} from "../core/settings.js";
+import { envFilePath } from "../core/envFile.js";
+import { validateJevKey } from "../core/judgment/judge.js";
 
 // Resolved relative to this file, so the built layout must keep `src/api/` next to
 // `src/ui/` — which is why the build copies the static UI into `dist/src/ui` rather
@@ -111,12 +116,21 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
 }
 
-export async function buildServer(opts?: { dbPath?: string; service?: MemoryService }) {
+export async function buildServer(opts?: { dbPath?: string; service?: MemoryService; onShutdown?: () => void }) {
   const service = opts?.service ?? new MemoryService({ dbPath: opts?.dbPath });
   await service.init();
 
+  // How the process stops, as a callback because a test has to prove the route reached
+  // it without the runner dying. The default is the real thing: drop the listener first,
+  // then the process — `daemon restart` polls /health after asking, so a port still held
+  // open would read as a daemon that never stopped.
+  const shutdown = opts?.onShutdown ?? (() => {
+    app.close();
+    process.exit(0);
+  });
+
   const app: Server = createServer((req, res) => {
-    void handle(req, res, service).catch((e) => {
+    void handle(req, res, service, shutdown).catch((e) => {
       const status = e instanceof SyntaxError ? 400 : 500;
       send(res, status, { error: e instanceof Error ? e.message : String(e) });
     });
@@ -144,7 +158,7 @@ function send(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, service: MemoryService) {
+async function handle(req: IncomingMessage, res: ServerResponse, service: MemoryService, shutdown: () => void) {
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
   const method = req.method ?? "GET";
@@ -219,43 +233,89 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       return send(res, 400, { error: `${named} — this route writes only: ${SETTING_KEYS.join(", ")}` });
     }
 
-    // The environment wins over the file — that is the precedence, and it means a key
-    // already set there makes this write a no-op. Answering "ok" while nothing moves is
-    // the silent-fallback bug this project keeps writing comments about, so a shadowed
-    // key is an error that names where the value actually lives.
-    // `keyPresent` is the same predicate `GET /embedding` reports as `shadowed`, so the
-    // button the panel disables and the write this refuses cannot disagree.
-    const shadowed = Object.keys(patch).filter(keyPresent);
-    if (shadowed.length > 0) {
-      return send(res, 400, {
-        error:
-          shadowed.join(", ") +
-          " is set in the environment, which overrides settings.json — unset it (or edit .env) before switching here",
-      });
-    }
+    // Everything after this route's own scope guard — the shadowed check, validation of
+    // what the patch touches, the write — is the sequence `/settings` uses too, so it is
+    // one function. A copy is how the two routes would start disagreeing about which
+    // patch was validated.
+    const guarded = await guardSettingsWrite(patch);
+    if (!guarded.ok) return send(res, guarded.status, { error: guarded.error });
 
-    // Preview first, write second: previewEmbedding is the factory's own resolution,
-    // so a patch that previews cleanly cannot fail at the next start — and a rejected
-    // patch leaves no file behind at all. writeSettings is what rejects keys outside
-    // the two whitelists, and it throws before it opens anything.
-    const preview = previewEmbedding(mergeEnv(process.env, { ...readSettings(), ...patch } as Settings));
+    // A patch of judge or extractor knobs asks nothing of the embedder, so no preview was
+    // taken; the target this route has always answered with is the merged environment as
+    // it now stands.
+    const preview = guarded.preview ?? previewEmbedding(runtimeEnv());
     if (!preview.ok) return send(res, 400, { error: preview.error });
-    try {
-      await writeSettings(patch as Settings);
-    } catch (e) {
-      return send(res, 400, { error: e instanceof Error ? e.message : "bad settings" });
-    }
     // `needsRestart` is measured, not assumed: writing the same provider the process
     // already serves with is not a reason to restart anything.
-    const liveMatches =
-      service.embedder.name === preview.provider &&
-      service.embedder.dim === preview.dim &&
-      (service.embedder.model ?? null) === preview.model;
     return send(res, 200, {
       ok: true,
-      needsRestart: !liveMatches,
+      needsRestart: !runsOnTarget(service.embedder, preview),
       target: { provider: preview.provider, dim: preview.dim, model: preview.model },
     });
+  }
+
+  // The console's own settings surface: the inventory it renders, and the writes it makes.
+  if (path === "/settings" && method === "GET") {
+    return send(res, 200, {
+      entries: settingsInventory(),
+      settingsPath: settingsPath(),
+      envPath: envFilePath(),
+      // Measured the way /embedding measures it: is there a difference between what this
+      // process serves and what the next start would build?
+      restartRequired: restartPending(service),
+    });
+  }
+
+  if (path === "/settings" && method === "POST") {
+    let body: Record<string, unknown>;
+    try {
+      body = await readJson(req);
+    } catch {
+      return send(res, 400, { error: "malformed JSON body" });
+    }
+    const patch: Record<string, string> = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (typeof value !== "string") return send(res, 400, { error: key + " must be a string" });
+      patch[key] = value;
+    }
+    // This route writes both whitelists and nothing else. `writeSettings` would reject the
+    // rest anyway, but a 400 that names the key and the list is the only version the
+    // console can show as a sentence.
+    const outside = Object.keys(patch).filter((key) => !isWritableKey(key));
+    if (outside.length > 0) {
+      const named =
+        outside.length === 1 ? `${outside[0]} is not a settings key` : `${outside.join(", ")} are not settings keys`;
+      return send(res, 400, { error: `${named} — this route writes only: ${WRITABLE_KEYS.join(", ")}` });
+    }
+
+    const guarded = await guardSettingsWrite(patch);
+    if (!guarded.ok) return send(res, guarded.status, { error: guarded.error });
+    return send(res, 200, { saved: Object.keys(patch), restartRequired: restartPending(service) });
+  }
+
+  // Adopt: the environment wins the merge, so a key sitting in `.env` shadows every write
+  // above. This is how the user gets out of that without hand-editing — the values move
+  // into settings.json and their `.env` lines are commented out, never deleted.
+  if (path === "/settings/adopt-env" && method === "POST") {
+    try {
+      return send(res, 200, await adoptEnvKeys());
+    } catch (e) {
+      return send(res, 400, { error: e instanceof Error ? e.message : "could not adopt .env" });
+    }
+  }
+
+  // The restart at the end of every "restart required" (the CLI's `daemon restart`). The
+  // console is a localhost surface and this stops the process, so a caller that is not on
+  // the loopback address is answered as if the route were not there: a 403 would confirm
+  // it is, and this is not a route to advertise.
+  if (path === "/admin/shutdown" && method === "POST") {
+    if (!isLoopbackAddress(req.socket.remoteAddress)) return notFound(res);
+    res.writeHead(204);
+    res.end();
+    // `finish`, not the end of this function: the 204 has to leave before the listener
+    // carrying it goes away.
+    res.on("finish", shutdown);
+    return;
   }
 
   if (path === "/embedding/reembed" && method === "GET") {
@@ -453,8 +513,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       return;
     } catch { /* try the next root */ }
   }
-  res.writeHead(404, { "content-type": "text/plain" });
-  res.end("not found");
+  notFound(res);
 }
 
 /** Where each provider's credential is read from. NIM answers to two names. */
@@ -463,6 +522,110 @@ const NIM_KEY_ALIASES = ["NVIDIA_API_KEY", "NIM_API_KEY"] as const;
 
 function keyPresent(name: string): boolean {
   return (process.env[name] ?? "").trim() !== "";
+}
+
+/** What a configuration resolves to — the `ok` branch of `previewEmbedding`. */
+type EmbeddingTarget = Extract<ReturnType<typeof previewEmbedding>, { ok: true }>;
+
+/**
+ * Whether saving this key changes what the embedder would be built from. The provider
+ * credentials count: `resolveEmbedding` reads them, so a patch carrying one is a change to
+ * the switch even though the key itself takes effect immediately everywhere else.
+ */
+function changesEmbedder(key: string): boolean {
+  return (isWritableKey(key) && keyEffect(key) === "restart") || (KEY_ENVS as readonly string[]).includes(key);
+}
+
+/** Whether the live embedder already is what `target` describes — the only thing that makes a restart pointless. */
+function runsOnTarget(embedder: EmbeddingProvider, target: EmbeddingTarget): boolean {
+  return (
+    embedder.name === target.provider &&
+    embedder.dim === target.dim &&
+    (embedder.model ?? null) === target.model
+  );
+}
+
+/** Is there a difference between what this process serves and what the next start would build? */
+function restartPending(service: MemoryService): boolean {
+  const preview = previewEmbedding(runtimeEnv());
+  return !preview.ok || !runsOnTarget(service.embedder, preview);
+}
+
+/**
+ * The one path from an HTTP body to settings.json, shared by `/embedding` and `/settings`.
+ *
+ * Order is the whole point. Shadowed first: the environment wins the merge, so a key
+ * already set there makes the write a no-op, and answering "ok" while nothing moved is the
+ * silent failure this project keeps writing comments about. Then validation of exactly what
+ * the patch touches, then the write — which is never reached by a patch that failed, so a
+ * rejected patch leaves both files as they were.
+ *
+ * `preview` is null when the patch asks nothing of the embedder: the preview exists to
+ * prove the switch being written can be built, and a judge knob must stay savable while the
+ * embedding configuration is mid-repair.
+ */
+async function guardSettingsWrite(
+  patch: Record<string, string>,
+): Promise<{ ok: true; preview: EmbeddingTarget | null } | { ok: false; status: number; error: string }> {
+  const keys = Object.keys(patch);
+
+  // `keyPresent` is the same predicate `GET /embedding` reports as `shadowed`, so the
+  // button the panel disables and the write this refuses cannot disagree.
+  const shadowed = keys.filter(keyPresent);
+  if (shadowed.length > 0) {
+    const named = shadowed.length === 1 ? `${shadowed[0]} is` : `${shadowed.join(", ")} are`;
+    return {
+      ok: false,
+      status: 400,
+      error: `${named} set in the environment, which overrides settings.json — unset it (or edit .env) before saving here`,
+    };
+  }
+
+  // Preview first, write second: previewEmbedding is the factory's own resolution, so a
+  // patch that previews cleanly cannot fail at the next start.
+  let preview: EmbeddingTarget | null = null;
+  if (keys.some(changesEmbedder)) {
+    const candidate = previewEmbedding(mergeEnv(process.env, { ...readSettings(), ...patch } as Settings));
+    if (!candidate.ok) return { ok: false, status: 400, error: candidate.error };
+    preview = candidate;
+  }
+
+  // A stored-but-broken judge key is the quietest failure here: the judge fails open, so
+  // every memory would be stored unjudged and nothing would say why. One real call with the
+  // candidate key is the only point where the user can be told. An empty value clears the
+  // key instead, which has nothing to validate.
+  const candidateKey = patch.JEV_API_KEY;
+  if (candidateKey !== undefined && candidateKey !== "") {
+    const verdict = await validateJevKey(candidateKey);
+    if (!verdict.ok) {
+      return { ok: false, status: 400, error: `JEV_API_KEY not saved — ${verdict.error ?? "the endpoint rejected it"}` };
+    }
+  }
+
+  try {
+    await writeSettings(patch as Settings);
+  } catch (e) {
+    return { ok: false, status: 400, error: e instanceof Error ? e.message : "bad settings" };
+  }
+  return { ok: true, preview };
+}
+
+/**
+ * Whether a peer address is this machine. `remoteAddress` is the only thing that can say:
+ * the console has no auth, so `/admin/shutdown` may act for the loopback interface and
+ * nobody else. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is what a dual-stack listener reports
+ * for a v4 connection.
+ */
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const v4 = address.startsWith("::ffff:") ? address.slice(7) : address;
+  return v4 === "::1" || /^127\./.test(v4);
+}
+
+/** The 404 every miss gets — including a route that exists only for the loopback address. */
+function notFound(res: ServerResponse) {
+  res.writeHead(404, { "content-type": "text/plain" });
+  res.end("not found");
 }
 
 interface EmbeddingJob {
@@ -545,11 +708,7 @@ async function embeddingInfo(service: MemoryService, namespace: string) {
   };
   const preview = previewEmbedding(runtimeEnv());
   const target = preview.ok ? { provider: preview.provider, dim: preview.dim, model: preview.model } : null;
-  const needsRestart =
-    target === null ||
-    target.provider !== live.provider ||
-    target.dim !== live.dim ||
-    target.model !== live.model;
+  const needsRestart = !preview.ok || !runsOnTarget(service.embedder, preview);
 
   const rows = (await service.list({ namespace, includeDeleted: true, limit: STATS_ROW_CAP })).memories;
   const { summarize } = await import("../core/stats.js");

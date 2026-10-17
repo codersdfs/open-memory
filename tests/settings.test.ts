@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  SECRET_KEYS,
   SETTING_KEYS,
   adoptEnvKeys,
   settingsPath,
@@ -10,6 +11,9 @@ import {
   writeSettings,
   runtimeEnv,
   embeddingSource,
+  keyEffect,
+  maskSecret,
+  settingsInventory,
 } from "../src/core/settings.js";
 import { readEnvFile } from "../src/core/envFile.js";
 import { EMBEDDING_PRESETS, createEmbeddingProvider, previewEmbedding } from "../src/core/embedding/index.js";
@@ -231,6 +235,60 @@ describe("two whitelists", () => {
     // Only the mode is asserted: the rename consumes the tmp either way, so "the tmp is
     // gone" holds with or without the fix and would never fail.
     expect(statSync(settingsPath(home)).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("settings inventory", () => {
+  it("masks a secret to its last four characters, and a short one to nothing at all", () => {
+    expect(maskSecret("sk-abcdefgh1234")).toBe("…1234");
+    // A value no longer than the tail would come back whole, which is the one thing a
+    // masked read must never do.
+    expect(maskSecret("abcd")).toBe("…");
+    expect(maskSecret("k")).toBe("…");
+  });
+
+  it("names where each value comes from and what applying it costs", () => {
+    put(JSON.stringify({ JEV_API_KEY: "jev-file-secret-7734", EMBEDDING_DIM: "1024" }));
+
+    const entries = settingsInventory(
+      { OPENAI_API_KEY: "sk-env-secret-4821", TYPESAFE_API_KEY: "typesafe-env-only-3310" },
+      home,
+    );
+    const byName = Object.fromEntries(entries.map((entry) => [entry.name, entry]));
+
+    // The environment wins the merge, so that is the tail a masked read has to show.
+    expect(byName.OPENAI_API_KEY).toEqual({
+      name: "OPENAI_API_KEY", kind: "secret", source: "env", masked: "…4821", effect: "immediate", writable: true,
+    });
+    expect(byName.JEV_API_KEY).toEqual({
+      name: "JEV_API_KEY", kind: "secret", source: "file", masked: "…7734", effect: "immediate", writable: true,
+    });
+    expect(byName.EMBEDDING_DIM).toMatchObject({ kind: "plain", source: "file", masked: null, effect: "restart" });
+    expect(byName.EMBEDDING_PROVIDER).toMatchObject({ source: "default", effect: "restart", masked: null });
+    expect(byName.EXTRACTOR_MODEL).toMatchObject({ source: "default", effect: "immediate" });
+    // An unset credential has no value to mask and no built-in default to fall back on.
+    expect(byName.NIM_API_KEY).toMatchObject({ source: "absent", masked: null });
+    // Read from the environment but outside both whitelists: reported, because a blank
+    // field would let the user believe nothing is set while the judge is using this key.
+    expect(byName.TYPESAFE_API_KEY).toEqual({
+      name: "TYPESAFE_API_KEY", kind: "secret", source: "env", masked: "…3310", effect: "immediate", writable: false,
+    });
+    // Not set, so not noise in the inventory.
+    expect(byName.JEV_API_KEY_FILE).toBeUndefined();
+  });
+
+  it("splits the whitelists into a restart group and an immediate group", () => {
+    // ADR-0009: one process, one vector space — the embedder is frozen at construction.
+    // The judge and extractor knobs are read through runtimeEnv per call, so they never
+    // need one.
+    expect(SETTING_KEYS.filter((key) => keyEffect(key) === "restart")).toEqual([
+      "EMBEDDING_PROVIDER", "EMBEDDING_DIM", "NIM_DIM",
+      "OPENAI_EMBED_MODEL", "NIM_EMBED_MODEL",
+      "OPENAI_BASE_URL", "NIM_BASE_URL",
+      "NIM_INPUT_TYPE", "NIM_TRUNCATE",
+    ]);
+    for (const key of SECRET_KEYS) expect(keyEffect(key)).toBe("immediate");
+    expect(keyEffect("EXTRACTOR_MODEL")).toBe("immediate");
   });
 });
 
