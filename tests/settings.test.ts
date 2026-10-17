@@ -315,4 +315,84 @@ describe("adoptEnvKeys", () => {
     expect(lines).toContain("#MEMORY_JEV=true");
     expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["JEV_API_KEY"]);
   });
+
+  it("leaves a line whose quote is never closed enabled, and reports it", async () => {
+    // `parseValue` finds no closing quote and falls through to the unquoted branch, so this
+    // reads `'sk-1` — the opener glued onto the value. Adopting that would persist the quote
+    // and comment the one line that still has the real key.
+    putEnv("JEV_API_KEY='sk-1\nMEMORY_JEV=true\n");
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({
+      adopted: ["MEMORY_JEV"],
+      notAdopted: ["JEV_API_KEY"],
+      backupPath: `${envFile()}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).toEqual({ MEMORY_JEV: "true" });
+    expect(readFileSync(envFile(), "utf8")).toContain("JEV_API_KEY='sk-1\n");
+    expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["JEV_API_KEY"]);
+  });
+
+  it("leaves a line with text after the closing quote enabled, and reports it", async () => {
+    // `parseValue` stops at the closing quote, so this reads `abc` while the line says more:
+    // the value that moved would be a truncation of what the user wrote.
+    putEnv('JEV_API_KEY="abc"def\nMEMORY_JEV=true\n');
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({
+      adopted: ["MEMORY_JEV"],
+      notAdopted: ["JEV_API_KEY"],
+      backupPath: `${envFile()}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).not.toHaveProperty("JEV_API_KEY");
+    expect(readFileSync(envFile(), "utf8")).toContain('JEV_API_KEY="abc"def\n');
+    expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["JEV_API_KEY"]);
+  });
+
+  it("still refuses a double-quoted \\n, which the loader expands and parseValue does not", async () => {
+    // The raw text does reconstruct `line1\nline2`, so exactness alone would let it through;
+    // `process.loadEnvFile` turns that `\n` into a newline, so the value that landed in
+    // settings.json would differ from what .env gives. This is the backslash rule's job.
+    putEnv('JEV_API_KEY="line1\\nline2"\n');
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({ adopted: [], notAdopted: ["JEV_API_KEY"], backupPath: null, restartRequired: true });
+    expect(existsSync(settingsPath(home))).toBe(false);
+    expect(readEnvFile(envFile()).filter((e) => e.enabled).map((e) => e.name)).toEqual(["JEV_API_KEY"]);
+  });
+
+  it("adopts properly quoted values, both quote shapes, and comments them out", async () => {
+    putEnv('JEV_API_KEY="a b c"\nOPENAI_API_KEY=\'d e\'\n');
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({
+      adopted: ["JEV_API_KEY", "OPENAI_API_KEY"],
+      notAdopted: [],
+      backupPath: `${envFile()}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).toEqual({ JEV_API_KEY: "a b c", OPENAI_API_KEY: "d e" });
+    expect(readFileSync(envFile(), "utf8")).toBe('#JEV_API_KEY="a b c"\n#OPENAI_API_KEY=\'d e\'\n');
+  });
+
+  it("adopts an unquoted value with a trailing space and # comment", async () => {
+    putEnv("NIM_DIM=1024 # from an older setup\n");
+
+    const result = await adoptEnvKeys({ home, envFile: envFile() });
+
+    expect(result).toEqual({
+      adopted: ["NIM_DIM"],
+      notAdopted: [],
+      backupPath: `${envFile()}.bak`,
+      restartRequired: true,
+    });
+    expect(readSettings(home)).toEqual({ NIM_DIM: "1024" });
+    expect(readFileSync(envFile(), "utf8")).toBe("#NIM_DIM=1024 # from an older setup\n");
+  });
 });

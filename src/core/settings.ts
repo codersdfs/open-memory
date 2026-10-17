@@ -152,9 +152,41 @@ export interface AdoptResult {
 }
 
 /**
- * Whether `.env`'s parser reproduces this line's value exactly. `parseValue` strips the
- * quotes and drops an inline comment but interprets no escapes, so a backslash — the shape
- * `\"` and every other quote-escaped character takes — marks a value adopt would get wrong.
+ * Whether this line's raw text is what `parseValue` turned into `value` — the reconstruction
+ * test adopt needs, because `parseValue` strips the quotes and drops an inline comment
+ * rather than telling you what it removed.
+ *
+ * A quoted line must be that quote, the value, and the same closing quote with nothing
+ * before or after. An unquoted one must be the value alone, or the value and a trailing `#`
+ * comment. `JEV_API_KEY="ab\"cd"` (reads `ab\`), a quote opener that is never closed
+ * (`'sk-1` reads with the quote glued on) and text after the closing quote (`"abc"def`
+ * reads `abc`) all fail it.
+ */
+function readsBackExactly(raw: string | undefined, value: string): boolean {
+  if (raw === undefined) return false;
+  const trimmed = raw.trim();
+  const quote = trimmed[0];
+  if (quote === '"' || quote === "'") return trimmed === `${quote}${value}${quote}`;
+  if (!trimmed.startsWith(value)) return false;
+  return trimmed === value || /^\s+#/.test(trimmed.slice(value.length));
+}
+
+/**
+ * The value text `parseValue` was given for a line it accepted. A name holds no `=`, and
+ * neither the indent, the `#` nor the `export ` prefix does, so the first `=` is always the
+ * assignment's. `undefined` for a line the file no longer has.
+ */
+function rawValueText(line: string | undefined): string | undefined {
+  if (line === undefined) return undefined;
+  const eq = line.indexOf("=");
+  return eq === -1 ? undefined : line.slice(eq + 1);
+}
+
+/**
+ * Whether the loader that actually builds this process's environment reads the line
+ * differently from `parseValue`: it expands `\n` inside double quotes, which `parseValue`
+ * leaves as two characters. That is why a backslash stays refused even when the raw text
+ * does reconstruct the value — `readsBackExactly` cannot see an escape it does not interpret.
  */
 function hasEscape(raw: string | undefined): boolean {
   return raw !== undefined && raw.includes("\\");
@@ -175,9 +207,11 @@ function hasEscape(raw: string | undefined): boolean {
  *
  * A line whose value `.env` cannot be read back exactly is not moved at all, because
  * commenting it out would make `settings.json` the only copy and the value there would be
- * wrong. `parseValue` strips the quotes but does not interpret escapes, so
- * `JEV_API_KEY="ab\"cd"` reads as `ab\`. A name with such a line stays enabled in `.env`
- * and is reported in `notAdopted`; making the file explainable beats silently rewriting a key.
+ * wrong. Two checks decide that, and neither subsumes the other: the raw text must
+ * reconstruct the value (`readsBackExactly`), and it must carry no backslash, because the
+ * real loader expands `\n` inside double quotes while `parseValue` does not. A name with
+ * such a line stays enabled in `.env` and is reported in `notAdopted`; making the file
+ * explainable beats silently rewriting a key.
  */
 export async function adoptEnvKeys(opts: AdoptOptions = {}): Promise<AdoptResult> {
   const file = opts.envFile ?? envFilePath();
@@ -197,7 +231,8 @@ export async function adoptEnvKeys(opts: AdoptOptions = {}): Promise<AdoptResult
   // enabled line of a name it is given, which would take the unreadable value with it.
   const lossy = new Set<string>();
   for (const entry of entries) {
-    if (hasEscape(lines[entry.line - 1])) lossy.add(entry.name);
+    const raw = rawValueText(lines[entry.line - 1]);
+    if (hasEscape(raw) || !readsBackExactly(raw, entry.value)) lossy.add(entry.name);
   }
 
   const patch: Settings = {};
