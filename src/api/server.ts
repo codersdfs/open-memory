@@ -1,5 +1,6 @@
 import "../config.js";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { isIPv4 } from "node:net";
 import { readFile, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -164,6 +165,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   const method = req.method ?? "GET";
   const q = Object.fromEntries(url.searchParams);
 
+  // Tier A of the mutation gate, before any route looks at the request (see
+  // `foreignOriginProblem` for why only `Origin` and not the content type is global).
+  if (method === "POST" || method === "PATCH" || method === "DELETE") {
+    const foreign = foreignOriginProblem(req);
+    if (foreign) return send(res, foreign.status, { error: foreign.error });
+  }
+
   if (path === "/health") {
     // `version` is what lets a CLI notice a daemon left running from an older
     // install. Reachability alone is not enough: a stale daemon answers /health
@@ -208,7 +216,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   }
 
   if (path === "/embedding" && method === "POST") {
-    const refused = mutatingRequestProblem(req);
+    const refused = notJsonProblem(req);
     if (refused) return send(res, refused.status, { error: refused.error });
     let body: Record<string, unknown>;
     try {
@@ -269,7 +277,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   }
 
   if (path === "/settings" && method === "POST") {
-    const refused = mutatingRequestProblem(req);
+    const refused = notJsonProblem(req);
     if (refused) return send(res, refused.status, { error: refused.error });
     let body: Record<string, unknown>;
     try {
@@ -301,7 +309,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   // above. This is how the user gets out of that without hand-editing — the values move
   // into settings.json and their `.env` lines are commented out, never deleted.
   if (path === "/settings/adopt-env" && method === "POST") {
-    const refused = mutatingRequestProblem(req);
+    const refused = notJsonProblem(req);
     if (refused) return send(res, refused.status, { error: refused.error });
     try {
       return send(res, 200, await adoptEnvKeys());
@@ -317,8 +325,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   if (path === "/admin/shutdown" && method === "POST") {
     if (!isLoopbackAddress(req.socket.remoteAddress)) return notFound(res);
     // A loopback peer is still only half the question: a page open in the user's own
-    // browser is one too. The headers decide the rest (see `mutatingRequestProblem`).
-    const refused = mutatingRequestProblem(req);
+    // browser is one too. Its `Origin` was already refused above if it named another
+    // machine; what is left is this route's own JSON requirement (tier B).
+    const refused = notJsonProblem(req);
     if (refused) return send(res, refused.status, { error: refused.error });
     res.writeHead(204);
     res.end();
@@ -636,30 +645,38 @@ async function guardSettingsWrite(
  * nobody else. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is what a dual-stack listener reports
  * for a v4 connection; an `Origin` header spells the same machine as a bare `localhost` or
  * as a bracketed `[::1]`.
+ *
+ * A v4 host only counts as a dotted quad: `/^127\./` also accepted `127.0.0.1.evil.example`,
+ * a name a stranger can register and point at itself, which handed the gate back to the page
+ * it exists to stop. `isIPv4` parses all four octets, so a `127.` prefix with anything but
+ * three octets — or an octet above 255 — is not loopback.
  */
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
   const mapped = address.startsWith("::ffff:") ? address.slice(7) : address;
-  const host = mapped.startsWith("[") && mapped.endsWith("]") ? mapped.slice(1, -1) : mapped;
-  return host === "localhost" || host === "::1" || /^127\./.test(host);
+  const host = (mapped.startsWith("[") && mapped.endsWith("]") ? mapped.slice(1, -1) : mapped).toLowerCase();
+  if (host === "localhost" || host === "::1") return true;
+  return isIPv4(host) && host.startsWith("127.");
 }
 
 /**
- * What a mutating route demands of the request itself, and why a loopback peer is not enough.
+ * The two tiers of the mutation gate, and why there are two.
  *
  * A page in the user's own browser reaches this listener as a loopback peer too, and a
  * bodyless or form-shaped POST is a "simple request": no preflight, so the server sees it
- * before that page has earned anything. So the content type is the first gate — this API
- * speaks JSON, and a page cannot claim `application/json` cross-origin without a preflight
- * this server never grants. The second is `Origin`: when a browser sends one it has to name
- * this machine, which stops a foreign page from riding the peer check. An absent `Origin`
- * (curl, the CLI, a test) stays valid, and neither refusal echoes what it rejected.
+ * before that page has earned anything. What such a page cannot do is lie about `Origin` —
+ * a browser attaches it to every cross-origin mutation — so tier A checks exactly that, on
+ * every POST/PATCH/DELETE, before any handler runs.
+ *
+ * Tier A does not require a content type, and deliberately so: the CLI, the pi extension,
+ * hooks and adapters send neither an `Origin` nor always a JSON content type, so a global
+ * 415 would break clients that are not browsers while stopping nothing a browser can do.
+ * The JSON requirement is tier B, and it stays only on the console's own write routes
+ * (`/settings`, `/settings/adopt-env`, `/admin/shutdown`, `/embedding`), whose only client
+ * is the console and always speaks JSON. An absent `Origin` (curl, the CLI, a test) stays
+ * valid, and neither refusal echoes what it rejected.
  */
-function mutatingRequestProblem(req: IncomingMessage): { status: number; error: string } | null {
-  const type = String(req.headers["content-type"] ?? "").toLowerCase();
-  if (!type.startsWith("application/json")) {
-    return { status: 415, error: "content-type must be application/json" };
-  }
+function foreignOriginProblem(req: IncomingMessage): { status: number; error: string } | null {
   const origin = req.headers.origin;
   if (origin === undefined) return null;
   let host: string;
@@ -669,6 +686,12 @@ function mutatingRequestProblem(req: IncomingMessage): { status: number; error: 
     return { status: 403, error: "origin not allowed" };
   }
   return isLoopbackAddress(host) ? null : { status: 403, error: "origin not allowed" };
+}
+
+/** Tier B: the console's write routes have no client that speaks anything but JSON. */
+function notJsonProblem(req: IncomingMessage): { status: number; error: string } | null {
+  const type = String(req.headers["content-type"] ?? "").toLowerCase();
+  return type.startsWith("application/json") ? null : { status: 415, error: "content-type must be application/json" };
 }
 
 /** The 404 every miss gets — including a route that exists only for the loopback address. */

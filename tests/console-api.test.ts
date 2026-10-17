@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { AddressInfo } from "node:net";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +14,26 @@ import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
 import type { Memory } from "../src/core/types.js";
 
 const DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * A POST with exactly the headers the caller names — the only way a test can send none at
+ * all, since `fetch` always sets a content type for a string body.
+ */
+function postRaw(port: number, path: string, headers: Record<string, string>, body: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    const req = request(
+      { host: "127.0.0.1", port, path, method: "POST", headers: { ...headers, "content-length": Buffer.byteLength(body) } },
+      (res) => {
+        let text = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => { text += chunk; });
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
 
 function mem(o: Partial<Memory> & { type: Memory["type"] }): Memory {
   return {
@@ -441,9 +461,10 @@ describe("embedding switch", () => {
 
 // The console's credential routes. Three things decide whether this feature is safe, and
 // each has its own case here: no response or error body may carry a full key value,
-// `/admin/shutdown` must not act for anything but the loopback address, and a mutating
-// route must get a JSON request from a loopback origin — a page in the user's own browser
-// is a loopback peer too.
+// `/admin/shutdown` must not act for anything but the loopback address, and a console
+// write route must get a JSON request from a loopback origin — a page in the user's own
+// browser is a loopback peer too. The `Origin` half is what every mutation gets
+// ("mutation gate" below); here it has to hold for the console's own routes.
 describe("settings routes", () => {
   interface Entry {
     name: string;
@@ -654,6 +675,48 @@ describe("settings routes", () => {
     expect(shutdowns).toBe(0);
   });
 
+  it("refuses a shutdown asked for by a lookalike of a loopback address", async () => {
+    // A hostname anyone can register and point at itself: it starts with `127.` and is not
+    // a dotted quad, which the old `/^127\./` prefix test read as this machine.
+    const res = await fetch(`${base}/admin/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://127.0.0.1.evil.example" },
+    });
+
+    expect(res.status).toBe(403);
+    expect(shutdowns).toBe(0);
+  });
+
+  it("refuses an adopt-env asked for by a lookalike of a loopback address, leaving .env alone", async () => {
+    writeFileSync(envFile, "NIM_API_KEY=nvapi-not-adopted-4477\n", "utf8");
+    const beforeEnv = readFileSync(envFile, "utf8");
+    const beforeSettings = readSettings(home);
+
+    const res = await fetch(`${base}/settings/adopt-env`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://127.0.0.1.evil.example" },
+      body: "{}",
+    });
+
+    expect(res.status).toBe(403);
+    expect(readFileSync(envFile, "utf8")).toBe(beforeEnv);
+    expect(readSettings(home)).toEqual(beforeSettings);
+  });
+
+  it("allows a loopback origin, spelled as localhost or as the quad", async () => {
+    for (const origin of ["http://localhost:7331", "http://127.0.0.1:7331"]) {
+      const res = await fetch(`${base}/settings`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin },
+        body: JSON.stringify({ NOPE: "x" }),
+      });
+      // Past the gate and into the route's own validation: the refusal names the key, and
+      // a 400 here is only reachable once the origin was accepted.
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain("NOPE");
+    }
+  });
+
   it("shuts down for a loopback caller only", async () => {
     // A second listener whose peer address is rewritten to a public one. `remoteAddress`
     // is the only thing the route may trust, and this is the only way to reach that branch
@@ -681,5 +744,62 @@ describe("settings routes", () => {
     expect(res.status).toBe(204);
     await shutdownCalled;
     expect(shutdowns).toBe(1);
+  });
+});
+
+// The other half of the gate. `Origin` is checked on every POST/PATCH/DELETE, not just on
+// the four console routes: POST /decay and POST /extract are simple requests too, and the
+// CLI, the pi extension and the hooks reach them with no `Origin` and not always a JSON
+// content type — which is why only the Origin check is global.
+describe("mutation gate", () => {
+  let base = "";
+  let close: () => Promise<void> = async () => {};
+  let svc: MemoryService;
+
+  beforeAll(async () => {
+    svc = new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider() });
+    const { app } = await buildServer({ service: svc });
+    await new Promise<void>((r) => app.listen(0, "127.0.0.1", r));
+    base = `http://127.0.0.1:${(app.address() as AddressInfo).port}`;
+    close = () => new Promise<void>((r) => app.close(() => r()));
+  });
+  afterAll(async () => { await close(); });
+
+  it("refuses POST /decay from a foreign origin, and prunes nothing", async () => {
+    // A row decay would take: working, past its 7-day window, strength under the cap.
+    const old = await svc.store.insert({ namespace: "gate:1", type: "working", text: "a working row past its window", strength: 0.1 }, []);
+    old.createdAt = Date.now() - 30 * DAY;
+
+    const refused = await fetch(`${base}/decay`, { method: "POST", headers: { origin: "https://evil.example" } });
+    expect(refused.status).toBe(403);
+    expect(await refused.text()).not.toContain("evil.example");
+    expect((await svc.store.getById(old.id))?.isDeleted).toBe(0);
+
+    // The same request with no Origin — the CLI — still prunes it, so the row above was
+    // a live candidate and the refusal above was the gate, not an empty store.
+    const local = await fetch(`${base}/decay`, { method: "POST" });
+    expect(local.status).toBe(200);
+    expect(((await local.json()) as { pruned: number }).pruned).toBe(1);
+  });
+
+  it("refuses POST /extract from a foreign origin, and stores nothing", async () => {
+    const refused = await fetch(`${base}/extract`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+      body: JSON.stringify({ text: "I live in Berlin", namespace: "gate:2" }),
+    });
+
+    expect(refused.status).toBe(403);
+    expect((await svc.list({ namespace: "gate:2" })).total).toBe(0);
+  });
+
+  it("accepts POST /extract with neither an Origin nor a JSON content type", async () => {
+    // The compatibility case, kept as a test so the two-tier decision cannot quietly
+    // become a global content-type requirement later.
+    const res = await postRaw(Number(new URL(base).port), "/extract", {}, JSON.stringify({ text: "I live in Berlin", namespace: "gate:3" }));
+
+    expect(res.status).toBe(200);
+    expect((JSON.parse(res.text) as { extracted: number }).extracted).toBeGreaterThan(0);
+    expect((await svc.list({ namespace: "gate:3" })).total).toBeGreaterThan(0);
   });
 });
