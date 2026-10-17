@@ -15,8 +15,18 @@ const ok = (noul: number): typeof fetch =>
 const saved = { ...process.env };
 afterEach(() => { process.env = { ...saved }; });
 
+// Key precedence is JEV_API_KEY, then JEV_API_KEY_FILE, then TYPESAFE_API_KEY. A case
+// that exercises the fallback has to clear the two names that win over it, or it only
+// passes while the developer's shell happens not to have them set.
+function useTypesafeKey(): void {
+  delete process.env.JEV_API_KEY;
+  delete process.env.JEV_API_KEY_FILE;
+  process.env.TYPESAFE_API_KEY = "k";
+}
+
 describe("jev judge", () => {
   it("returns null with no key — fail-open, never blocks a write", async () => {
+    delete process.env.JEV_API_KEY;
     delete process.env.JEV_API_KEY_FILE;
     delete process.env.TYPESAFE_API_KEY;
     expect(jevApiKey()).toBeUndefined();
@@ -25,7 +35,7 @@ describe("jev judge", () => {
   });
 
   it("returns the keep probability", async () => {
-    process.env.TYPESAFE_API_KEY = "k";
+    useTypesafeKey();
     expect(await jevKeep("user lives in Berlin", { fetchImpl: ok(0.83) })).toEqual({
       keep: 0.83,
       model: "jev-test",
@@ -33,12 +43,12 @@ describe("jev judge", () => {
   });
 
   it("clamps a nonsense probability instead of propagating it", async () => {
-    process.env.TYPESAFE_API_KEY = "k";
+    useTypesafeKey();
     expect((await jevKeep("x", { fetchImpl: ok(1.4) }))!.keep).toBe(1);
   });
 
   it("is disabled by MEMORY_JEV=false without touching the network", async () => {
-    process.env.TYPESAFE_API_KEY = "k";
+    useTypesafeKey();
     process.env.MEMORY_JEV = "false";
     expect(jevEnabled()).toBe(false);
     let called = false;
@@ -48,7 +58,7 @@ describe("jev judge", () => {
   });
 
   it("fails open on a server error, after retrying", async () => {
-    process.env.TYPESAFE_API_KEY = "k";
+    useTypesafeKey();
     let n = 0;
     const boom: typeof fetch = (async () => {
       n++;
@@ -59,7 +69,7 @@ describe("jev judge", () => {
   });
 
   it("does not retry a 401", async () => {
-    process.env.TYPESAFE_API_KEY = "k";
+    useTypesafeKey();
     let n = 0;
     const bad: typeof fetch = (async () => {
       n++;
@@ -70,7 +80,7 @@ describe("jev judge", () => {
   });
 
   it("returns null when the answer is not a noul", async () => {
-    process.env.TYPESAFE_API_KEY = "k";
+    useTypesafeKey();
     const weird: typeof fetch = (async () =>
       new Response(JSON.stringify({ model: "m", answers: { keep: { type: "score", score: 3 } } }), {
         status: 200,
@@ -89,6 +99,7 @@ describe("jev judge", () => {
     const f = path.join(dir, "key.txt");
     await fs.writeFile(f, " secret-key\n", "utf8");
     process.env.JEV_API_KEY_FILE = f;
+    delete process.env.JEV_API_KEY;
     delete process.env.TYPESAFE_API_KEY;
     expect(jevApiKey()).toBe("secret-key");
     await fs.rm(dir, { recursive: true, force: true });
@@ -96,6 +107,7 @@ describe("jev judge", () => {
 
   it("names an unreadable key file instead of silently storing unjudged", async () => {
     process.env.JEV_API_KEY_FILE = path.join(os.tmpdir(), "definitely-not-here", "key.txt");
+    delete process.env.JEV_API_KEY;
     delete process.env.TYPESAFE_API_KEY;
     expect(jevApiKey()).toBeUndefined();
   });

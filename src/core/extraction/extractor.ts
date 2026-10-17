@@ -1,5 +1,5 @@
 import type { MemoryType } from "../types.js";
-import { jevKeep, jevEnabled, importanceFor, JEV_MIN_KEEP } from "../judgment/judge.js";
+import { jevKeep, importanceFor, JEV_MIN_KEEP } from "../judgment/judge.js";
 import { runtimeEnv } from "../settings.js";
 
 export interface ExtractedMemory {
@@ -52,6 +52,9 @@ export class Extractor {
       .split(/(?<=[.!?])\s+|\n+/)
       .map((s) => s.trim())
       .filter((s) => s.length > 12);
+    // Every JEV_MIN_KEEP() is a synchronous settings.json read, so the threshold is
+    // read once for the turn instead of once per judged sentence.
+    const floor = JEV_MIN_KEEP();
     for (const s of sentences.slice(0, this.maxPerTurn * 2)) {
       if (candidates.length >= this.maxPerTurn) break;
       if (!Extractor.isWorthKeeping(s)) continue;
@@ -59,7 +62,7 @@ export class Extractor {
       // the class they cannot judge — "run the tests before commit" is scaffolding
       // in one repo and a durable routine in another. One noul settles it.
       const verdict = await this.judge(s);
-      if (verdict && verdict.keep < JEV_MIN_KEEP()) continue;
+      if (verdict && verdict.keep < floor) continue;
       // Gate saw the punctuation; storage should not carry it.
       const clean = s.replace(/[.!?]+$/, "").trim();
       const lower = s.toLowerCase();
@@ -148,7 +151,8 @@ export class Extractor {
    * it, unjudged" — the fail-open contract lives in the judge, not here.
    */
   private async judge(sentence: string): Promise<{ keep: number } | null> {
-    if (!jevEnabled()) return null;
+    // No enabled-check here: jevKeep applies the same gate and returns null when the
+    // judge is off, so checking again only costs another settings.json read.
     try {
       return await jevKeep(sentence);
     } catch {
