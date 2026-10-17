@@ -7,7 +7,7 @@ import { allPartitions, resolveAgent, resolveRequestScope, resolveWriteKey, reso
 import { resolveDbPath, resolveHome, legacyDbPath, dbExists } from "../core/dbPath.js";
 import { MemoryService } from "../core/memoryService.js";
 import { createEmbeddingProvider } from "../core/embedding/index.js";
-import { embedEnv } from "../core/settings.js";
+import { runtimeEnv } from "../core/settings.js";
 import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
 import type { Memory, MemoryType, SearchResult } from "../core/types.js";
@@ -223,7 +223,7 @@ async function cmdReembed(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>):
   const { SqliteVectorStore } = await import("../core/store/sqlite.js");
   // Merged env, or the CLI would migrate with a different provider than the console
   // says it would.
-  const embedder = createEmbeddingProvider(embedEnv());
+  const embedder = createEmbeddingProvider(runtimeEnv());
   const store = new SqliteVectorStore(resolveDbPath(flagString(a, "db")));
   await store.init();
   const previousDim = await store.storedDim();

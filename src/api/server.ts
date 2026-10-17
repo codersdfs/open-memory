@@ -9,7 +9,7 @@ import { stripEmbedding, TYPES, STATUSES, type MemoryType, type MemoryStatus } f
 import { appVersion } from "../version.js";
 import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding, type EmbeddingProvider } from "../core/embedding/index.js";
 import { reembedAll, type ReembedResult } from "../core/embedding/reembed.js";
-import { embedEnv, embeddingSource, mergeEnv, readSettings, SETTING_KEYS, settingsPath, writeSettings, type Settings } from "../core/settings.js";
+import { runtimeEnv, embeddingSource, mergeEnv, readSettings, SETTING_KEYS, settingsPath, writeSettings, type Settings } from "../core/settings.js";
 
 // Resolved relative to this file, so the built layout must keep `src/api/` next to
 // `src/ui/` — which is why the build copies the static UI into `dist/src/ui` rather
@@ -206,6 +206,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       patch[key] = value;
     }
 
+    // This route writes the embedding switch and nothing else. `writeSettings` accepts
+    // the console's credentials too, so the scope is stated here: a patch key this route
+    // does not own is a 400 naming it, never a write into settings.json.
+    const outside = Object.keys(patch).filter((key) => !(SETTING_KEYS as readonly string[]).includes(key));
+    if (outside.length > 0) {
+      return send(res, 400, {
+        error: `${outside.join(", ")} is not an embedding setting — this route writes only: ${SETTING_KEYS.join(", ")}`,
+      });
+    }
+
     // The environment wins over the file — that is the precedence, and it means a key
     // already set there makes this write a no-op. Answering "ok" while nothing moves is
     // the silent-fallback bug this project keeps writing comments about, so a shadowed
@@ -223,8 +233,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
 
     // Preview first, write second: previewEmbedding is the factory's own resolution,
     // so a patch that previews cleanly cannot fail at the next start — and a rejected
-    // patch leaves no file behind at all. writeSettings is what rejects secret-shaped
-    // and unknown keys, and it throws before it opens anything.
+    // patch leaves no file behind at all. writeSettings is what rejects keys outside
+    // the two whitelists, and it throws before it opens anything.
     const preview = previewEmbedding(mergeEnv(process.env, { ...readSettings(), ...patch } as Settings));
     if (!preview.ok) return send(res, 400, { error: preview.error });
     try {
@@ -262,7 +272,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     const dryRun = body.dryRun !== false;
     let target: EmbeddingProvider;
     try {
-      target = createEmbeddingProvider(embedEnv());
+      target = createEmbeddingProvider(runtimeEnv());
     } catch (e) {
       return send(res, 400, { error: e instanceof Error ? e.message : "embedding provider unavailable" });
     }
@@ -530,7 +540,7 @@ async function embeddingInfo(service: MemoryService, namespace: string) {
     model: service.embedder.model ?? null,
     source: embeddingSource(),
   };
-  const preview = previewEmbedding(embedEnv());
+  const preview = previewEmbedding(runtimeEnv());
   const target = preview.ok ? { provider: preview.provider, dim: preview.dim, model: preview.model } : null;
   const needsRestart =
     target === null ||

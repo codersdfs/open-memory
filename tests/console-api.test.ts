@@ -298,10 +298,11 @@ describe("embedding switch", () => {
     expect(((await res.json()) as { error: string }).error).toContain("OPENAI_API_KEY");
   });
 
-  it("refuses to store anything key-shaped", async () => {
+  it("refuses a credential on the embedding route", async () => {
+    // A whitelisted secret is writable now, but not here: this route owns the switch.
     const res = await post("/embedding", { NVIDIA_API_KEY: "nvapi-not-really" });
     expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toContain("belong in the environment");
+    expect(((await res.json()) as { error: string }).error).toContain("is not an embedding setting");
   });
 
   it("refuses a write the environment would override", async () => {

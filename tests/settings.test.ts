@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -7,7 +7,7 @@ import {
   settingsPath,
   readSettings,
   writeSettings,
-  embedEnv,
+  runtimeEnv,
   embeddingSource,
 } from "../src/core/settings.js";
 import { EMBEDDING_PRESETS, createEmbeddingProvider, previewEmbedding } from "../src/core/embedding/index.js";
@@ -29,34 +29,34 @@ const put = (text: string) => writeFileSync(settingsPath(home), text, "utf8");
 describe("settings precedence", () => {
   it("picks up a settings file on its own", () => {
     put(JSON.stringify({ EMBEDDING_PROVIDER: "nim" }));
-    expect(embedEnv({}, home).EMBEDDING_PROVIDER).toBe("nim");
+    expect(runtimeEnv({}, home).EMBEDDING_PROVIDER).toBe("nim");
     expect(embeddingSource({}, home)).toBe("settings");
   });
 
   it("lets a real environment variable beat the file", () => {
     put(JSON.stringify({ EMBEDDING_PROVIDER: "nim", EMBEDDING_DIM: "1024" }));
-    const merged = embedEnv({ EMBEDDING_PROVIDER: "openai" }, home);
+    const merged = runtimeEnv({ EMBEDDING_PROVIDER: "openai" }, home);
     expect(merged.EMBEDDING_PROVIDER).toBe("openai");
     expect(merged.EMBEDDING_DIM).toBe("1024");
     expect(embeddingSource({ EMBEDDING_PROVIDER: "openai" }, home)).toBe("env");
   });
 
   it("neither file nor env means the key is absent, not empty", () => {
-    expect(embedEnv({}, home).EMBEDDING_PROVIDER).toBeUndefined();
-    expect("EMBEDDING_PROVIDER" in embedEnv({}, home)).toBe(false);
+    expect(runtimeEnv({}, home).EMBEDDING_PROVIDER).toBeUndefined();
+    expect("EMBEDDING_PROVIDER" in runtimeEnv({}, home)).toBe(false);
     expect(embeddingSource({}, home)).toBe("default");
   });
 
   it("an empty settings value shadows nothing", () => {
     put(JSON.stringify({ EMBEDDING_PROVIDER: "", EMBEDDING_DIM: "" }));
-    expect("EMBEDDING_PROVIDER" in embedEnv({}, home)).toBe(false);
+    expect("EMBEDDING_PROVIDER" in runtimeEnv({}, home)).toBe(false);
     expect(embeddingSource({}, home)).toBe("default");
   });
 
   it("an empty env value does not mask the settings file below it", () => {
     // `KEY=` in a .env is the common shape; it means "unset", not "override".
     put(JSON.stringify({ EMBEDDING_PROVIDER: "nim" }));
-    expect(embedEnv({ EMBEDDING_PROVIDER: "" }, home).EMBEDDING_PROVIDER).toBe("nim");
+    expect(runtimeEnv({ EMBEDDING_PROVIDER: "" }, home).EMBEDDING_PROVIDER).toBe("nim");
     expect(embeddingSource({ EMBEDDING_PROVIDER: "" }, home)).toBe("settings");
   });
 });
@@ -110,14 +110,11 @@ describe("writeSettings", () => {
     expect(existsSync(settingsPath(home))).toBe(false);
   });
 
-  it("rejects a key-shaped key, naming the variable and the environment", async () => {
-    await expect(writeSettings({ OPENAI_API_KEY: "sk-x" } as never, home)).rejects.toThrow(/OPENAI_API_KEY.*environment/);
-    await expect(writeSettings({ MY_TOKEN: "t" } as never, home)).rejects.toThrow(/MY_TOKEN.*environment/);
-    expect(existsSync(settingsPath(home))).toBe(false);
-  });
-
   it("names every variable it accepts, and no key-shaped one is among them", () => {
-    for (const key of SETTING_KEYS) expect(key).toMatch(/^(EMBEDDING_|NIM_|OPENAI_(EMBED_MODEL|BASE_URL))/);
+    // The non-secret list holds knobs only; every credential lives in SECRET_KEYS.
+    for (const key of SETTING_KEYS) {
+      expect(key).toMatch(/^(EMBEDDING_|NIM_|OPENAI_(EMBED_MODEL|BASE_URL)|JEV_|MEMORY_JEV|ENABLE_EXTRACTOR|EXTRACTOR_MODEL)/);
+    }
     expect(SETTING_KEYS.some((k) => /API_KEY|_KEY|TOKEN|SECRET/i.test(k))).toBe(false);
   });
 });
@@ -192,5 +189,33 @@ describe("byVectorDim", () => {
     const s = summarize([row([1, 2, 3]), row([1, 2, 3]), row([1, 2, 3, 4]), row([])], 0);
     expect(s.byVectorDim).toEqual({ "3": 2, "4": 1, "0": 1 });
     expect(s.total).toBe(4);
+  });
+});
+
+describe("two whitelists", () => {
+  it("accepts a whitelisted secret", async () => {
+    await writeSettings({ OPENAI_API_KEY: "sk-test" }, home);
+    expect(readSettings(home).OPENAI_API_KEY).toBe("sk-test");
+  });
+
+  it("still rejects a credential-shaped name outside the whitelists", async () => {
+    await expect(writeSettings({ TYPESAFE_API_KEY: "x" } as never, home)).rejects.toThrow(/unknown setting/);
+    await expect(writeSettings({ JEV_API_KEY_FILE: "x" } as never, home)).rejects.toThrow(/unknown setting/);
+  });
+
+  it("reads a secret back through runtimeEnv", async () => {
+    await writeSettings({ JEV_API_KEY: "jev-1" }, home);
+    expect(runtimeEnv({}, home).JEV_API_KEY).toBe("jev-1");
+  });
+
+  it("lists the judge and extractor knobs", () => {
+    for (const k of ["JEV_ENDPOINT", "JEV_MODEL", "MEMORY_JEV", "MEMORY_JEV_MIN", "ENABLE_EXTRACTOR", "EXTRACTOR_MODEL"]) {
+      expect(SETTING_KEYS).toContain(k);
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("creates the file 0600 on POSIX", async () => {
+    await writeSettings({ OPENAI_API_KEY: "sk-test" }, home);
+    expect(statSync(settingsPath(home)).mode & 0o777).toBe(0o600);
   });
 });

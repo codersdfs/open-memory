@@ -1,12 +1,13 @@
 /**
- * `~/.ai-memory/settings.json` — the console's writable, non-secret settings.
+ * `~/.ai-memory/settings.json` — the console's writable settings.
  *
- * A file instead of a route that rewrites `.env` because the user's `.env` may hold
- * API keys, and a mistake there is unrecoverable; this file holds only the variable
- * names below, so a bad write costs a delete. The vocabulary is the environment's —
- * a setting key *is* an env var name, so there is no mapping layer to drift and the
- * factory's `env` seam is the whole integration. Precedence: real environment >
- * this file > the factory's built-in default.
+ * A file instead of a route that rewrites `.env`: the user's `.env` is where a mistake
+ * costs a key, and this file is the one place the console may write. It holds two
+ * whitelists — the knobs below, and the credentials a user would otherwise hand-type
+ * into `.env`. The vocabulary is the environment's — a key *is* an env var name, so
+ * there is no mapping layer to drift and the factory's `env` seam is the whole
+ * integration. Precedence: real environment > this file > the factory's built-in
+ * default.
  */
 
 import { readFileSync } from "node:fs";
@@ -14,7 +15,7 @@ import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveHome } from "./dbPath.js";
 
-/** Every key `settings.json` may hold. A settings key is an env var name — nothing else. */
+/** Every non-secret key `settings.json` may hold. A setting key is an env var name — nothing else. */
 export const SETTING_KEYS = [
   "EMBEDDING_PROVIDER",
   "EMBEDDING_DIM",
@@ -25,17 +26,34 @@ export const SETTING_KEYS = [
   "NIM_BASE_URL",
   "NIM_INPUT_TYPE",
   "NIM_TRUNCATE",
+  "JEV_ENDPOINT",
+  "JEV_MODEL",
+  "MEMORY_JEV",
+  "MEMORY_JEV_MIN",
+  "ENABLE_EXTRACTOR",
+  "EXTRACTOR_MODEL",
 ] as const;
 
+/**
+ * Credentials the console may write — one per provider the factory, the judge or the
+ * extractor can use. A closed list rather than a `/API_KEY|TOKEN/` shape: the pattern
+ * only guessed at which names were credentials, and a console has to name exactly which.
+ */
+export const SECRET_KEYS = ["OPENAI_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY", "JEV_API_KEY"] as const;
+
 export type SettingKey = (typeof SETTING_KEYS)[number];
+export type SecretKey = (typeof SECRET_KEYS)[number];
 
-export type Settings = Partial<Record<SettingKey, string>>;
+/** The two whitelists as one vocabulary: what may be written, read back and merged. */
+export type WritableKey = SettingKey | SecretKey;
 
-/** Anything shaped like a credential belongs in the environment, never in this file. */
-const SECRET_KEY = /API_KEY|_KEY|TOKEN|SECRET/i;
+export type Settings = Partial<Record<WritableKey, string>>;
 
-function isSettingKey(key: string): key is SettingKey {
-  return (SETTING_KEYS as readonly string[]).includes(key);
+/** Both lists in one place, so nothing can add a key to one and forget the other. */
+const WRITABLE_KEYS: readonly WritableKey[] = [...SETTING_KEYS, ...SECRET_KEYS];
+
+function isWritableKey(key: string): key is WritableKey {
+  return (WRITABLE_KEYS as readonly string[]).includes(key);
 }
 
 /** Absolute path to the settings file. `resolveHome` is the only home resolution. */
@@ -52,7 +70,7 @@ export function readSettings(home?: string): Settings {
   const parsed = readJson(settingsPath(home));
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
   const out: Settings = {};
-  for (const key of SETTING_KEYS) {
+  for (const key of WRITABLE_KEYS) {
     const value = (parsed as Record<string, unknown>)[key];
     if (typeof value === "string") out[key] = value;
   }
@@ -73,29 +91,30 @@ function readJson(file: string): unknown {
  *
  * Creates the home dir if missing, then writes `settings.json.tmp` and renames over
  * the target, so an interrupted or failed write leaves the previous file intact.
- * Unknown keys and anything key-shaped are rejected — silently storing either would
- * be the kind of mistake this file exists to make recoverable.
+ * Anything outside the two whitelists is rejected — silently storing a name the console
+ * does not own would be the kind of mistake this file exists to make recoverable.
+ *
+ * The file is created `0600` so only its owner can read it. That is a POSIX mode: on
+ * Windows `mode` is largely inert and the protection is the user profile ACL, so this
+ * is not a promise that the file is locked there.
  */
 export async function writeSettings(patch: Settings, home?: string): Promise<Settings> {
   for (const key of Object.keys(patch)) {
-    if (SECRET_KEY.test(key)) {
-      throw new Error(`${key} looks like a secret — API keys and tokens belong in the environment, not in settings.json`);
-    }
-    if (!isSettingKey(key)) {
-      throw new Error(`unknown setting "${key}" — settings.json holds only: ${SETTING_KEYS.join(", ")}`);
+    if (!isWritableKey(key)) {
+      throw new Error(`unknown setting "${key}" — settings.json holds only: ${WRITABLE_KEYS.join(", ")}`);
     }
   }
 
   const merged: Settings = { ...readSettings(home) };
   for (const [key, value] of Object.entries(patch)) {
-    if (typeof value === "string" && isSettingKey(key)) merged[key] = value;
+    if (typeof value === "string" && isWritableKey(key)) merged[key] = value;
   }
 
   await mkdir(resolveHome(home), { recursive: true });
   const target = settingsPath(home);
   const tmp = `${target}.tmp`;
   try {
-    await writeFile(tmp, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+    await writeFile(tmp, `${JSON.stringify(merged, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(tmp, target);
   } catch (err) {
     await rm(tmp, { force: true }).catch(() => {});
@@ -114,19 +133,19 @@ function nonEmpty(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
- * The environment the embedder should be built from: real environment > settings file
+ * The environment every consumer should be built from: real environment > settings file
  * > the factory's default. Both sides drop empty strings first, so `KEY=` in `.env`
  * or `""` in the file reads as unset instead of shadowing the layer below it with a
  * broken value.
  */
-export function embedEnv(base: NodeJS.ProcessEnv = process.env, home?: string): NodeJS.ProcessEnv {
+export function runtimeEnv(base: NodeJS.ProcessEnv = process.env, home?: string): NodeJS.ProcessEnv {
   return mergeEnv(base, readSettings(home));
 }
 
 /** Only the whitelisted keys survive, so a caller cannot smuggle anything into env. */
 function pickSettingKeys(settings: Settings): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
-  for (const key of SETTING_KEYS) {
+  for (const key of WRITABLE_KEYS) {
     const value = settings[key];
     if (value !== undefined) out[key] = value;
   }
