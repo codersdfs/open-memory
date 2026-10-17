@@ -46,6 +46,7 @@ Memory
 Setup & introspection
   setup                  create the memory home dir; --copy-db to migrate the old store
   db info                which store would be used, and why
+  daemon restart         stop the running daemon and start a fresh one
   mcp                    run the MCP stdio server (agents spawn this)
   inject                 read a hook payload on stdin, print context for this turn
   agent <sub>            init | list | doctor | link | unlink (per-agent integration)
@@ -105,7 +106,7 @@ class Runner {
         Runner.warnedStaleDaemon = true;
         console.error(
           `ai-memory: ignoring the running daemon (version ${health.version ?? "unknown"}, this CLI is ${mine}) — ` +
-          "it would serve the old code. Restart it, or pass --no-daemon to silence this.",
+          "it would serve the old code. Restart it with `ai-memory daemon restart`, or pass --no-daemon to silence this.",
         );
       }
       return false;
@@ -691,6 +692,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdSetup(runner, ctx, a);
       case "db":
         return await cmdDb(runner, ctx, a);
+      case "daemon": {
+        const { runDaemonCommand } = await import("./daemon.js");
+        return await runDaemonCommand(a.positionals, ctx);
+      }
       case "mcp": {
         const { runMcpServer } = await import("../mcp/server.js");
         await runMcpServer({

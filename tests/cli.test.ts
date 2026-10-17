@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { restartDaemon, runDaemonCommand } from "../src/cli/daemon.js";
 
 /**
  * End-to-end CLI tests.
@@ -188,5 +189,121 @@ describe("cli entrypoint file", () => {
     const candidates = [path.join(root, "dist", "cli", "index.js"), CLI];
     expect(candidates.some((c) => existsSync(c))).toBe(true);
     rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+/**
+ * `daemon restart` with every dependency injected.
+ *
+ * Nothing here probes a real daemon, stops one or starts a process: the machine this
+ * runs on has a live daemon serving memory. What is pinned is the decision — probe,
+ * then stop, then start — and the exit code the command leaves behind.
+ */
+describe("daemon restart", () => {
+  function channel() {
+    const lines: string[] = [];
+    const errors: string[] = [];
+    return { out: (s: string) => lines.push(s), err: (s: string) => errors.push(s), lines, errors };
+  }
+
+  it("reports that nothing is running, and exits 0, when the probe finds no daemon", async () => {
+    let stopped = 0;
+    let started = 0;
+    const result = await restartDaemon({
+      probe: async () => false,
+      shutdown: async () => {
+        stopped++;
+      },
+      spawn: () => {
+        started++;
+      }
+    });
+
+    expect(result).toEqual({ restarted: false, reason: "no daemon is running" });
+    // A shutdown aimed at a daemon that is not there would be a POST to nothing, and a
+    // spawn would be a second daemon nobody asked for.
+    expect(stopped).toBe(0);
+    expect(started).toBe(0);
+
+    const io = channel();
+    const code = await runDaemonCommand(["restart"], io, {
+      probe: async () => false,
+      shutdown: async () => {
+        stopped++;
+      },
+      spawn: () => {
+        started++;
+      }
+    });
+    expect(code).toBe(0);
+    expect(io.lines.join("\n")).toContain("no daemon is running");
+    expect(io.errors).toEqual([]);
+  });
+
+  it("stops the daemon that answers, starts a replacement, and exits 0", async () => {
+    const order: string[] = [];
+    const deps = {
+      probe: async () => true,
+      shutdown: async () => {
+        order.push("shutdown");
+      },
+      spawn: () => {
+        order.push("spawn");
+      }
+    };
+
+    const result = await restartDaemon(deps);
+    expect(result).toEqual({ restarted: true });
+    // Order is the point: spawning before the old process is gone is a port clash.
+    expect(order).toEqual(["shutdown", "spawn"]);
+
+    const io = channel();
+    expect(await runDaemonCommand(["restart"], io, deps)).toBe(0);
+    expect(io.lines.join("\n")).toContain("restarted");
+  });
+
+  it("starts nothing, and exits non-zero, when the shutdown throws", async () => {
+    let started = 0;
+    const deps = {
+      probe: async () => true,
+      shutdown: async () => {
+        throw new Error("the daemon refused to shut down (HTTP 403)");
+      },
+      spawn: () => {
+        started++;
+      }
+    };
+
+    const result = await restartDaemon(deps);
+    expect(result.restarted).toBe(false);
+    expect(result.reason).toContain("HTTP 403");
+    expect(started).toBe(0);
+
+    const io = channel();
+    expect(await runDaemonCommand(["restart"], io, deps)).not.toBe(0);
+    expect(io.errors.join("\n")).toContain("HTTP 403");
+  });
+
+  it("exits non-zero, naming the command to run, when no replacement can be started", async () => {
+    // The source checkout has no built server entry to exec; the real default says so
+    // and hands over the command instead of exiting 0 over a process that never began.
+    let stopped = 0;
+    const deps = {
+      probe: async () => true,
+      shutdown: async () => {
+        stopped++;
+      },
+      spawn: () => {
+        throw new Error("could not start a replacement: run: npx tsx src/api/server.ts");
+      }
+    };
+
+    const result = await restartDaemon(deps);
+    expect(result.restarted).toBe(false);
+    expect(stopped).toBe(1);
+
+    const io = channel();
+    expect(await runDaemonCommand(["restart"], io, deps)).not.toBe(0);
+    expect(io.errors.join("\n")).toContain("npx tsx src/api/server.ts");
   });
 });
