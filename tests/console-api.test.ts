@@ -422,11 +422,28 @@ describe("embedding switch", () => {
     expect(hits.memories.length).toBeGreaterThan(0);
     expect(hits.memories[0]).not.toHaveProperty("embedding");
   });
+
+  it("previews the switch before saving a patch of extractor or judge knobs", async () => {
+    // This route answers with the target, so it has to hold one before it writes. A settings
+    // file that cannot build an embedder is the seam: the patch below names no embedding
+    // key, so the shared guard has nothing of its own to preview and would write first.
+    await writeSettings({ EMBEDDING_PROVIDER: "nope" }, home);
+    const before = readSettings(home);
+
+    const res = await post("/embedding", { EXTRACTOR_MODEL: "extractor-test" });
+
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("unknown EMBEDDING_PROVIDER");
+    // A 400 for a patch it already saved is the one answer this route must never give.
+    expect(readSettings(home)).toEqual(before);
+  });
 });
 
-// The console's credential routes. Two things decide whether this feature is safe, and
-// each has its own case here: no response or error body may carry a full key value, and
-// `/admin/shutdown` must not act for anything but the loopback address.
+// The console's credential routes. Three things decide whether this feature is safe, and
+// each has its own case here: no response or error body may carry a full key value,
+// `/admin/shutdown` must not act for anything but the loopback address, and a mutating
+// route must get a JSON request from a loopback origin — a page in the user's own browser
+// is a loopback peer too.
 describe("settings routes", () => {
   interface Entry {
     name: string;
@@ -608,6 +625,35 @@ describe("settings routes", () => {
     expect(await second.json()).toEqual({ adopted: [], notAdopted: [], backupPath: null, restartRequired: true });
   });
 
+  it("refuses an adopt-env that is not a JSON request, leaving .env and settings alone", async () => {
+    // The shape a foreign page can send without a preflight: a simple POST with a form body.
+    writeFileSync(envFile, "NIM_API_KEY=nvapi-not-adopted-7712\n", "utf8");
+    const beforeEnv = readFileSync(envFile, "utf8");
+    const beforeSettings = readSettings(home);
+
+    const res = await fetch(`${base}/settings/adopt-env`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "NIM_API_KEY=nvapi-not-adopted-7712",
+    });
+
+    expect(res.status).toBe(415);
+    expect(readFileSync(envFile, "utf8")).toBe(beforeEnv);
+    expect(readSettings(home)).toEqual(beforeSettings);
+  });
+
+  it("refuses a shutdown asked for by a foreign origin, and stops nothing", async () => {
+    const res = await fetch(`${base}/admin/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+    });
+
+    expect(res.status).toBe(403);
+    // A refusal names no values — the origin it rejected least of all.
+    expect(await res.text()).not.toContain("evil.example");
+    expect(shutdowns).toBe(0);
+  });
+
   it("shuts down for a loopback caller only", async () => {
     // A second listener whose peer address is rewritten to a public one. `remoteAddress`
     // is the only thing the route may trust, and this is the only way to reach that branch
@@ -630,7 +676,8 @@ describe("settings routes", () => {
       await new Promise<void>((r) => app.close(() => r()));
     }
 
-    const res = await fetch(`${base}/admin/shutdown`, { method: "POST" });
+    // A JSON request with no Origin — curl, the CLI, the console same-origin fetch.
+    const res = await fetch(`${base}/admin/shutdown`, { method: "POST", headers: { "content-type": "application/json" } });
     expect(res.status).toBe(204);
     await shutdownCalled;
     expect(shutdowns).toBe(1);

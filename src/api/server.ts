@@ -208,6 +208,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   }
 
   if (path === "/embedding" && method === "POST") {
+    const refused = mutatingRequestProblem(req);
+    if (refused) return send(res, refused.status, { error: refused.error });
     let body: Record<string, unknown>;
     try {
       body = await readJson(req);
@@ -236,15 +238,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     // Everything after this route's own scope guard — the shadowed check, validation of
     // what the patch touches, the write — is the sequence `/settings` uses too, so it is
     // one function. A copy is how the two routes would start disagreeing about which
-    // patch was validated.
-    const guarded = await guardSettingsWrite(patch);
+    // patch was validated. `alwaysPreview` because this route's answer *is* the target:
+    // a patch of judge or extractor knobs still may not be saved before the switch it sits
+    // in is known to build, or this route answers 400 for a patch it already wrote.
+    const guarded = await guardSettingsWrite(patch, { alwaysPreview: true });
     if (!guarded.ok) return send(res, guarded.status, { error: guarded.error });
 
-    // A patch of judge or extractor knobs asks nothing of the embedder, so no preview was
-    // taken; the target this route has always answered with is the merged environment as
-    // it now stands.
-    const preview = guarded.preview ?? previewEmbedding(runtimeEnv());
-    if (!preview.ok) return send(res, 400, { error: preview.error });
+    // `alwaysPreview` is what makes this a target rather than a null: the guard previewed
+    // the switch before it wrote anything.
+    const preview = guarded.preview;
     // `needsRestart` is measured, not assumed: writing the same provider the process
     // already serves with is not a reason to restart anything.
     return send(res, 200, {
@@ -267,6 +269,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   }
 
   if (path === "/settings" && method === "POST") {
+    const refused = mutatingRequestProblem(req);
+    if (refused) return send(res, refused.status, { error: refused.error });
     let body: Record<string, unknown>;
     try {
       body = await readJson(req);
@@ -297,6 +301,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   // above. This is how the user gets out of that without hand-editing — the values move
   // into settings.json and their `.env` lines are commented out, never deleted.
   if (path === "/settings/adopt-env" && method === "POST") {
+    const refused = mutatingRequestProblem(req);
+    if (refused) return send(res, refused.status, { error: refused.error });
     try {
       return send(res, 200, await adoptEnvKeys());
     } catch (e) {
@@ -310,6 +316,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   // it is, and this is not a route to advertise.
   if (path === "/admin/shutdown" && method === "POST") {
     if (!isLoopbackAddress(req.socket.remoteAddress)) return notFound(res);
+    // A loopback peer is still only half the question: a page open in the user's own
+    // browser is one too. The headers decide the rest (see `mutatingRequestProblem`).
+    const refused = mutatingRequestProblem(req);
+    if (refused) return send(res, refused.status, { error: refused.error });
     res.writeHead(204);
     res.end();
     // `finish`, not the end of this function: the 204 has to leave before the listener
@@ -562,10 +572,20 @@ function restartPending(service: MemoryService): boolean {
  *
  * `preview` is null when the patch asks nothing of the embedder: the preview exists to
  * prove the switch being written can be built, and a judge knob must stay savable while the
- * embedding configuration is mid-repair.
+ * embedding configuration is mid-repair. `alwaysPreview` is the exception, and `/embedding`
+ * is why: its answer is the target itself, so it holds a preview before it writes whatever
+ * keys the patch names.
  */
 async function guardSettingsWrite(
   patch: Record<string, string>,
+  opts: { alwaysPreview: true },
+): Promise<{ ok: true; preview: EmbeddingTarget } | { ok: false; status: number; error: string }>;
+async function guardSettingsWrite(
+  patch: Record<string, string>,
+): Promise<{ ok: true; preview: EmbeddingTarget | null } | { ok: false; status: number; error: string }>;
+async function guardSettingsWrite(
+  patch: Record<string, string>,
+  opts: { alwaysPreview?: boolean } = {},
 ): Promise<{ ok: true; preview: EmbeddingTarget | null } | { ok: false; status: number; error: string }> {
   const keys = Object.keys(patch);
 
@@ -584,7 +604,7 @@ async function guardSettingsWrite(
   // Preview first, write second: previewEmbedding is the factory's own resolution, so a
   // patch that previews cleanly cannot fail at the next start.
   let preview: EmbeddingTarget | null = null;
-  if (keys.some(changesEmbedder)) {
+  if (opts.alwaysPreview || keys.some(changesEmbedder)) {
     const candidate = previewEmbedding(mergeEnv(process.env, { ...readSettings(), ...patch } as Settings));
     if (!candidate.ok) return { ok: false, status: 400, error: candidate.error };
     preview = candidate;
@@ -611,15 +631,44 @@ async function guardSettingsWrite(
 }
 
 /**
- * Whether a peer address is this machine. `remoteAddress` is the only thing that can say:
- * the console has no auth, so `/admin/shutdown` may act for the loopback interface and
+ * Whether a host names this machine. `remoteAddress` is the only thing that can say for a
+ * peer: the console has no auth, so `/admin/shutdown` may act for the loopback interface and
  * nobody else. IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is what a dual-stack listener reports
- * for a v4 connection.
+ * for a v4 connection; an `Origin` header spells the same machine as a bare `localhost` or
+ * as a bracketed `[::1]`.
  */
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
-  const v4 = address.startsWith("::ffff:") ? address.slice(7) : address;
-  return v4 === "::1" || /^127\./.test(v4);
+  const mapped = address.startsWith("::ffff:") ? address.slice(7) : address;
+  const host = mapped.startsWith("[") && mapped.endsWith("]") ? mapped.slice(1, -1) : mapped;
+  return host === "localhost" || host === "::1" || /^127\./.test(host);
+}
+
+/**
+ * What a mutating route demands of the request itself, and why a loopback peer is not enough.
+ *
+ * A page in the user's own browser reaches this listener as a loopback peer too, and a
+ * bodyless or form-shaped POST is a "simple request": no preflight, so the server sees it
+ * before that page has earned anything. So the content type is the first gate — this API
+ * speaks JSON, and a page cannot claim `application/json` cross-origin without a preflight
+ * this server never grants. The second is `Origin`: when a browser sends one it has to name
+ * this machine, which stops a foreign page from riding the peer check. An absent `Origin`
+ * (curl, the CLI, a test) stays valid, and neither refusal echoes what it rejected.
+ */
+function mutatingRequestProblem(req: IncomingMessage): { status: number; error: string } | null {
+  const type = String(req.headers["content-type"] ?? "").toLowerCase();
+  if (!type.startsWith("application/json")) {
+    return { status: 415, error: "content-type must be application/json" };
+  }
+  const origin = req.headers.origin;
+  if (origin === undefined) return null;
+  let host: string;
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    return { status: 403, error: "origin not allowed" };
+  }
+  return isLoopbackAddress(host) ? null : { status: 403, error: "origin not allowed" };
 }
 
 /** The 404 every miss gets — including a route that exists only for the loopback address. */
