@@ -67,13 +67,14 @@ node node_modules/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB
 
 ![the same view in the light theme](docs/images/console-recall-light.png)
 
-Five views:
+Six views:
 
 - **Recall** — search, the per-hit score decomposition, and the token budget bar with its `truncated` badge and overflow summary. The `0.72` / `0.35` / `0.2` floors are preset buttons, so the same query visibly goes from zero hits to several.
 - **Memories** — list, filters, a detail drawer, the supersede chain in both directions, and create / pin / status / supersede / soft-delete / restore.
 - **Sessions** — a read-only timeline of pi's own `.jsonl` session files, with the memory tool calls marked.
 - **Graph** — frames `/graph.html`, read-only over `vault/`.
-- **Stats** — the `?full=1` numbers, histograms, the decay candidates and what a decay would prune.
+- **Stats** — the `?full=1` numbers, histograms, the decay candidates and what a decay would prune, plus the `Embeddings` card that switches the provider.
+- **Settings** — the provider keys, the judge's endpoint, model and floor, and the extractor's switch, written to `settings.json` and shown masked. The embedding settings are not here: they stay in the Stats card, which the page links to.
 
 Two themes — dark (default) and warm-white light — behind an `auto | dark | light` control, `auto` following `prefers-color-scheme`. Keyboard: `/` focus search, `Esc` close drawer, `j`/`k` move selection, `Cmd`/`Ctrl`+`Enter` submit.
 
@@ -167,9 +168,13 @@ EMBEDDING_DIM=1024                                          # for any other mode
 
 NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` body fields that E5/Nemotron score on; OpenAI rejects those, so they are sent only for NIM.
 
-**A third path, from the console.** `Embeddings` in the Stats view picks a provider and writes `~/.ai-memory/settings.json` — the non-secret keys only (`EMBEDDING_PROVIDER`, the dim, the model, the base URL), **never an API key**. Precedence is **real environment > that file > built-in default**: an `EMBEDDING_PROVIDER` exported in your shell — or in `.env`, which is a real env value — beats the file, and the card says which of the three is in play. The change takes effect on the **next start**; the running process keeps its embedder (ADR-0009).
+**A third path, from the console.** `Embeddings` in the Stats view picks a provider and writes `~/.ai-memory/settings.json`; `Settings` writes the provider keys there too, along with the judge's key and knobs and the extractor's. The file is flat — a setting key is an environment variable name — and only the console's own lists are accepted, so a name the console does not own is refused by name, never written. Precedence is **real environment > that file > built-in default**: an `EMBEDDING_PROVIDER` exported in your shell — or in `.env`, which is a real env value — beats the file, and the card says which of the three is in play (ADR-0010).
 
-The order is fixed: **write → dry run → migrate → restart.** Neither middle step is optional. A restart right after a write is refused by the startup guard, which names both dims — that is the guard working, not a crash. And migrating without restarting is the worse state: every row is at the new width while the running process still embeds at the old one, so searches return nothing until it restarts. The card counts the rows the running provider cannot read for exactly that reason, and says `restart now to restore search` when the migration ends.
+**What a save costs depends on the key.** The embedding settings (`EMBEDDING_PROVIDER`, the dim, the model, the base URL) take effect on the **next start** — the running process keeps its embedder (ADR-0009). A key, `MEMORY_JEV` / `MEMORY_JEV_MIN` / `JEV_ENDPOINT` / `JEV_MODEL`, or `ENABLE_EXTRACTOR` / `EXTRACTOR_MODEL` is **live on the next call**: those are read per use, not frozen at boot. The file is created `0600`, which is a POSIX mode — on Windows it is inert and the protection is your profile ACL. A saved key is never sent back in clear: the console shows `…` and its last four characters, and no response or error body carries more.
+
+**If a value already sits in `.env`, the console cannot save over it.** The environment wins the merge, so the save is refused and names where the live value is; `adopt .env` is the way out. Adopt copies the values into `settings.json` first, then comments their `.env` lines out — never deletes them, never reorders the file — with `.env.bak` written once beforehand, so the pre-edit copy survives every later adopt. A line whose value cannot be read back exactly (a backslash the loader would expand, unusual quoting) is left in `.env` untouched and reported instead, because commenting it out would make a wrong `settings.json` the only copy.
+
+The order is fixed: **write → dry run → migrate → restart.** Neither middle step is optional. A restart right after a write is refused by the startup guard, which names both dims — that is the guard working, not a crash. And migrating without restarting is the worse state: every row is at the new width while the running process still embeds at the old one, so searches return nothing until it restarts. The card counts the rows the running provider cannot read for exactly that reason, and says `restart now to restore search` when the migration ends. `ai-memory daemon restart` performs that last step: it probes `/health`, asks the daemon to shut down, waits for the port to stop answering, starts a replacement, and only says `daemon restarted` once the replacement answers `/health`.
 
 **Measured on this corpus** (53 live rows, `nvidia/nemotron-3-embed-1b` via NIM, 2026-10-06). Three memories, each asked twice — once in its own words, once paraphrased with no shared vocabulary — and scored by where the right memory lands in the whole store:
 
@@ -196,7 +201,7 @@ EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... ai-memory reembed   # rewrite in
 ai-memory reembed --dry-run                                        # count first, write nothing
 ```
 
-It covers archived, draft and soft-deleted rows too, so a later `restore` cannot hand the retriever a vector of the wrong width; a row left stale by an interrupted run is skipped by search rather than crashing it. A key still has to come from the environment; `reembed` reads the same merged settings the console writes, so the CLI and the console's migrate agree on which provider they are migrating to. `mv memory.db memory.db.bak` remains the start-fresh option.
+It covers archived, draft and soft-deleted rows too, so a later `restore` cannot hand the retriever a vector of the wrong width; a row left stale by an interrupted run is skipped by search rather than crashing it. `reembed` reads the same merged environment the console writes to — a real variable or `settings.json` — so the CLI and the console's migrate agree on which provider they are migrating to. `mv memory.db memory.db.bak` remains the start-fresh option.
 
 The vector weight follows the embedder: `0.6` when a real provider is configured, `0` for hash (which returns ~0.9 cosine to everything, so the term would be noise). `MEMORY_VECTOR_WEIGHT` overrides either. A configured embedder that contributed nothing to ranking would cost a network hop per save and buy nothing — which is why this is not a number you have to discover.
 
@@ -253,12 +258,21 @@ keep 1.0 -> importance 0.90      keep 0.5 -> importance 0.65      keep 0.0 -> im
 Below `MEMORY_JEV_MIN` (default 0.5) the sentence is dropped. **Fail-open**: no key, a 401, or the API being down means the memory is stored *unjudged* rather than lost. A store that silently stops recording because a judge API is down is worse than one that occasionally keeps a mediocre fact.
 
 ```bash
-echo -n 'ts-...' > ~/.typesafe-key && chmod 600 ~/.typesafe-key
-# in .env:
-JEV_API_KEY_FILE=~/.typesafe-key       # a path, so .env stays shareable
+# in the environment (.env or an export):
+JEV_API_KEY=ts-...                    # or JEV_API_KEY_FILE=~/.typesafe-key
 MEMORY_JEV_MIN=0.5
-MEMORY_JEV=false                     # turn it off, heuristic only
+MEMORY_JEV=false                      # turn it off, heuristic only
 ```
+
+**Or in the console.** `Settings` has a field for `JEV_API_KEY` and for the four judge knobs, saved to `~/.ai-memory/settings.json` — live on the next memory, no restart, because the judge reads its key and its knobs per call. That is also the form that keeps `.env` shareable without a second file. The path form still works and is still the right one if you would rather the key live nowhere it could be pasted by accident:
+
+```bash
+echo -n 'ts-...' > ~/.typesafe-key && chmod 600 ~/.typesafe-key
+# then, in .env:
+JEV_API_KEY_FILE=~/.typesafe-key       # a path, so .env stays shareable
+```
+
+`JEV_API_KEY_FILE` and `TYPESAFE_API_KEY` stay environment-only: the console reports them, it never writes them. A key set directly wins over the path, whichever layer it arrives from, and the real environment wins over `settings.json` (ADR-0010).
 
 Judge confidence outranks the regex importance: Jev read the whole sentence, the pattern only saw a verb. With no key configured, behavior is byte-identical to v0.2.0.
 
