@@ -213,8 +213,7 @@ Message `feat(write): schema-free facet tags` to `.git/commit-msg.tmp`, then `gi
 ### Task 3: The reconciler — pure decision function
 
 **Files:**
-- Create: `src/core/write/reconciler.ts`
-- Modify: `src/core/types.ts` (add `Relation`)
+- Create: `src/core/write/reconciler.ts` (declares `Relation`; `types.ts` is left alone — it carries unrelated uncommitted work)
 - Test: `tests/reconciler.test.ts`
 
 **Interfaces:**
@@ -250,11 +249,11 @@ export const DEFAULT_THRESHOLDS = { lexical: 0.8, cosine: 0.85 } as const;
 export async function reconcile(input: ReconcileInput): Promise<Decision>;
 ```
 
-`Relation` is added to `src/core/types.ts` as `export type Relation = "duplicate" | "refines" | "contradicts";` so neither the write layer nor the judge owns the other.
+`Relation` is declared in `src/core/write/reconciler.ts` as `export type Relation = "duplicate" | "refines" | "contradicts";`. The judge imports it from there (`import type`), so the dependency runs one way — judgement → write — and there is no cycle.
 
 **Rule order (exact — later tasks depend on it):**
 
-1. Score every neighbour with `lexicalSimilarity(input.text, n.memory.text)`. Keep those passing `lexical >= lex` **or** (`embedderKind !== "hash"` **and** `vectorScore >= cos`). Pick the highest `lexical`, tie-break on `vectorScore`.
+1. Score every neighbour with `lexicalSimilarity(input.text, n.memory.text)` and `covers(n.memory.text, input.text)`. Keep those passing `lexical >= lex` **or** `covers` **or** (`embedderKind !== "hash"` **and** `vectorScore >= cos`). Containment is part of the gate because Jaccard scores a one-clause extension at 0.67 — exactly the case the refinement rule exists for. Pick the highest `lexical`, tie-break on `vectorScore`.
 2. None → `insert` / `no-neighbour`.
 3. `normalizeText(input.text) === normalizeText(best.memory.text)` → `reinforce` / `exact-duplicate`.
 4. `source === "extractor"` → `insert` / `extractor-no-delete`.
@@ -539,7 +538,7 @@ Message `feat(mcp): report the reconcile decision on remember` to `.git/commit-m
 - Test: `tests/judge.test.ts` (append)
 
 **Interfaces:**
-- Consumes: `Relation` from `src/core/types.ts` (Task 3).
+- Consumes: `Relation` from `src/core/write/reconciler.js` (Task 3, type-only import).
 - Produces:
 
 ```ts
@@ -715,4 +714,4 @@ Message `docs: ADR-0011 and README for write-time reconcile` to `.git/commit-msg
 
 **Placeholder scan.** No TBD, no "handle edge cases", no untyped function left for later. Every task names its file, its signatures, its test and its command.
 
-**Type consistency.** `Decision` (Task 3) is the only decision type; `SaveResult` wraps it (Task 4) and the MCP layer reads `decision.action` (Task 5). `Relation` is declared once in `types.ts` (Task 3) and consumed by `judge.ts` (Task 6) and `reconciler.ts`. `RelationJudge` returns `Relation | null` everywhere; `jevRelation` returns `RelationResult | null`, and only the service adapts between them (Task 7).
+**Type consistency.** `Decision` (Task 3) is the only decision type; `SaveResult` wraps it (Task 4) and the MCP layer reads `decision.action` (Task 5). `Relation` is declared once in `reconciler.ts` (Task 3) and consumed by `judge.ts` (Task 6) and `reconciler.ts`. `RelationJudge` returns `Relation | null` everywhere; `jevRelation` returns `RelationResult | null`, and only the service adapts between them (Task 7).

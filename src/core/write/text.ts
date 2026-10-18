@@ -80,8 +80,12 @@ export function covers(oldText: string, newText: string): boolean {
 
 /** Cap on an appended merge, in characters. See spec 4.3. */
 const MERGE_MAX_CHARS = 600;
-/** Cap on an appended merge relative to the new text. */
-const MERGE_MAX_RATIO = 2;
+/**
+ * Cap on an appended merge relative to the new text: an old claim far longer than the
+ * new one is a different claim, not a detail of it, and appending it is how a memory
+ * grows to three times its size on every rewrite.
+ */
+const MERGE_MAX_OLD_RATIO = 2;
 const MERGE_MARKER = " (previously: ";
 
 /**
@@ -94,6 +98,6 @@ const MERGE_MARKER = " (previously: ";
 export function mergeText(oldText: string, newText: string): string {
   if (covers(oldText, newText)) return newText;
   const merged = `${newText}${MERGE_MARKER}${oldText})`;
-  if (merged.length > MERGE_MAX_CHARS || merged.length > newText.length * MERGE_MAX_RATIO) return newText;
+  if (merged.length > MERGE_MAX_CHARS || oldText.length > newText.length * MERGE_MAX_OLD_RATIO) return newText;
   return merged;
 }

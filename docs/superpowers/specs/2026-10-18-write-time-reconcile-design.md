@@ -106,7 +106,7 @@ Pick the argmax **only if** `top >= 0.5` **and** `top - second >= 0.15`; otherwi
 
 1. Tokenise both. If every old token is already present in the new text, **nothing is lost**: merged = `new` (tag inheritance still happens).
 2. Otherwise merged = `` `${new} (previously: ${old})` `` — the earlier claim travels with the row that replaced it, marked as earlier, so a reader can tell which half is current.
-3. Cap: if merged exceeds 600 chars, or 2x the new text, merge is abandoned — text = `new`, and the old text stays recoverable through the soft-deleted row in the chain. A merge that triples a memory's token cost is not worth the detail.
+3. Cap: if merged exceeds 600 chars, or the old text is more than 2x the new text, merge is abandoned — text = `new`, and the old text stays recoverable through the soft-deleted row in the chain. A merge that triples a memory's token cost is not worth the detail.
 4. A merge that changed the text requires **one extra embed call** at save time. Cold misses and pure duplicates still cost exactly one embed, as today.
 
 The merge marker is ASCII (`previously:`) on purpose: the corpus is bilingual and this string must survive tokenisation as a plain signal, not a locale-dependent phrase.
