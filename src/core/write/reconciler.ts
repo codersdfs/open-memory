@@ -26,7 +26,8 @@ export type ReconcileReason =
   | "model-unavailable"
   | "extractor-no-delete"
   | "episodic-no-delete"
-  | "pinned-no-delete";
+  | "pinned-no-delete"
+  | "disabled";
 
 /** What a model may answer about an old/new pair. */
 export type Relation = "duplicate" | "refines" | "contradicts";

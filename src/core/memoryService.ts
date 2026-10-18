@@ -9,6 +9,21 @@ import { InMemoryVectorStore } from "./store/memory.js";
 import { resolveDbPath } from "./dbPath.js";
 import { runtimeEnv } from "./settings.js";
 import { resolveScopeKeys, resolveWriteKey, type MemoryScope } from "./scope.js";
+import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
+
+export type SaveInput = Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope };
+
+export interface SaveResult {
+  memory: Memory;
+  decision: Decision;
+}
+
+/** A knob that is set but unreadable falls back to the default instead of NaN. */
+function envNumber(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 export class MemoryService {
   public store: VectorStore;
@@ -17,8 +32,10 @@ export class MemoryService {
   public extractor: Extractor;
   private dedupThreshold: number;
   private dbPath?: string;
+  /** Injected in tests; the jev judge is wired in the next stage. */
+  private relation?: RelationJudge;
 
-  constructor(opts?: { store?: VectorStore; embedder?: EmbeddingProvider; dbPath?: string; dedupThreshold?: number }) {
+  constructor(opts?: { store?: VectorStore; embedder?: EmbeddingProvider; dbPath?: string; dedupThreshold?: number; relation?: RelationJudge }) {
     this.dbPath = resolveDbPath(opts?.dbPath);
     // store is injected for tests (InMemory) — otherwise lazy-created in init() to avoid static node:sqlite import
     if (opts?.store) {
@@ -32,6 +49,7 @@ export class MemoryService {
     this.retriever = new HybridRetriever(this.store, this.embedder);
     this.extractor = new Extractor();
     this.dedupThreshold = opts?.dedupThreshold ?? 0.92;
+    this.relation = opts?.relation;
   }
 
   async init(): Promise<void> {
@@ -66,32 +84,112 @@ export class MemoryService {
   }
 
   /**
-   * Save one memory.
+   * Save one memory and report what it did to the store.
    *
    * `input.namespace` is still the whole story when supplied. Otherwise `scope`
    * decides the layer: `shared` → `shared:<user>`, `private` (default) →
-   * `<agent>:<user>`. Dedup deliberately compares inside one partition only, so the
-   * same sentence may legitimately exist as a private note and a shared fact.
+   * `<agent>:<user>`. Reconciling happens inside one partition only, so the same
+   * sentence may legitimately exist as a private note and a shared fact.
+   *
+   * The neighbour query below is the one the old dedup loop already ran: the five
+   * nearest rows in this partition and type. It was thrown away after an exact-string
+   * compare; `reconcile` is the only thing that changed about it.
    */
-  async save(input: Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope }): Promise<Memory> {
+  async saveDetailed(input: SaveInput): Promise<SaveResult> {
+    const env = runtimeEnv();
     const namespace = input.namespace?.trim()
       ? input.namespace
       : resolveWriteKey({ agent: input.agent, user: input.user, scope: input.scope });
-    const target: MemoryInput = { ...input, namespace };
+    const target: MemoryInput = {
+      namespace,
+      type: input.type,
+      text: input.text,
+      importance: input.importance,
+      strength: input.strength,
+      source: input.source,
+      tags: input.tags,
+      supersedesId: input.supersedesId ?? null,
+      visibility: input.visibility,
+      status: input.status,
+      pin: input.pin
+    };
     const embedding = await this.embedder.embed(target.text, { inputType: "passage" });
-    const existing = await this.store.vectorSearch({
+
+    if (env.MEMORY_RECONCILE === "off") {
+      const existing = await this.store.vectorSearch({
+        namespace,
+        queryEmbedding: embedding,
+        type: target.type,
+        limit: 5,
+        includeDeleted: false
+      });
+      for (const { memory, vectorScore } of existing) {
+        if (vectorScore > this.dedupThreshold && memory.text.trim().toLowerCase() === target.text.trim().toLowerCase()) {
+          return {
+            memory,
+            decision: { action: "reinforce", reason: "disabled", oldId: memory.id, text: memory.text, tags: memory.tags ?? [], lexical: 1 }
+          };
+        }
+      }
+      const memory = await this.store.insert(target, embedding);
+      return { memory, decision: { action: "insert", reason: "disabled", text: memory.text, tags: memory.tags ?? [], lexical: 0 } };
+    }
+
+    const neighbours = await this.store.vectorSearch({
       namespace,
       queryEmbedding: embedding,
       type: target.type,
       limit: 5,
       includeDeleted: false
     });
-    for (const { memory, vectorScore } of existing) {
-      if (vectorScore > this.dedupThreshold && memory.text.trim().toLowerCase() === target.text.trim().toLowerCase()) {
-        return memory;
+    const decision = await reconcile({
+      text: input.text,
+      type: target.type,
+      source: input.source,
+      callerTags: input.tags,
+      neighbours,
+      embedderKind: this.embedder.name,
+      relation: this.relation,
+      thresholds: {
+        lexical: envNumber(env.MEMORY_RECONCILE_LEX, DEFAULT_THRESHOLDS.lexical),
+        cosine: envNumber(env.MEMORY_RECONCILE_COS, DEFAULT_THRESHOLDS.cosine)
       }
+    });
+
+    if (decision.action === "reinforce" && decision.oldId) {
+      await this.store.reinforce([decision.oldId]);
+      const memory = await this.getActive(decision.oldId);
+      if (memory) return { memory, decision };
+      // The row vanished between the neighbour query and the reinforce. Store the write
+      // rather than report a rule that did not happen.
     }
-    return this.store.insert(target, embedding);
+
+    if (decision.action === "supersede" && decision.oldId) {
+      const old = neighbours.find((n) => n.memory.id === decision.oldId)?.memory;
+      // A merge changed the text, so the vector has to be rebuilt: a stored vector that
+      // does not describe its own text never matches a query again.
+      const storedEmbedding = decision.text === input.text
+        ? embedding
+        : await this.embedder.embed(decision.text, { inputType: "passage" });
+      const memory = await this.store.supersede(decision.oldId, {
+        ...target,
+        text: decision.text,
+        tags: decision.tags,
+        importance: Math.max(old?.importance ?? 0, input.importance ?? 0.5)
+      }, storedEmbedding);
+      return { memory, decision };
+    }
+
+    const memory = await this.store.insert({ ...target, tags: decision.tags }, embedding);
+    return {
+      memory,
+      decision: decision.action === "insert" ? decision : { ...decision, action: "insert", oldId: undefined, reason: "no-neighbour" }
+    };
+  }
+
+  /** The old entry point, unchanged for every existing caller: the memory, no decision. */
+  async save(input: SaveInput): Promise<Memory> {
+    return (await this.saveDetailed(input)).memory;
   }
 
   async get(id: string): Promise<Memory | null> {
