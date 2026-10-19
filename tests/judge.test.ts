@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { jevKeep, jevApiKey, jevEnabled, importanceFor, validateJevKey } from "../src/core/judgment/judge.js";
+import { jevKeep, jevRelation, jevApiKey, jevEnabled, importanceFor, validateJevKey } from "../src/core/judgment/judge.js";
 import { writeSettings } from "../src/core/settings.js";
 import { mkdtempSync, promises as fs } from "node:fs";
 import os from "node:os";
@@ -181,5 +181,55 @@ describe("validateJevKey", () => {
 
     expect(verdict.ok).toBe(false);
     expect(verdict.error).toContain("ENOTFOUND");
+  });
+});
+
+// The write path asks one question per pair, and the three labels are probabilities in
+// the same batch: three HTTP calls to answer one question would cost more than the memory
+// is worth.
+const noulAnswers = (scores: Record<string, number>): typeof fetch =>
+  (async () =>
+    new Response(
+      JSON.stringify({
+        model: "jev-test",
+        answers: Object.fromEntries(Object.entries(scores).map(([k, v]) => [k, { type: "noul", noul: v }])),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as unknown as typeof fetch;
+
+describe("jevRelation", () => {
+  it("picks the confident relation", async () => {
+    useTypesafeKey();
+    const r = await jevRelation("use pnpm", "we moved to npm", { fetchImpl: noulAnswers({ duplicate: 0.05, refines: 0.1, contradicts: 0.85 }) });
+    expect(r?.relation).toBe("contradicts");
+    expect(r?.scores.contradicts).toBe(0.85);
+  });
+
+  it("returns a null relation when two labels tie", async () => {
+    useTypesafeKey();
+    const r = await jevRelation("use pnpm", "we moved to npm", { fetchImpl: noulAnswers({ duplicate: 0.6, refines: 0.5, contradicts: 0.1 }) });
+    expect(r?.relation).toBeNull();
+  });
+
+  it("sends all three labels in one call, with the pair in the state", async () => {
+    useTypesafeKey();
+    let body: { state?: string; questions?: Record<string, unknown> } = {};
+    const spy = (async (_u: unknown, init: RequestInit) => {
+      body = JSON.parse(String(init.body)) as typeof body;
+      return new Response(JSON.stringify({ answers: { duplicate: { type: "noul", noul: 0.1 }, refines: { type: "noul", noul: 0.1 }, contradicts: { type: "noul", noul: 0.9 } } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await jevRelation("old sentence", "new sentence", { fetchImpl: spy });
+    expect(Object.keys(body.questions ?? {}).sort()).toEqual(["contradicts", "duplicate", "refines"]);
+    expect(String(body.state)).toContain("OLD: old sentence");
+    expect(String(body.state)).toContain("NEW: new sentence");
+  });
+
+  it("is disabled by MEMORY_JEV=false without touching the network", async () => {
+    useTypesafeKey();
+    process.env.MEMORY_JEV = "false";
+    let called = false;
+    const spy = (async () => { called = true; return new Response("{}"); }) as unknown as typeof fetch;
+    expect(await jevRelation("a", "b", { fetchImpl: spy })).toBeNull();
+    expect(called).toBe(false);
   });
 });

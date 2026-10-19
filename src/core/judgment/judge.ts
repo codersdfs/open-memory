@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { runtimeEnv } from "../settings.js";
+import type { Relation } from "../write/reconciler.js";
 
 /**
  * The write-side gate, asked of a model instead of a regex.
@@ -79,37 +80,51 @@ export interface JudgeOptions {
   retries?: number;
 }
 
+/** One noul question, in the shape the endpoint documents. */
+interface NoulQuestion {
+  instructions: string;
+  criteria?: { true: string; false: string };
+}
+
+const KEEP_QUESTION: NoulQuestion = {
+  instructions:
+    "Will this still be useful to an assistant in a different session weeks from now, " +
+    "with no memory of this conversation?",
+  criteria: {
+    true:
+      "A durable fact, user preference, environment fact, or an agreed convention or routine.",
+    false:
+      "Transient task state, a question, an instruction for the agent right now, " +
+      "or something already recorded in the repo.",
+  },
+};
+
 /**
- * The wire body for one systemOne call. One question, so the judge and the console's
- * key check ask the endpoint the same thing — the protocol is not duplicated.
+ * The wire body for one systemOne call. One request, N questions — the console's key check
+ * and the write-side judge ask the endpoint the same way, so the protocol is written once
+ * and a caller that needs three probabilities pays one round trip instead of three.
  */
-function systemOneBody(text: string, model: string): string {
+function systemOneBody(state: string, questions: Record<string, NoulQuestion>, model: string): string {
   return JSON.stringify({
-    state: text,
+    state,
     model,
-    questions: {
-      keep: {
-        type: "noul",
-        instructions:
-          "Will this still be useful to an assistant in a different session weeks from now, " +
-          "with no memory of this conversation?",
-        criteria: {
-          true:
-            "A durable fact, user preference, environment fact, or an agreed convention or routine.",
-          false:
-            "Transient task state, a question, an instruction for the agent right now, " +
-            "or something already recorded in the repo.",
-        },
-      },
-    },
+    questions: Object.fromEntries(
+      Object.entries(questions).map(([name, q]) => [name, { type: "noul", ...q }]),
+    ),
   });
 }
 
-/** One noul against the sentence. null = no verdict (disabled, no key, or failed). */
-export async function jevKeep(
-  text: string,
-  opts: JudgeOptions = {},
-): Promise<Verdict | null> {
+/**
+ * One POST with timer, retries and fail-open. Returns the requested probabilities, or
+ * null when there is no usable answer: disabled, no key, a rejected request, or a
+ * malformed body after the retry budget is spent.
+ */
+async function systemOneCall(
+  state: string,
+  questions: Record<string, NoulQuestion>,
+  required: string[],
+  opts: JudgeOptions,
+): Promise<{ answers: Record<string, number>; model?: string } | null> {
   const env = runtimeEnv();
   if (!isJevEnabled(env)) return null;
   const apiKey = apiKeyFrom(env);
@@ -120,7 +135,7 @@ export async function jevKeep(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const retries = opts.retries ?? DEFAULT_RETRIES;
   const doFetch = opts.fetchImpl ?? fetch;
-  const body = systemOneBody(text, model);
+  const body = systemOneBody(state, questions, model);
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const ctl = new AbortController();
@@ -148,9 +163,15 @@ export async function jevKeep(
         model?: string;
         answers?: Record<string, { type?: string; noul?: number }>;
       };
-      const a = json.answers?.keep;
-      if (a?.type !== "noul" || typeof a.noul !== "number") throw new Error("jev answer missing");
-      return { keep: Math.max(0, Math.min(1, a.noul)), model: json.model };
+      const answers: Record<string, number> = {};
+      for (const name of Object.keys(questions)) {
+        const a = json.answers?.[name];
+        answers[name] = a?.type === "noul" && typeof a.noul === "number"
+          ? Math.max(0, Math.min(1, a.noul))
+          : Number.NaN;
+      }
+      if (required.some((k) => Number.isNaN(answers[k]))) throw new Error("jev answer missing");
+      return { answers, model: json.model };
     } catch (e) {
       if (attempt < retries) continue;
       // fail-open: the caller stores unjudged rather than dropping the memory.
@@ -161,6 +182,87 @@ export async function jevKeep(
     }
   }
   return null;
+}
+
+/** One noul against the sentence. null = no verdict (disabled, no key, or failed). */
+export async function jevKeep(
+  text: string,
+  opts: JudgeOptions = {},
+): Promise<Verdict | null> {
+  const r = await systemOneCall(text, { keep: KEEP_QUESTION }, ["keep"], opts);
+  if (!r) return null;
+  return { keep: r.answers.keep, model: r.model };
+}
+
+export interface RelationResult {
+  /** null = no label cleared the margin; the caller stores the memory unjudged. */
+  relation: Relation | null;
+  scores: Record<Relation, number>;
+  model?: string;
+}
+
+/**
+ * The three labels the write path can act on. Each is a noul in ONE request: three calls
+ * to answer one question about one pair would cost more than the memory is worth.
+ */
+const RELATION_QUESTIONS: Record<Relation, NoulQuestion> = {
+  duplicate: {
+    instructions: "Do OLD and NEW state the same fact, such that keeping both would be redundant?",
+    criteria: {
+      true: "Same claim, reworded or restated. Either one answers the same question.",
+      false: "Different claims, even if they share vocabulary or topic.",
+    },
+  },
+  refines: {
+    instructions: "Does NEW add detail to OLD while still agreeing with it?",
+    criteria: {
+      true: "NEW says everything OLD said, plus something more specific.",
+      false: "NEW leaves something OLD stated still unanswered, or disagrees with it.",
+    },
+  },
+  contradicts: {
+    instructions: "Do OLD and NEW disagree, such that OLD is no longer true?",
+    criteria: {
+      true: "A change of value, version, location, preference or decision between them.",
+      false: "Both can be true at once, or they are about different things.",
+    },
+  },
+};
+
+/** Below this margin two labels are too close to act on. */
+const DEFAULT_MARGIN = 0.15;
+
+/**
+ * What a new sentence does to an old one.
+ *
+ * Returns null when there is no answer at all; a null `relation` when the model answered
+ * but no label won clearly. The caller must treat both the same way: store the write.
+ * Deleting a memory on a 0.5/0.45 split is the one failure this feature cannot afford.
+ */
+export async function jevRelation(
+  oldText: string,
+  newText: string,
+  opts: JudgeOptions & { margin?: number } = {},
+): Promise<RelationResult | null> {
+  const r = await systemOneCall(
+    `OLD: ${oldText}\nNEW: ${newText}`,
+    RELATION_QUESTIONS,
+    ["duplicate", "refines", "contradicts"],
+    opts,
+  );
+  if (!r) return null;
+  const scores: Record<Relation, number> = {
+    duplicate: r.answers.duplicate,
+    refines: r.answers.refines,
+    contradicts: r.answers.contradicts,
+  };
+  const ranked = (Object.keys(scores) as Relation[])
+    .map((k) => [k, scores[k]] as const)
+    .sort((a, b) => b[1] - a[1]);
+  const [top, second] = ranked;
+  const margin = opts.margin ?? DEFAULT_MARGIN;
+  const decided = top[1] >= 0.5 && top[1] - second[1] >= margin;
+  return { relation: decided ? top[0] : null, scores, model: r.model };
 }
 
 /**
@@ -202,7 +304,7 @@ export async function validateJevKey(
     const res = await doFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
-      body: systemOneBody("a candidate key, checked before the console saves it", model),
+      body: systemOneBody("a candidate key, checked before the console saves it", { keep: KEEP_QUESTION }, model),
       signal: ctl.signal,
     });
     if (res.ok) return { ok: true };
