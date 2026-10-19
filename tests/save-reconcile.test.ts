@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import type { EmbeddingProvider } from "../src/core/embedding/provider.js";
 
 const saved = { ...process.env };
 afterEach(() => { process.env = { ...saved }; });
@@ -52,6 +53,42 @@ describe("saveDetailed", () => {
     const extractor = await svc.saveDetailed({ namespace: NS, type: "semantic", source: "extractor", text: "use pnpm not npm for every install" });
     expect(extractor.decision.action).toBe("insert");
     expect(await active()).toHaveLength(4);
+  });
+
+  // A non-hash stub: the cosine gate exists only for real embedders, and this pair is
+  // deliberately not a token-subset, so only the judge can decide it.
+  const stubEmbedder = {
+    name: "nim", dim: 4,
+    embed: async () => [1, 0, 0, 0],
+    embedBatch: async (texts: string[]) => texts.map(() => [1, 0, 0, 0]),
+  } as unknown as EmbeddingProvider;
+
+  it("supersedes a contradiction once the judge says so", async () => {
+    const judged = new MemoryService({
+      store: new InMemoryVectorStore(), embedder: stubEmbedder,
+      relation: async () => "contradicts",
+    });
+    await judged.init();
+    const old = await judged.save({ namespace: NS, type: "semantic", text: "the API listens on 8787" });
+    const next = await judged.saveDetailed({ namespace: NS, type: "semantic", text: "the API now listens on 9090" });
+    expect(next.decision.action).toBe("supersede");
+    expect(next.decision.reason).toBe("model-contradicts");
+    expect(next.memory.supersedesId).toBe(old.id);
+    expect(next.memory.text).toBe("the API now listens on 9090 (previously: the API listens on 8787)");
+    expect((await judged.get(old.id))?.isDeleted).toBe(1);
+  });
+
+  it("never asks the judge about a below-gate neighbour", async () => {
+    let asked = 0;
+    const judged = new MemoryService({
+      store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider(),
+      relation: async () => { asked++; return "contradicts"; },
+    });
+    await judged.init();
+    await judged.save({ namespace: NS, type: "semantic", text: "deploy the memory service" });
+    const other = await judged.saveDetailed({ namespace: NS, type: "semantic", text: "deploy the blog with hugo" });
+    expect(asked).toBe(0);
+    expect(other.decision).toMatchObject({ action: "insert", reason: "no-neighbour" });
   });
 
   it("MEMORY_RECONCILE=off restores the old path", async () => {

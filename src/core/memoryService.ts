@@ -10,6 +10,7 @@ import { resolveDbPath } from "./dbPath.js";
 import { runtimeEnv } from "./settings.js";
 import { resolveScopeKeys, resolveWriteKey, type MemoryScope } from "./scope.js";
 import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
+import { jevEnabled, jevRelation, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
 
 export type SaveInput = Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope };
 
@@ -32,7 +33,7 @@ export class MemoryService {
   public extractor: Extractor;
   private dedupThreshold: number;
   private dbPath?: string;
-  /** Injected in tests; the jev judge is wired in the next stage. */
+  /** Injected in tests; otherwise the jev judge is used when one is configured. */
   private relation?: RelationJudge;
 
   constructor(opts?: { store?: VectorStore; embedder?: EmbeddingProvider; dbPath?: string; dedupThreshold?: number; relation?: RelationJudge }) {
@@ -149,7 +150,7 @@ export class MemoryService {
       callerTags: input.tags,
       neighbours,
       embedderKind: this.embedder.name,
-      relation: this.relation,
+      relation: this.relationJudge(),
       thresholds: {
         lexical: envNumber(env.MEMORY_RECONCILE_LEX, DEFAULT_THRESHOLDS.lexical),
         cosine: envNumber(env.MEMORY_RECONCILE_COS, DEFAULT_THRESHOLDS.cosine)
@@ -177,6 +178,11 @@ export class MemoryService {
         tags: decision.tags,
         importance: Math.max(old?.importance ?? 0, input.importance ?? 0.5)
       }, storedEmbedding);
+      // A model decision that deleted a row is the one event a user cannot reconstruct
+      // from the store afterwards, so it leaves a line behind.
+      if (decision.reason.startsWith("model-")) {
+        console.warn(`[reconcile] superseded ${decision.oldId} (${decision.reason}) -> ${memory.id}`);
+      }
       return { memory, decision };
     }
 
@@ -185,6 +191,24 @@ export class MemoryService {
       memory,
       decision: decision.action === "insert" ? decision : { ...decision, action: "insert", oldId: undefined, reason: "no-neighbour" }
     };
+  }
+
+  /**
+   * The relation judge for this call.
+   *
+   * Injected judges win (tests). Otherwise jev answers, and only when a judge is actually
+   * configured: no key means no call, not a call that fails. The margin is read per call
+   * so a value saved in the console applies to the next write without a restart.
+   */
+  private relationJudge(): RelationJudge | undefined {
+    if (this.relation) return this.relation;
+    if (!jevEnabled()) return undefined;
+    return (oldText: string, newText: string) =>
+      jevRelation(oldText, newText, {
+        margin: envNumber(runtimeEnv().MEMORY_RECONCILE_MARGIN, DEFAULT_RELATION_MARGIN)
+      })
+        .then((r) => r?.relation ?? null)
+        .catch(() => null);
   }
 
   /** The old entry point, unchanged for every existing caller: the memory, no decision. */

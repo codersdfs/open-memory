@@ -230,7 +230,7 @@ const RELATION_QUESTIONS: Record<Relation, NoulQuestion> = {
 };
 
 /** Below this margin two labels are too close to act on. */
-const DEFAULT_MARGIN = 0.15;
+export const DEFAULT_RELATION_MARGIN = 0.15;
 
 /**
  * What a new sentence does to an old one.
@@ -260,7 +260,7 @@ export async function jevRelation(
     .map((k) => [k, scores[k]] as const)
     .sort((a, b) => b[1] - a[1]);
   const [top, second] = ranked;
-  const margin = opts.margin ?? DEFAULT_MARGIN;
+  const margin = opts.margin ?? DEFAULT_RELATION_MARGIN;
   const decided = top[1] >= 0.5 && top[1] - second[1] >= margin;
   return { relation: decided ? top[0] : null, scores, model: r.model };
 }
