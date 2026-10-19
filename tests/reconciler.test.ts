@@ -61,6 +61,36 @@ describe("reconcile", () => {
     expect(d).toMatchObject({ action: "insert", reason: "extractor-no-delete" });
   });
 
+  it("stores a reordered correction instead of folding it as a duplicate", async () => {
+    const d = await reconcile({
+      ...base, text: "user prefers spaces over tabs",
+      neighbours: [{ memory: mem({ text: "user prefers tabs over spaces" }), vectorScore: 0.9 }]
+    });
+    expect(d.action).toBe("supersede");
+    expect(d.text).toBe("user prefers spaces over tabs");
+  });
+
+  it("does not let a long document supersede a short memory", async () => {
+    const long = "use pnpm not npm " + "lorem ipsum dolor sit amet ".repeat(20);
+    const d = await reconcile({ ...base, text: long, neighbours: [{ memory: mem(), vectorScore: 0.9 }] });
+    expect(d.action).toBe("insert");
+  });
+
+  it("never supersedes a working row, nor one whose type the caller omitted", async () => {
+    const working = await reconcile({
+      ...base, type: "working", text: "use pnpm not npm for every install",
+      neighbours: [{ memory: mem({ type: "working" }), vectorScore: 0.9 }]
+    });
+    expect(working).toMatchObject({ action: "insert", reason: "typed-no-delete" });
+
+    const untyped = await reconcile({
+      ...base, type: undefined as unknown as typeof base.type,
+      text: "use pnpm not npm for every install",
+      neighbours: [{ memory: mem(), vectorScore: 0.9 }]
+    });
+    expect(untyped).toMatchObject({ action: "insert", reason: "typed-no-delete" });
+  });
+
   it("treats a throwing judge as insert", async () => {
     const d = await reconcile({
       ...base, embedderKind: "nim", text: "unrelated wording",

@@ -122,6 +122,14 @@ describe("memory_remember reports the reconcile decision", () => {
     const second = await remember("use pnpm not npm for every install");
     expect(second.content[0].text).toMatch(new RegExp(`^superseded ${firstId}: `));
     expect(second.structuredContent.decision).toMatchObject({ action: "supersede", oldId: firstId });
+
+    // A superseded row is gone from the agent's view on purpose: memory_get answers an
+    // agent, and a tombstone must not come back as context. Recovery is the CLI's
+    // `restore`, which is exercised in tests/cli.test.ts.
+    const tombstone = (await line({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "memory_get", arguments: { id: firstId } } })).result as {
+      isError?: boolean;
+    };
+    expect(tombstone.isError).toBe(true);
   });
 });
 

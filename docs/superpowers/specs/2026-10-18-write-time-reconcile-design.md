@@ -62,7 +62,7 @@ MemoryService.saveDetailed(input)
   6. return { memory, decision, reason, oldId? }
 ```
 
-`save()` = `(await saveDetailed(input)).memory`. `extractAndSave()` switches to `saveDetailed()` and only logs decisions.
+`save()` = `(await saveDetailed(input)).memory`. `extractAndSave()` keeps calling `save()`; the decision is not logged (a library does not chat).
 
 ## 4. Decision table
 
@@ -131,20 +131,20 @@ A successor inherits the superseded row's `entity:`/`topic:` facets that the new
 | `MEMORY_RECONCILE_COS` | `0.85` | Cosine gate, ignored when the embedder is `hash`. |
 | `MEMORY_RECONCILE_MARGIN` | `0.15` | Confidence margin required from the relation model. |
 
-All four join `SETTING_KEYS` so the console can write them, and all four are read per call through `runtimeEnv()` (a saved value applies to the next write, no restart).
+All four are **env-only** — they do *not* join `SETTING_KEYS` (see D8) — and all four are read per call through `runtimeEnv()` (a value from `settings.json` still applies to the next write, no restart).
 
 ## 7. Failure modes and ceilings
 
 - **No jev key / jev down** → rules only. Exact duplicates and strict refinements still fold; paraphrased contradictions insert. Documented, and the `memory_stats`-facing text says which mode is active.
 - **Hash embedder** → cosine gate disabled by design (D3). Lexical only. A fully paraphrased duplicate inserts. This is the honest ceiling of a 384-d bucket embedder; the README already says so.
 - **Concurrency.** Two agents writing the same fact at the same instant both see an empty neighbour set and both insert. No unique index is available without a schema change; the sweeper for this class of mess is stage B (offline consolidate). `// ponytail: last-write-wins race, B sweeps it`.
-- **Model rejects a refinement that carried information.** The old row is soft-deleted, not destroyed: it stays in the chain and `memory_get` still reads it. Recall is recoverable; a *wrong* memory that was never folded is not.
+- **Model rejects a refinement that carried information.** The old row is soft-deleted, not destroyed: it stays in the chain, recoverable with `ai-memory restore <id>`; MCP `memory_get` refuses a tombstone on purpose. Recall is recoverable; a *wrong* memory that was never folded is not.
 - **Write latency.** +0 ms on a cold miss, +1 HTTP round trip (≤20 s timeout, 1 retry) on a near-hit. The retry budget comes from `judge.ts` unchanged. If this ever hurts, the gate is the knob, not the timeout.
 
 ## 8. Compatibility, rollback, migration
 
 - **No migration.** Existing rows are untouched; new columns none. Facets apply to new writes only.
-- **Rollback** is one env var: `MEMORY_RECONCILE=off` restores today's path exactly. No data rollback needed — supersedes are soft deletes, restorable with `memory_get` + `updateMeta({isDeleted:0})`.
+- **Rollback** is one env var: `MEMORY_RECONCILE=off` restores today's path exactly. No data rollback needed — supersedes are soft deletes, restorable with `ai-memory restore <id>`.
 - **MCP contract:** tool names, schemas and `memory_remember` args are unchanged. Only the response text gains one line naming the decision.
 - **Acceptance for stage A does not include bench re-runs**, but a pre-release run is required (see 9.5).
 

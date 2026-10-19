@@ -11,7 +11,7 @@
 
 import type { Memory, MemoryType } from "../types.js";
 import { buildTags, inheritFacets } from "./facets.js";
-import { covers, lexicalSimilarity, mergeText, normalizeText } from "./text.js";
+import { covers, lexicalSimilarity, mergeText, normalizeText, tokenize } from "./text.js";
 
 export type ReconcileAction = "insert" | "reinforce" | "supersede";
 
@@ -27,6 +27,7 @@ export type ReconcileReason =
   | "extractor-no-delete"
   | "episodic-no-delete"
   | "pinned-no-delete"
+  | "typed-no-delete"
   | "disabled";
 
 /** What a model may answer about an old/new pair. */
@@ -66,11 +67,29 @@ export interface Decision {
 }
 
 /**
- * Same claim, not same sentence. Token-set identity, so a comma or a trailing mark does
- * not turn a duplicate into a refinement — which would supersede a row for punctuation.
+ * Same claim, not same sentence.
+ *
+ * Token *sequence*, not token set: "prefers tabs over spaces" and "prefers spaces over
+ * tabs" hold the same tokens in a different order and mean opposite things, and folding
+ * them would discard the correction while reporting success. Punctuation and case still
+ * disappear, which is the only insensitivity the rule needs.
  */
 function sameClaim(a: string, b: string): boolean {
-  return normalizeText(a) === normalizeText(b) || lexicalSimilarity(a, b) === 1;
+  return normalizeText(a) === normalizeText(b) || tokenize(a).join(" ") === tokenize(b).join(" ");
+}
+
+/**
+ * How much longer than the old text a refinement may be before it is treated as a
+ * different memory. A wiki section that happens to contain every token of a short memory
+ * is not that memory's next version — it is a document.
+ */
+function growthCap(oldText: string): number {
+  return Math.max(200, oldText.length * 4);
+}
+
+/** Only the two long-lived types may be superseded; `working` is scratch, `episodic` is an event. */
+function deletable(type: MemoryType | undefined): boolean {
+  return type === "semantic" || type === "procedural";
 }
 
 /** The best neighbour that clears the gate. */
@@ -84,8 +103,8 @@ function nearest(
     const lexical = lexicalSimilarity(input.text, n.memory.text);
     // Containment counts as a near-hit: Jaccard punishes a short sentence that adds one
     // clause (4 of 6 tokens = 0.67), and "the same fact, longer" is exactly the case the
-    // refinement rule exists for.
-    const contained = covers(n.memory.text, input.text);
+    // refinement rule exists for. The growth cap keeps a long document from qualifying.
+    const contained = covers(n.memory.text, input.text) && input.text.length <= growthCap(n.memory.text);
     // The hash embedder scores ~0.9 cosine to everything, so cosine may gate only when a
     // real provider is configured. A gate that admits everything is not a gate.
     const passes = lexical >= lexicalFloor || contained || (input.embedderKind !== "hash" && n.vectorScore >= cosineFloor);
@@ -128,11 +147,17 @@ export async function reconcile(input: ReconcileInput): Promise<Decision> {
   if (input.source === "extractor") return { ...insert, reason: "extractor-no-delete", lexical: hit.lexical };
   // D6 — an event is time-bound; two similar events are two events.
   if (input.type === "episodic") return { ...insert, reason: "episodic-no-delete", lexical: hit.lexical };
+  // The guards above read the incoming write; this one reads the row that would be
+  // deleted. A store call with no `type` removes the neighbour filter entirely, so the
+  // incoming type cannot be trusted to describe the old row.
+  if (!deletable(input.type) || !deletable(old.type)) {
+    return { ...insert, reason: "typed-no-delete", lexical: hit.lexical };
+  }
   // `pin` is explicit intent, and the one thing a rewrite must not override.
   if (old.pin === 1) return { ...insert, reason: "pinned-no-delete", lexical: hit.lexical };
 
-  // The new sentence states everything the old one did, and more. No model needed.
-  if (covers(old.text, input.text)) return supersede("refinement");
+  // The new sentence states everything the old one did, and more — but only by a little.
+  if (covers(old.text, input.text) && input.text.length <= growthCap(old.text)) return supersede("refinement");
 
   if (!input.relation) return { ...insert, reason: "model-unavailable", lexical: hit.lexical };
 

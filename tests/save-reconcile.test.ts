@@ -91,6 +91,12 @@ describe("saveDetailed", () => {
     expect(other.decision).toMatchObject({ action: "insert", reason: "no-neighbour" });
   });
 
+  it("treats MEMORY_RECONCILE=OFF as off", async () => {
+    process.env.MEMORY_RECONCILE = "OFF";
+    const a = await svc.saveDetailed({ namespace: NS, type: "semantic", text: "use pnpm not npm" });
+    expect(a.decision.reason).toBe("disabled");
+  });
+
   it("MEMORY_RECONCILE=off restores the old path", async () => {
     process.env.MEMORY_RECONCILE = "off";
     const a = await svc.saveDetailed({ namespace: NS, type: "semantic", text: "use pnpm not npm" });

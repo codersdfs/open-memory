@@ -24,6 +24,15 @@ describe("deriveFacets", () => {
     expect(deriveFacets(`edited ${winPath}`)).toContain(`path:${winPath.toLowerCase()}`);
     expect(deriveFacets("edited C:/memory/src/core/types.ts")).toContain("path:c:/memory/src/core/types.ts");
   });
+  it("does not read dates or slash words as paths", () => {
+    expect(deriveFacets("shipped on 2026/10/18 with and/or CI/CD")).toEqual([]);
+  });
+
+  it("keeps the inherited facet even when the new row fills the tag list", () => {
+    const many = Array.from({ length: MAX_TAGS }, (_, i) => `unofficial${i}`);
+    expect(inheritFacets(["entity:pnpm"], many)).toContain("entity:pnpm");
+  });
+
   it("derives nothing from a plain sentence", () => {
     expect(deriveFacets("use pnpm for every install")).toEqual([]);
   });

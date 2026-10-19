@@ -218,6 +218,9 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
       case "memory_get": {
         const id = String(args.id ?? "").trim();
         if (!id) return { text: "memory_get: id is required", structured: null, isError: true };
+        // Answers an agent, so a tombstone counts as absent: a forgotten or superseded row
+        // must not come back as context. Recovery is `ai-memory restore <id>` (CLI) or the
+        // console, both of which read through `get`.
         const memory = await ctx.service.getActive(id);
         if (!memory) return { text: `no memory ${id}`, structured: null, isError: true };
         return { text: `[${memory.id}] (${memory.type}/${memory.namespace})\n${memory.text}`, structured: stripEmbedding(memory) };

@@ -8,7 +8,7 @@
 
 ## Why auto-supersede is safe
 
-- A supersede is a **soft delete plus a link**: the old row keeps its text, its tags and its id, `is_deleted = 1`, and the new row's `supersedes_id` points at it. `memory_get` still reads the tombstone, so nothing is unrecoverable.
+- A supersede is a **soft delete plus a link**: the old row keeps its text, its tags and its id, `is_deleted = 1`, and the new row's `supersedes_id` points at it. `ai-memory restore <id>` (or the console) reads the tombstone back, so nothing is unrecoverable. MCP `memory_get` deliberately does not: it answers an agent, and a tombstone must not return as context.
 - `pin = 1` is never auto-superseded. Pin is the one explicit signal that says "keep this".
 - The merger is capped: past 600 chars, or when the old text is more than twice the new text, the row stores the new text only and the chain keeps the old one.
 - A model answer is acted on only when the top label reaches 0.5 **and** leads the runner-up by `MEMORY_RECONCILE_MARGIN` (0.15). Every other answer, a timeout, a 401 and an unconfigured judge all fall through to `insert`. No failure mode drops a write.

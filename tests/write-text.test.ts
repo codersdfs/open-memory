@@ -12,6 +12,9 @@ describe("tokenize", () => {
   it("keeps latin words and drops stopwords", () => {
     expect(tokenize("Use the pnpm tool")).toEqual(["use", "pnpm", "tool"]);
   });
+  it("drops a CJK run made only of particles", () => {
+    expect(tokenize("我的")).toEqual([]);
+  });
   it("emits CJK bigrams so a Chinese sentence never scores zero", () => {
     expect(tokenize("包管理器"))
       .toEqual(expect.arrayContaining(["包管", "管理", "理器"]));

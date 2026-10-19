@@ -80,7 +80,12 @@ export function deriveFacets(text: string): string[] {
     if (value) add(`path:${value}`);
   }
   for (const m of text.matchAll(UNIX_PATH)) {
-    const value = slug(m[0], PATH_KEEP);
+    const raw = m[0];
+    // `[\w.-]+/[\w.-]+` also matches "2026/10/18", "and/or" and "CI/CD". A path
+    // needs a hint: a file extension, or an explicit relative/root prefix.
+    const looksLikePath = /\.[A-Za-z][A-Za-z0-9]{0,4}$/.test(raw) || /^(\.{1,2}\/|~\/|\/)/.test(raw);
+    if (!looksLikePath) continue;
+    const value = slug(raw, PATH_KEEP);
     if (value) add(`path:${value}`);
   }
   return out;
@@ -105,13 +110,21 @@ export function buildTags(text: string, callerTags?: string[]): string[] {
  * a file, so it is not inherited.
  */
 export function inheritFacets(oldTags: string[] | undefined, newTags: string[]): string[] {
-  const out = [...newTags];
+  const isFacet = (t: string): boolean => /^(entity|topic):/i.test(t);
+  const out = newTags.filter(isFacet);
+  const plain = newTags.filter((t) => !isFacet(t));
   const seen = new Set(out.map((t) => t.toLowerCase()));
   for (const tag of oldTags ?? []) {
     const lower = tag.toLowerCase();
     if (!lower.startsWith("entity:") && !lower.startsWith("topic:")) continue;
     if (seen.has(lower) || out.length >= MAX_TAGS) continue;
     seen.add(lower);
+    out.push(tag);
+  }
+  // Inherited facets outrank the new row's free-form tags: a full tag list must not be
+  // what pushes the entity that makes the version chain readable off the end.
+  for (const tag of plain) {
+    if (out.length >= MAX_TAGS) break;
     out.push(tag);
   }
   return out.slice(0, MAX_TAGS);

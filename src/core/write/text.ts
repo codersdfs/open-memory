@@ -11,8 +11,14 @@ const STOPWORDS = new Set([
   "the", "a", "an", "is", "are", "was", "were", "be", "been", "to", "of",
   "and", "or", "in", "on", "at", "for", "it", "its", "this", "that", "these",
   "those", "with", "as", "by", "from", "but", "if", "so", "than", "then",
-  "我的", "的", "了", "是", "在", "和", "就", "也", "都", "我", "你",
 ]);
+
+/**
+ * CJK particles. A bigram made only of these carries no topic, so it is dropped; the
+ * single-character branch below uses the same set. Multi-character stopwords would never
+ * match anything (a CJK run has no spaces, so runs are never one character long).
+ */
+const CJK_STOP_CHARS = new Set(["的", "了", "是", "在", "和", "就", "也", "都", "我", "你", "与"]);
 
 const CJK = /[\u4e00-\u9fff]/;
 const WORD_SPLIT = /[^\p{L}\p{N}]+/u;
@@ -45,10 +51,14 @@ export function tokenize(text: string): string[] {
     if (!raw) continue;
     if (CJK.test(raw)) {
       if (raw.length === 1) {
-        if (!STOPWORDS.has(raw)) out.push(raw);
+        if (!CJK_STOP_CHARS.has(raw)) out.push(raw);
         continue;
       }
-      for (let i = 0; i + 1 < raw.length; i++) out.push(raw.slice(i, i + 2));
+      for (let i = 0; i + 1 < raw.length; i++) {
+        const pair = raw.slice(i, i + 2);
+        if (CJK_STOP_CHARS.has(pair[0]) && CJK_STOP_CHARS.has(pair[1])) continue;
+        out.push(pair);
+      }
       continue;
     }
     if (raw.length < 2) continue;

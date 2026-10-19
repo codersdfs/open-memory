@@ -116,7 +116,8 @@ export class MemoryService {
     };
     const embedding = await this.embedder.embed(target.text, { inputType: "passage" });
 
-    if (env.MEMORY_RECONCILE === "off") {
+    // Case-insensitive: a rollback typed as OFF is a rollback, not a silent no-op.
+    if ((env.MEMORY_RECONCILE ?? "").trim().toLowerCase() === "off") {
       const existing = await this.store.vectorSearch({
         namespace,
         queryEmbedding: embedding,
@@ -167,6 +168,9 @@ export class MemoryService {
 
     if (decision.action === "supersede" && decision.oldId) {
       const old = neighbours.find((n) => n.memory.id === decision.oldId)?.memory;
+      // The row can only vanish under a concurrent writer. Inserting the write is the
+      // only honest outcome; `supersede` would throw and lose the whole save.
+      if (old) {
       // A merge changed the text, so the vector has to be rebuilt: a stored vector that
       // does not describe its own text never matches a query again.
       const storedEmbedding = decision.text === input.text
@@ -184,12 +188,15 @@ export class MemoryService {
         console.warn(`[reconcile] superseded ${decision.oldId} (${decision.reason}) -> ${memory.id}`);
       }
       return { memory, decision };
+      }
     }
 
     const memory = await this.store.insert({ ...target, tags: decision.tags }, embedding);
     return {
       memory,
-      decision: decision.action === "insert" ? decision : { ...decision, action: "insert", oldId: undefined, reason: "no-neighbour" }
+      // A decision that named an action this service could not carry out keeps its
+      // reason: reporting "no-neighbour" after a vanished row hides what happened.
+      decision: decision.action === "insert" ? decision : { ...decision, action: "insert", oldId: undefined }
     };
   }
 
