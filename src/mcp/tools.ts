@@ -168,7 +168,7 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
         if (!text) return { text: "memory_remember: text is required", structured: null, isError: true };
         const scope = asScope(args.scope) ?? ctx.defaultScope ?? "private";
         const namespace = resolveWriteKey({ agent: ctx.defaultAgent, scope });
-        const memory = await ctx.service.save({
+        const { memory, decision } = await ctx.service.saveDetailed({
           namespace,
           text,
           type: (args.type as MemoryType | undefined) ?? "semantic",
@@ -176,10 +176,20 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           tags: Array.isArray(args.tags) ? (args.tags as string[]).map(String) : undefined,
           source: args.source === undefined ? `mcp:${ctx.defaultAgent}` : String(args.source)
         });
-        const action = memory.text === text ? "stored" : "already known";
+        // A supersede is the only outcome where an id the model may already have seen is
+        // no longer current, so the response has to name it; the other two keep their old
+        // wording because existing prompts and logs match on it.
+        const head = decision.action === "supersede"
+          ? `superseded ${decision.oldId}: ${memory.id}`
+          : decision.action === "reinforce"
+            ? `already known: ${memory.id}`
+            : `stored: ${memory.id}`;
         return {
-          text: `${action}: ${memory.id} → ${memory.namespace}`,
-          structured: stripEmbedding(memory)
+          text: `${head} → ${memory.namespace}`,
+          structured: {
+            ...stripEmbedding(memory),
+            decision: { action: decision.action, reason: decision.reason, oldId: decision.oldId }
+          }
         };
       }
 

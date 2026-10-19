@@ -4,6 +4,9 @@ import { callTool, MEMORY_TOOLS } from "../src/mcp/tools.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { resolveScopeKeys } from "../src/core/scope.js";
+import { buildServer } from "../src/api/server.js";
+import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import type { AddressInfo } from "node:net";
 
 /**
  * Protocol-level tests for the MCP surface (ADR-0007).
@@ -88,6 +91,62 @@ describe("MCP tool listing", () => {
       if (t.name !== "memory_get" && t.name !== "memory_forget") {
         expect(t.inputSchema.properties).toHaveProperty("scope");
       }
+    }
+  });
+});
+
+/**
+ * The daemon path, which the injected-service tests above cannot reach: when the extension
+ * finds a live daemon it proxies over HTTP, and that is where both memory_remember and
+ * memory_get used to read a wrapped `{ memory }` the route never sends — a TypeError for
+ * the write, "no memory <id>" for every existing id.
+ */
+describe("memory_remember reports the reconcile decision", () => {
+  it("names the superseded id, not just the new one", async () => {
+    // Own service: the file-level one uses whatever embedder the machine's settings
+    // name, and this test is about the wording, not the provider.
+    const local = new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider(), dedupThreshold: 0.92 });
+    await local.init();
+    const server = await createMcpServer({ service: local, agent: "claude" });
+    const line = async (l: unknown) => JSON.parse((await server.handleLine(JSON.stringify(l)))!) as Record<string, unknown>;
+    const remember = async (text: string) =>
+      ((await line({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "memory_remember", arguments: { text } } })).result as {
+        content: { text: string }[];
+        structuredContent: { id: string; decision: { action: string; oldId?: string } };
+      });
+
+    const first = await remember("use pnpm not npm");
+    const firstId = first.structuredContent.id;
+    expect(first.content[0].text).toMatch(/^stored: /);
+
+    const second = await remember("use pnpm not npm for every install");
+    expect(second.content[0].text).toMatch(new RegExp(`^superseded ${firstId}: `));
+    expect(second.structuredContent.decision).toMatchObject({ action: "supersede", oldId: firstId });
+  });
+});
+
+describe("MCP over a live daemon", () => {
+  it("remembers and reads back through the daemon's bare response shape", async () => {
+    const daemonService = new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider(), dedupThreshold: 0.99 });
+    await daemonService.init();
+    const { app } = await buildServer({ service: daemonService });
+    await new Promise<void>((r) => app.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(app.address() as AddressInfo).port}`;
+    try {
+      const server = await createMcpServer({ server: url, agent: "claude" });
+      const line = async (l: unknown) => JSON.parse((await server.handleLine(JSON.stringify(l)))!) as Record<string, unknown>;
+      const remembered = await line({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "memory_remember", arguments: { text: "the daemon keeps this note" } } });
+      const writeResult = remembered.result as Record<string, unknown>;
+      expect(writeResult.isError ?? false).toBe(false);
+      const saved = writeResult.structuredContent as { id: string; namespace: string };
+      expect(typeof saved.id).toBe("string");
+      const got = await line({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "memory_get", arguments: { id: saved.id } } });
+      const readResult = got.result as Record<string, unknown>;
+      expect(readResult.isError ?? false).toBe(false);
+      expect((readResult.structuredContent as { text: string }).text).toBe("the daemon keeps this note");
+    } finally {
+      await new Promise<void>((r) => app.close(() => r()));
+      try { daemonService.close(); } catch {}
     }
   });
 });
