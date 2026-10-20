@@ -1,4 +1,4 @@
-﻿import { describe, it, expect } from "vitest";
+import { describe, it, expect } from "vitest";
 import { assembleFragment } from "../src/core/retrieval/assemble.js";
 import { budgetEnforce, countTokens } from "../src/core/retrieval/tokens.js";
 

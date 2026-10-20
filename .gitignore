@@ -18,7 +18,11 @@ _asar/
 .pi/
 # .gitignore has no end-of-line comments — the first version of these lines ended with
 # "# ..." and therefore matched nothing. Comments go on their own line.
-bench/
+# `bench/` is the LoCoMo harness's data and results directory. It is a bare directory
+# pattern, so it matched `src/bench/` too and silently kept the real-time benchmark's
+# source out of the 0.4.0-beta.1 commit — the test shipped, the module it imports did
+# not, and the failure only showed on a clean checkout. Anchored to the root on purpose.
+/bench/
 downloads/
 vault/
 rea-usage.md
