@@ -44,11 +44,11 @@ nothing to leak, rotate or revoke.
 ## Cutting a release
 
 ```bash
-npm version 0.3.0-beta.2 --no-git-tag-version   # version + lockfile
+npm version 0.4.0-beta.2 --no-git-tag-version   # version + lockfile
 $EDITOR CHANGELOG.md                            # what changed, dated
 
-git commit -am "release: 0.3.0-beta.2"
-git tag -a v0.3.0-beta.2 -m "open-memory 0.3.0-beta.2"
+git commit -am "release: 0.4.0-beta.2"
+git tag -a v0.4.0-beta.2 -m "open-memory 0.4.0-beta.2"
 git push origin master --follow-tags            # this starts publish.yml
 ```
 

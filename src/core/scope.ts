@@ -217,10 +217,13 @@ export function resolveRequestScope(q: {
     namespaces = [explicit];
   } else if (q.all) {
     const user = resolveUser();
-    namespaces = [
+    // `all` has to mean every partition this user owns, the legacy one included:
+    // without it an `--all` sweep read LESS than a plain request, which already fans out
+    // over the legacy family. `resolveAllNamespaces` counts it for the same reason.
+    namespaces = withLegacy([
       namespaceKey({ agentId: agent, userId: user }),
       namespaceKey({ agentId: SHARED_AGENT, userId: user })
-    ];
+    ]);
   } else if (isScope(q.scope)) {
     namespaces = resolveScopeKeys({ agent, scope: q.scope });
   } else {

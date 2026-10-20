@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useRoute, type ViewName } from './router';
 import { useTheme, type ThemeChoice } from './theme';
+import { api } from './lib/api';
 import RecallView from './views/Recall';
 import MemoriesView from './views/Memories';
 import SessionsView from './views/Sessions';
@@ -27,6 +28,22 @@ export default function App() {
   const route = useRoute();
   const theme = useTheme();
   const [namespace, setNamespace] = useState(() => localStorage.getItem(NS_KEY) ?? 'default:default');
+  /** D5 — the real partitions, so nobody types one that holds nothing. A failed load leaves
+   *  the field free-text: the server being unreachable must not block the picker. */
+  const [known, setKnown] = useState<string[]>([]);
+
+  useEffect(() => {
+    let live = true;
+    api
+      .namespaces()
+      .then((r) => {
+        if (live) setKnown(r.namespaces);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
   const [health, setHealth] = useState<Health | null>(null);
   const [offline, setOffline] = useState(false);
 
@@ -82,10 +99,16 @@ export default function App() {
             <span>namespace</span>
             <input
               value={namespace}
+              list="om-namespaces"
               spellCheck={false}
               aria-label="Namespace"
               onChange={(e) => setNamespace(e.target.value)}
             />
+            <datalist id="om-namespaces">
+              {known.map((ns) => (
+                <option key={ns} value={ns} />
+              ))}
+            </datalist>
           </div>
 
           <div className="field">

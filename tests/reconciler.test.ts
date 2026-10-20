@@ -4,7 +4,9 @@ import type { Memory } from "../src/core/types.js";
 
 function mem(over: Partial<Memory> = {}): Memory {
   return {
-    id: "old-1", namespace: "pi:u", type: "semantic", text: "use pnpm not npm",
+    id: "old-1", namespace: "pi:u", project: null, kind: "note",
+    knowledgeId: null, knowledgeSection: null,
+    type: "semantic", text: "use pnpm not npm",
     embedding: [], importance: 0.8, strength: 0.8, lastUsedAt: null,
     source: "mcp:pi", tags: ["entity:pnpm"], supersedesId: null, isDeleted: 0,
     visibility: "private", status: "active", pin: 0, createdAt: 1, updatedAt: 1, ...over

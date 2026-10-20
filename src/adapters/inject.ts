@@ -89,19 +89,67 @@ export function deriveQuery(payload: HookPayload): { query: string; keywords: st
   return { query, keywords };
 }
 
+/** The extractor writes the resolved date as a tag; that date outranks the row's birth. */
+const AT_TAG = /^at:(\d{4}-\d{2}-\d{2})$/;
+
+/**
+ * When the memory is *about*, not when it was written. A row can be stored days after the
+ * event it records, so the explicitly resolved `at:` date wins; `createdAt` is the
+ * fallback (UTC day, because it is an epoch and this module must not depend on the
+ * machine's timezone for a value that came from another one).
+ */
+function memoryDate(m: { tags?: string[]; createdAt?: number }): string | null {
+  for (const tag of m.tags ?? []) {
+    const hit = AT_TAG.exec(String(tag).trim());
+    if (hit) return hit[1];
+  }
+  if (typeof m.createdAt === "number" && Number.isFinite(m.createdAt)) {
+    return new Date(m.createdAt).toISOString().slice(0, 10);
+  }
+  return null;
+}
+
 export function renderBlock(
-  memories: { id: string; text: string; type: string; namespace: string; score?: number }[],
+  memories: { id: string; text: string; type: string; namespace: string; score?: number; tags?: string[]; createdAt?: number }[],
   opts: { agent: string; cwd: string | null }
 ): string {
   const lines = memories.map((m) => {
     const where = m.namespace.startsWith("shared:") ? "shared" : "private";
-    return `- (${where}/${m.type}) ${m.text.replace(/\s+/g, " ").trim()}`;
+    // episodic is about when it happened and semantic about when it was learned; both
+    // read as stale without a date, and a stale fact is indistinguishable from a wrong
+    // one. procedural/working are instructions, so a date would only add noise.
+    const dated = m.type === "episodic" || m.type === "semantic";
+    const date = dated ? memoryDate(m) : null;
+    const stamp = date ? ` [${date}]` : "";
+    return `- (${where}/${m.type})${stamp} ${m.text.replace(/\s+/g, " ").trim()}`;
   });
   return [
     "<memory-context>",
     `Recalled from ai-memory for agent "${opts.agent}"${opts.cwd ? ` in ${opts.cwd}` : ""}.`,
     "These are stored facts from earlier sessions; they may be stale — verify before relying on them.",
     ...lines,
+    "Use memory_search / memory_remember (MCP) or `ai-memory search|save` to add more.",
+    "</memory-context>"
+  ].join("\n");
+}
+
+/**
+ * The session-start block: the brief instead of a search (ADR-0022).
+ *
+ * A hook fires at the moment a session opens, when there is no prompt and therefore no
+ * query — the old code searched for `"*"`, which is a query the retriever cannot answer
+ * meaningfully. The brief is built for exactly this moment: fixed sections, fixed order,
+ * no ranking to be surprised by. It is wrapped in the same envelope as a recalled block
+ * so an agent sees one kind of context, not two.
+ */
+export function renderBriefBlock(text: string, opts: { agent: string; cwd: string | null }): string {
+  return [
+    "<memory-context>",
+    `Project memory for agent "${opts.agent}"${opts.cwd ? ` in ${opts.cwd}` : ""}.`,
+    "These are durable notes from earlier sessions — decisions, conventions and gotchas already settled.",
+    "Verify before relying on them; correct one you know to be wrong rather than working around it.",
+    "",
+    text,
     "Use memory_search / memory_remember (MCP) or `ai-memory search|save` to add more.",
     "</memory-context>"
   ].join("\n");
@@ -130,12 +178,22 @@ export async function buildInjection(opts: InjectOptions): Promise<string> {
   const svc = opts.service ?? new MemoryService({ dbPath: opts.db });
   if (!opts.service) await svc.init();
   try {
+    const budgetTokens = opts.budgetTokens ?? Number(process.env.AI_MEMORY_INJECT_BUDGET ?? 600);
+    // SessionStart: no prompt, so no query. Ask for the brief; fall through to the old
+    // sweep only when the project has nothing filed (an un-projected store, or the very
+    // first session), so an existing install does not lose the pinned context it had.
+    if (!query && keywords.length === 0 && typeof svc.brief === "function") {
+      const brief = await svc.brief({ namespaces, agent, budgetTokens });
+      if (brief.sections.some((s) => s.items.length > 0)) {
+        return renderBriefBlock(brief.text, { agent, cwd: payload.cwd });
+      }
+    }
     const result = await svc.search({
       query: searchText,
       namespaces,
       agent,
       k: opts.limit ?? 5,
-      budgetTokens: opts.budgetTokens ?? Number(process.env.AI_MEMORY_INJECT_BUDGET ?? 600),
+      budgetTokens,
       threshold: opts.threshold ?? Number(process.env.AI_MEMORY_INJECT_THRESHOLD ?? 0.25),
       type: undefined as MemoryType | undefined
     });

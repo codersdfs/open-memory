@@ -5,8 +5,9 @@ import { readFile, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
-import { MemoryService } from "../core/memoryService.js";
-import { stripEmbedding, TYPES, STATUSES, type MemoryType, type MemoryStatus } from "../core/types.js";
+import { MemoryService, type SaveInput } from "../core/memoryService.js";
+import { stripEmbedding, TYPES, STATUSES, KINDS, type MemoryType, type MemoryKind, type MemoryStatus } from "../core/types.js";
+import { isScope, resolveRequestScope, resolveWriteKey } from "../core/scope.js";
 import { appVersion } from "../version.js";
 import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding, type EmbeddingProvider } from "../core/embedding/index.js";
 import { reembedAll, type ReembedResult } from "../core/embedding/reembed.js";
@@ -39,6 +40,11 @@ const UI_NEXT_DIRS = [
 ];
 // ponytail: full-scan cap for the stats view; page per-status if the store ever outgrows it
 const STATS_ROW_CAP = 20000;
+// One bulk request is one transaction and one embed batch. 5k rows at ~1.1k chars is
+// ~5.5 MB of text and one embed call per provider limit stayed well inside what a
+// single request should hold; larger imports belong in `ai-memory import`, which can
+// stream.
+const BULK_LIMIT = 5000;
 
 /** Trust boundary: every field here comes off the wire. */
 function str(v: unknown, max = 5000, min = 0): string | null {
@@ -58,16 +64,60 @@ function boolish(v: unknown): boolean {
 }
 const bad = (why: string) => ({ status: 400, body: { error: why } });
 
-function parseCreate(body: Record<string, unknown>) {
-  const text = str(body.text, 5000, 1);
+/**
+ * Which partition a write lands in. An explicit `namespace` still wins. A caller naming
+ * `agent`/`scope` gets that one layer through `resolveWriteKey` — never the shared one.
+ * A caller naming neither keeps the v0.2.0 legacy partition. Namespace is an daemon
+ * internal here, so dropping `agent`/`scope` sent every scoped write to `default:default`
+ * while the daemon-less path honoured it.
+ */
+function createNamespace(body: Record<string, unknown>): string {
+  const explicit = str(body.namespace, 200, 1);
+  if (explicit) return explicit;
+  const agent = str(body.agent, 200, 1) ?? undefined;
+  const scope = isScope(body.scope) ? body.scope : undefined;
+  return agent || scope ? resolveWriteKey({ agent, scope }) : "default:default";
+}
+
+/**
+ * The partitions a read should cover. An explicit `namespaces` list still wins (the CLI
+ * resolves it where the agent and user are actually known). Otherwise `agent`/`scope`/
+ * `all` resolve here: a daemon that answers from its own default reports nothing found
+ * for memories that are plainly there.
+ */
+function searchScope(q: Record<string, unknown>): { namespace?: string; namespaces?: string[] } {
+  const listed = str(q.namespaces, 2000, 1)?.split(",").map((s) => s.trim()).filter(Boolean);
+  if (listed && listed.length > 0) return { namespaces: listed };
+  const explicit = str(q.namespace, 200, 1);
+  if (explicit) return { namespace: explicit };
+  const agent = str(q.agent, 200, 1) ?? undefined;
+  const scope = isScope(q.scope) ? q.scope : undefined;
+  const all = boolish(q.all);
+  if (agent || scope || all) return { namespaces: resolveRequestScope({ agent, scope, all }).namespaces };
+  return { namespace: "default:default" };
+}
+
+/** `searchScope` says "one namespace" or "these namespaces"; the knowledge API wants one shape. */
+function knowledgeScope(scope: { namespace?: string; namespaces?: string[] }): { namespace: string } | { namespaces: string[] } {
+  return scope.namespaces && scope.namespaces.length > 0
+    ? { namespaces: scope.namespaces }
+    : { namespace: scope.namespace ?? "default:default" };
+}
+
+function parseCreate(body: Record<string, unknown>) {  const text = str(body.text, 5000, 1);
   if (!text) return bad("text required (1-5000 chars)");
   const type = enumOf(body.type, TYPES);
   if (!type) return bad(`type must be one of ${TYPES.join("|")}`);
   return {
     data: {
-      namespace: str(body.namespace, 200, 1) ?? "default:default",
+      namespace: createNamespace(body),
       type: type as MemoryType,
       text,
+      // ADR-0020/0021. Omitted means "let the store decide": project falls back to the
+      // repository the server runs in, kind to the wording. An explicit null project is
+      // a real value (unscoped), so it must survive as null rather than be dropped.
+      project: body.project === undefined ? undefined : body.project === null ? null : String(body.project),
+      kind: enumOf(body.kind, KINDS) as MemoryKind | undefined,
       importance: num(body.importance, 0, 1),
       source: str(body.source, 200) ?? undefined,
       tags: Array.isArray(body.tags) ? body.tags.slice(0, 10).map(String) : undefined,
@@ -85,13 +135,11 @@ function parseSearch(q: Record<string, unknown>) {
   return {
     data: {
       query,
-      namespace: str(q.namespace, 200, 1) ?? "default:default",
-      // A read covers more than one partition — the caller's own plus the legacy one —
-      // and the CLI resolves that list where the agent and user are actually known. It
-      // has to be able to say so, or a daemon answers from its own default and reports
-      // nothing found for memories that are plainly there. Overrides `namespace`.
-      namespaces: str(q.namespaces, 2000, 1)?.split(",").map((s) => s.trim()).filter(Boolean),
+      // Overrides `namespace`, and resolves `agent`/`scope`/`all` when it is absent.
+      ...searchScope(q),
       type: enumOf(q.type, TYPES),
+      project: q.project === undefined ? undefined : q.project === null ? null : String(q.project),
+      kind: enumOf(q.kind, KINDS) as MemoryKind | undefined,
       k: num(q.k, 1, 50) ?? 5,
       budgetTokens: num(q.budgetTokens, 10, 10000) ?? 800,
       threshold: num(q.threshold, 0, 1) ?? 0.72,
@@ -404,8 +452,62 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     } catch { return send(res, 200, {}); }
   }
   if (path === "/decay" && method === "POST") {
-    const { runDecay } = await import("../core/lifecycle/decay.js");
-    return send(res, 200, { pruned: await runDecay(service.store) });
+    const { runDecayDetailed } = await import("../core/lifecycle/decay.js");
+    // Since v0.4 the default pass archives, so the response has to name both halves;
+    // `pruned` alone used to mean "rows removed" and now means "rows hard-deleted".
+    const report = await runDecayDetailed(service.store);
+    return send(res, 200, { ...report, affected: report.archived + report.pruned });
+  }
+
+  if (path === "/compact" && method === "POST") {
+    // Soft delete keeps the bytes: this is the operator's one lever that gives them
+    // back. Optional on the store, so a store without a file to rewrite answers 501
+    // rather than pretending it reclaimed nothing.
+    if (!service.store.compact) return send(res, 501, { error: "this store cannot compact" });
+    return send(res, 200, await service.store.compact());
+  }
+
+  // Project brief (ADR-0022). GET for a shell one-liner, POST for a caller that wants
+  // to pass a project explicitly; both resolve partitions exactly like `/memories/search`,
+  // so `agent`/`scope`/`all` mean what they mean everywhere else.
+  if (path === "/brief" && (method === "GET" || method === "POST")) {
+    const body = method === "POST" ? await readJson(req) : {};
+    const qq: Record<string, unknown> = { ...q, ...body };
+    const scope = searchScope(qq);
+    const sinceDays = num(qq.sinceDays, 1, 3650);
+    const brief = await service.brief({
+      ...(scope.namespaces ? { namespaces: scope.namespaces } : { namespace: scope.namespace }),
+      project: qq.project === undefined ? undefined : qq.project === null ? null : String(qq.project),
+      budgetTokens: num(qq.budgetTokens, 60, 10000),
+      sinceMs: sinceDays === undefined ? undefined : sinceDays * 86_400_000
+    });
+    return send(res, 200, brief);
+  }
+
+  // Knowledge index (ADR-0023). `sync` is the only writer: it re-reads the vault and
+  // reconciles one row per section. Everything else reads the index, not the files.
+  if (path === "/knowledge/sync" && method === "POST") {
+    const body = await readJson(req);
+    const report = await service.syncKnowledge({
+      dir: body.dir === undefined ? undefined : String(body.dir),
+      dryRun: body.dryRun === true
+    });
+    return send(res, 200, report);
+  }
+  if (path === "/knowledge" && method === "GET") {
+    return send(res, 200, await service.knowledge(knowledgeScope(searchScope(q))));
+  }
+  const knowledgeDetail = path.match(/^\/knowledge\/([^/]+)(\/neighbors)?$/);
+  if (knowledgeDetail && method === "GET") {
+    const id = decodeURIComponent(knowledgeDetail[1]!);
+    const opts = knowledgeScope(searchScope(q));
+    if (knowledgeDetail[2]) {
+      const depth = num(q.depth, 1, 3) ?? 1;
+      return send(res, 200, await service.knowledgeNeighbors({ ...opts, id, depth }));
+    }
+    const page = await service.knowledgePage({ ...opts, id });
+    if (!page) return send(res, 404, { error: `unknown knowledge page: ${id}` });
+    return send(res, 200, page);
   }
 
   // Must precede the `/memories/:id` route below: that pattern also matches
@@ -419,12 +521,40 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, wantsEmbedding(q) ? result : { ...result, memories: result.memories.map(stripEmbedding) });
   }
 
+  // Bulk write (ADR-0018). One HTTP round trip, one embed batch, one transaction:
+  // importing 10k rows through `POST /memories` is 10k round trips and 10k commits.
+  // Before the `/memories/:id` pattern, for the same reason `/memories/search` is.
+  if (/^\/memories\/bulk$/.test(path) && method === "POST") {
+    const body = await readJson(req);
+    const items = Array.isArray(body.items) ? body.items : null;
+    if (!items) return send(res, 400, { error: "items must be an array" });
+    if (items.length > BULK_LIMIT) return send(res, 413, { error: `too many items (max ${BULK_LIMIT} per request)` });
+    const parsed: SaveInput[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const p = parseCreate(items[i]);
+      // A bad row fails the request by index rather than being skipped: a partial
+      // import that reports success is how a re-run ends up with duplicates.
+      if ("status" in p) return send(res, p.status, { ...p.body, index: i });
+      parsed.push(p.data);
+    }
+    const { memories } = await service.saveMany(parsed, { reconcile: body.reconcile === true });
+    return send(res, 201, { saved: memories.length, ids: memories.map((m) => m.id) });
+  }
+
   const mem = new RegExp("^/memories(/[^/]+)?(/supersede)?$").exec(path);
   if (mem) {
     const id = mem[1] ? decodeURIComponent(mem[1].slice(1)) : null;
     if (id && mem[2] && method === "POST") {
-      const p = parseCreate(await readJson(req));
+      const body = await readJson(req);
+      const p = parseCreate(body);
       if ("status" in p) return send(res, p.status, p.body);
+      // A replacement belongs in the partition of the memory it replaces. Over the daemon
+      // the CLI sends no namespace, so the create default moved the new row out of the
+      // partition the old one lived in, while the in-process path kept it.
+      if (!str(body.namespace, 200, 1) && !str(body.agent, 200, 1) && !isScope(body.scope)) {
+        const old = await service.get(id);
+        if (old) p.data.namespace = old.namespace;
+      }
       return send(res, 201, await service.supersede(id, p.data));
     }
     if (id && !mem[2] && method === "PATCH") {
@@ -461,6 +591,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       const listed = await service.list({
         namespace: str(q.namespace, 200, 1) ?? "default:default",
         type: enumOf(q.type, TYPES),
+        project: q.project === undefined ? undefined : q.project === null ? null : String(q.project),
+        kind: enumOf(q.kind, KINDS),
         includeDeleted: boolish(q.includeDeleted),
         status: enumOf(q.status, STATUSES),
         includeArchived: boolish(q.includeArchived),

@@ -62,6 +62,10 @@ export async function runImportCommand(positionals: string[], flags: Flags, ctx:
   const scope = (str(flags, "scope") as MemoryScope | undefined) ?? "shared";
   const agent = resolveAgent(str(flags, "agent"));
   const namespace = resolveWriteKey({ agent, scope });
+  // Import is new material by definition, so write-time reconcile is off by default:
+  // it runs a 5-neighbour vector search per row, which turns an import into a
+  // quadratic scan. `--reconcile` is there for a re-import where duplicates matter.
+  const reconcile = bool(flags, "reconcile");
 
   const chosen: ImportSource[] = only ? sources.filter((s) => s.id.includes(only) || s.path.includes(only)) : sources;
   if (chosen.length === 0) {
@@ -78,17 +82,20 @@ export async function runImportCommand(positionals: string[], flags: Flags, ctx:
       const sample = items.slice(0, 3).map((i) => i.text.slice(0, 120));
       let saved = 0;
       if (write) {
-        for (const item of items.slice(0, limit)) {
-          await svc.save({
-            namespace,
-            text: item.text,
-            type: item.type,
-            importance: item.importance,
-            tags: item.tags,
-            source: item.source
-          });
-          saved++;
-        }
+        // One `saveMany` per source: one embed batch and one transaction instead of
+        // one commit per row (ADR-0018). The stored items are independent rows, so a
+        // batch that fails takes the whole chunk with it rather than leaving a
+        // half-import behind.
+        const batch = items.slice(0, limit).map((item) => ({
+          namespace,
+          text: item.text,
+          type: item.type,
+          importance: item.importance,
+          tags: item.tags,
+          source: item.source
+        }));
+        const { memories } = await svc.saveMany(batch, { reconcile });
+        saved = memories.length;
       }
       report.push({ source: src.id, found: items.length, saved, sample });
       if (!ctx.json) {

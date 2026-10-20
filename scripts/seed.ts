@@ -1,11 +1,40 @@
-import "../src/config.js";
-import { MemoryService } from "../src/core/memoryService.js";
-import { resolveDbPath } from "../src/core/dbPath.js";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+/**
+ * Seed fixtures, never into a store the operator did not ask for.
+ *
+ * `src/config.ts` loads `.env` on import, and this checkout's `.env` contains
+ * `MEMORY_DB_PATH=memory.db` — which is exactly how 19 seed/test fixtures ended up in the
+ * real store. So read the environment *before* anything can inject `.env` values, and
+ * only an explicit `MEMORY_DB_PATH` / `AI_MEMORY_DB` counts as "seed this store".
+ * Otherwise this seeds a fresh temp store and prints where it went.
+ */
+const explicitDbPath = process.env.MEMORY_DB_PATH || process.env.AI_MEMORY_DB;
+
+// Dynamic on purpose: a static import would evaluate config.ts's `loadEnvFile()` before
+// the snapshot above, making the checkout's `.env` indistinguishable from an explicit
+// choice by the operator. MemoryService imports config itself, so `.env` is still applied
+// to the environment — just not before the snapshot.
+const { MemoryService } = await import("../src/core/memoryService.js");
+const { resolveDbPath } = await import("../src/core/dbPath.js");
 
 const ns = process.env.NAMESPACE ?? "default:default";
-// Same resolution the server and CLI use. Writing ./memory.db here seeded a
-// store nothing read — ADR-0007 moved the default to ~/.ai-memory/memory.db.
-const dbPath = resolveDbPath(process.env.MEMORY_DB_PATH);
+
+let dbPath: string;
+let usedTempDir = false;
+if (explicitDbPath) {
+  // Same resolution the server and CLI use for an explicit path.
+  dbPath = resolveDbPath(explicitDbPath);
+} else {
+  // Fixtures are demo data; a dedicated store per run means `seed` is always safe to run
+  // to inspect the UI, and never leaks test rows into a store an agent reads.
+  const dir = await mkdtemp(path.join(tmpdir(), "ai-memory-seed-"));
+  dbPath = path.join(dir, "memory.db");
+  usedTempDir = true;
+}
+console.log(`db: ${dbPath}${usedTempDir ? " (temporary store; set MEMORY_DB_PATH to seed another one)" : ""}`);
 
 const svc = new MemoryService({ dbPath });
 await svc.init();

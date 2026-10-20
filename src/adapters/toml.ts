@@ -26,13 +26,21 @@ function isHeader(line: string): boolean {
   return t.startsWith("[") && t.endsWith("]");
 }
 
+/** Child table of `header`, i.e. `[header.env]` — part of the section, not a neighbour. */
+function isChildHeader(line: string, header: string): boolean {
+  const t = line.trim();
+  return t.startsWith(`[${header}.`) && t.endsWith("]");
+}
+
 /** Returns [before, sectionLines, after] line arrays; sectionLines includes the header. */
 function splitAtSection(lines: string[], header: string): { before: string[]; section: string[] | null; after: string[] } {
   const start = lines.findIndex((l) => headerMatches(l, header));
   if (start === -1) return { before: lines, section: null, after: [] };
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
-    if (isHeader(lines[i]!)) {
+    // A child table (`[x.env]`) belongs to the section: replacing or removing `[x]`
+    // has to take it along, or the update leaves a stale subsection behind.
+    if (isHeader(lines[i]!) && !isChildHeader(lines[i]!, header)) {
       end = i;
       break;
     }

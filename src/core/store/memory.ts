@@ -1,7 +1,10 @@
 import { randomUUID } from "crypto";
-import type { Memory, MemoryInput } from "../types.js";
-import type { VectorStore } from "./interface.js";
+import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
+import type { KnowledgeCapability, VectorStore } from "./interface.js";
+import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CAP } from "./interface.js";
 import { cosineSimilarity } from "../embedding/provider.js";
+import { tokenize } from "../retrieval/bm25.js";
+import { deriveKind } from "../write/kind.js";
 import { median } from "../stats.js";
 
 export class InMemoryVectorStore implements VectorStore {
@@ -15,7 +18,11 @@ export class InMemoryVectorStore implements VectorStore {
     const mem: Memory = {
       id: randomUUID(),
       namespace: input.namespace,
+      project: input.project ?? null,
+      kind: input.kind ?? deriveKind(input.text),
       type: input.type,
+      knowledgeId: input.knowledgeId ?? null,
+      knowledgeSection: input.knowledgeSection ?? null,
       text: input.text,
       embedding,
       importance: input.importance ?? 0.5,
@@ -35,6 +42,13 @@ export class InMemoryVectorStore implements VectorStore {
     return mem;
   }
 
+  /** Mirror of the SQL batch insert: same rows, no transaction to save. */
+  async insertMany(items: { input: MemoryInput; embedding: number[] }[]): Promise<Memory[]> {
+    const out: Memory[] = [];
+    for (const it of items) out.push(await this.insert(it.input, it.embedding));
+    return out;
+  }
+
   async getById(id: string): Promise<Memory | null> {
     return this.map.get(id) ?? null;
   }
@@ -47,9 +61,22 @@ export class InMemoryVectorStore implements VectorStore {
     status?: string;
     includeArchived?: boolean;
     includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
   }): Memory[] {
     let arr = [...this.map.values()].filter((m) => m.namespace === opts.namespace);
     if (!opts.includeDeleted) arr = arr.filter((m) => m.isDeleted === 0);
+    // ADR-0020/0021, mirroring candidateWhere: undefined = any, null = unscoped.
+    if (opts.project !== undefined) {
+      arr = arr.filter((m) => (opts.project === null ? m.project === null : m.project === opts.project));
+    }
+    if (opts.kind) arr = arr.filter((m) => m.kind === opts.kind);
+    if (opts.knowledge !== undefined) {
+      arr = arr.filter((m) =>
+        opts.knowledge === null ? m.knowledgeId === null : m.knowledgeId === opts.knowledge
+      );
+    }
     if (opts.type) arr = arr.filter((m) => m.type === opts.type);
     if (opts.status) arr = arr.filter((m) => m.status === opts.status);
     else {
@@ -67,6 +94,9 @@ export class InMemoryVectorStore implements VectorStore {
     status?: string;
     includeArchived?: boolean;
     includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
   }): Promise<{ median: number; count: number }> {
     const cosines = this.candidates(opts)
       .filter((m) => m.embedding.length === opts.queryEmbedding.length)
@@ -96,9 +126,21 @@ export class InMemoryVectorStore implements VectorStore {
     limit?: number;
     offset?: number;
     query?: string;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
   }): Promise<{ memories: Memory[]; total: number }> {
     let arr = [...this.map.values()].filter((m) => m.namespace === opts.namespace);
     if (!opts.includeDeleted) arr = arr.filter((m) => m.isDeleted === 0);
+    if (opts.project !== undefined) {
+      arr = arr.filter((m) => (opts.project === null ? m.project === null : m.project === opts.project));
+    }
+    if (opts.kind) arr = arr.filter((m) => m.kind === opts.kind);
+    if (opts.knowledge !== undefined) {
+      arr = arr.filter((m) =>
+        opts.knowledge === null ? m.knowledgeId === null : m.knowledgeId === opts.knowledge
+      );
+    }
     if (opts.type) arr = arr.filter((m) => m.type === opts.type);
     if (opts.status) arr = arr.filter((m) => m.status === opts.status);
     else {
@@ -123,13 +165,16 @@ export class InMemoryVectorStore implements VectorStore {
     if (m) { m.embedding = embedding; m.text = text; m.updatedAt = Date.now(); }
   }
 
-  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number }): Promise<Memory | null> {
+  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null }): Promise<Memory | null> {
     const m = this.map.get(id);
     if (!m) return null;
     if (patch.status !== undefined) m.status = patch.status as Memory["status"];
     if (patch.pin !== undefined) m.pin = patch.pin;
     if (patch.visibility !== undefined) m.visibility = patch.visibility as Memory["visibility"];
     if (patch.isDeleted !== undefined) m.isDeleted = patch.isDeleted;
+    if (patch.tags !== undefined) m.tags = patch.tags;
+    if (patch.knowledgeId !== undefined) m.knowledgeId = patch.knowledgeId;
+    if (patch.knowledgeSection !== undefined) m.knowledgeSection = patch.knowledgeSection;
     m.updatedAt = Date.now();
     return m;
   }
@@ -151,6 +196,9 @@ export class InMemoryVectorStore implements VectorStore {
     status?: string;
     includeArchived?: boolean;
     includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
     const scored = this.candidates(opts).flatMap((memory) =>
       memory.embedding.length !== opts.queryEmbedding.length
@@ -161,8 +209,60 @@ export class InMemoryVectorStore implements VectorStore {
     return scored.slice(0, opts.limit);
   }
 
-  /** R2. Mirror of the SQL: +0.02, capped, and the use clock reset. */
-  async reinforce(ids: string[]): Promise<number> {
+  /**
+   * Mirror of the SQL store's lexical half (ADR-0012): same tokenizer, same
+   * all-rows df, same "one row enters the union at most once". Integer df over
+   * the whole map (not just this partition) is what keeps a test's ranking on
+   * this backend comparable to the one prod gets from memory_terms.
+   */
+  async lexicalCandidates(opts: {
+    namespace: string;
+    query: string;
+    limit: number;
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
+  }): Promise<{ memory: Memory; lexicalScore: number }[]> {
+    const queryTokens = [...new Set(tokenize(opts.query))].slice(0, LEXICAL_TOKEN_LIMIT);
+    if (queryTokens.length === 0) return [];
+    const all = [...this.map.values()];
+    const total = all.filter((m) => m.isDeleted === 0).length;
+    const df = new Map<string, number>();
+    for (const m of all) {
+      for (const token of new Set(tokenize(m.text))) {
+        if (queryTokens.includes(token)) df.set(token, (df.get(token) ?? 0) + 1);
+      }
+    }
+    // Same hygiene as the SQL store (ADR-0019): above 200 live rows a word that
+    // appears in more than a third of them is skipped and only the eight rarest
+    // query words score, because that is the shape the lexical half actually uses.
+    const cap = total >= MIN_ROWS_FOR_DF_CAP ? Math.floor(total * DF_CAP_RATIO) : Number.MAX_SAFE_INTEGER;
+    const useful = queryTokens
+      .filter((token) => (df.get(token) ?? 0) <= cap)
+      .sort((a, b) => (df.get(a) ?? 0) - (df.get(b) ?? 0))
+      .slice(0, LEXICAL_RAREST_K);
+    if (useful.length === 0) return [];
+    const scored = this.candidates(opts).flatMap((memory) => {
+      const counts = new Map<string, number>();
+      for (const token of tokenize(memory.text)) counts.set(token, (counts.get(token) ?? 0) + 1);
+      let lexicalScore = 0;
+      for (const token of useful) {
+        const tf = counts.get(token) ?? 0;
+        if (tf === 0) continue;
+        lexicalScore += tf * (total / (df.get(token) ?? 1));
+      }
+      return lexicalScore > 0 ? [{ memory, lexicalScore }] : [];
+    });
+    scored.sort((a, b) => b.lexicalScore - a.lexicalScore || a.memory.id.localeCompare(b.memory.id));
+    return scored.slice(0, opts.limit);
+  }
+
+  /** R2. Mirror of the SQL: +0.02, capped, and the use clock reset. */  async reinforce(ids: string[]): Promise<number> {
     const now = Date.now();
     let n = 0;
     for (const id of new Set(ids)) {
@@ -176,13 +276,20 @@ export class InMemoryVectorStore implements VectorStore {
     return n;
   }
 
-  async prune(opts: { olderThanMs: number; maxImportance: number; type?: string }): Promise<number> {
+  async prune(opts: { olderThanMs: number; maxImportance: number; type?: string; kind?: string }): Promise<number> {
     const cutoff = Date.now() - opts.olderThanMs;
     let n = 0;
     for (const m of this.map.values()) {
-      // Same rule as the SQL store: clock resets on use, and strength (not the
-      // judge's importance) decides.
-      if ((m.lastUsedAt ?? m.createdAt) < cutoff && m.strength <= opts.maxImportance && m.isDeleted === 0) {
+      // Same rule as the SQL store: clock resets on use, and eviction needs both
+      // a low write-time importance and a low strength, so reinforcement still
+      // protects a memory (ADR-0013).
+      if (
+        (m.lastUsedAt ?? m.createdAt) < cutoff &&
+        m.importance <= opts.maxImportance &&
+        m.strength <= opts.maxImportance &&
+        m.isDeleted === 0
+      ) {
+        if (opts.kind && m.kind !== opts.kind) continue;
         if (opts.type && m.type !== opts.type) continue;
         m.isDeleted = 1;
         m.updatedAt = Date.now();
@@ -191,4 +298,32 @@ export class InMemoryVectorStore implements VectorStore {
     }
     return n;
   }
+
+  /** Knowledge index mirror (ADR-0023): same contract as the SQL capability. */
+  get knowledge(): KnowledgeCapability {
+    return {
+      listByKnowledge: async (id) =>
+        [...this.map.values()]
+          .filter((m) => m.knowledgeId === id && m.isDeleted === 0)
+          .sort((a, b) => (a.knowledgeSection ?? "").localeCompare(b.knowledgeSection ?? "")),
+      listKnowledgeIds: async () => [
+        ...new Set(
+          [...this.map.values()]
+            .filter((m) => m.knowledgeId !== null && m.isDeleted === 0)
+            .map((m) => m.knowledgeId as string)
+        )
+      ].sort(),
+      replaceLinks: async (from, edges) => {
+        this.linksByFrom.set(from, edges.map((e) => ({ ...e })));
+      },
+      links: async (from) =>
+        from
+          ? (this.linksByFrom.get(from) ?? []).map((e) => ({ ...e }))
+          : [...this.linksByFrom.entries()]
+              .sort(([a], [b]) => a.localeCompare(b))
+              .flatMap(([, edges]) => edges.map((e) => ({ ...e })))
+    };
+  }
+
+  private linksByFrom = new Map<string, KnowledgeEdge[]>();
 }

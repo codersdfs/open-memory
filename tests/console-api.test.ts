@@ -40,6 +40,10 @@ function mem(o: Partial<Memory> & { type: Memory["type"] }): Memory {
   return {
     id: o.id ?? Math.random().toString(36).slice(2),
     namespace: "test:1",
+    project: null,
+    kind: "note",
+    knowledgeId: null,
+    knowledgeSection: null,
     text: "x".repeat(40),
     embedding: [],
     importance: 0.5,
@@ -63,7 +67,7 @@ describe("stats.summarize", () => {
     mem({ type: "working", createdAt: now - 8 * DAY }),                                        // decay candidate (7d)
     mem({ type: "working", createdAt: now - 2 * DAY }),
     mem({ type: "semantic", status: "archived", pin: 1, strength: 0.8, lastUsedAt: now - DAY }),
-    mem({ type: "semantic", isDeleted: 1, supersedesId: "dead", status: "superseded" }),
+    mem({ type: "semantic", isDeleted: 1, supersedesId: "dead", status: "archived" }),
     mem({ type: "procedural", strength: 0.7, lastUsedAt: now - 3 * DAY }),
   ];
 
@@ -72,8 +76,7 @@ describe("stats.summarize", () => {
     expect(s.byType.episodic).toBe(2);
     expect(s.byType.working).toBe(2);
     expect(s.byStatus.active).toBe(5);
-    expect(s.byStatus.archived).toBe(1);
-    expect(s.byStatus.superseded).toBe(1);
+    expect(s.byStatus.archived).toBe(2);
     expect(s.deleted).toBe(1);
     // "active" here means not soft-deleted, so it counts the archived row too —
     // byStatus.active is the status field, and the two numbers are different on purpose
@@ -87,11 +90,21 @@ describe("stats.summarize", () => {
     expect(s.neverUsed).toBe(5);
   });
 
-  it("decay candidates match decay.ts: episodic>90d&&importance<=0.3, working>7d", () => {
+  it("decay candidates match store.prune: age since last use, strength<=0.3 episodic, working>7d", () => {
     const s = summarize(rows, now);
     expect(s.decayCandidates.map((m) => m.type).sort()).toEqual(["episodic", "working"]);
     // the soft-deleted row is a tombstone — it is already gone
     expect(s.decayCandidates.some((m) => m.isDeleted === 1)).toBe(false);
+  });
+
+  it("a reinforced old row is not a decay candidate — the preview mirrors store.prune", () => {
+    const reinforced = mem({ type: "episodic", createdAt: now - 200 * DAY, lastUsedAt: now - 2 * DAY, importance: 0.2, strength: 0.1 });
+    const never = mem({ type: "episodic", createdAt: now - 200 * DAY, importance: 0.2, strength: 0.1 });
+    // Recalling an old memory resets its clock, so the preview must not offer it for pruning.
+    expect(summarize([reinforced, never], now).decayCandidates.map((m) => m.id)).toEqual([never.id]);
+    // Strength, not the write-time importance, is what eviction reads.
+    const strong = mem({ type: "episodic", createdAt: now - 200 * DAY, importance: 0.9, strength: 0.9 });
+    expect(summarize([strong], now).decayCandidates).toHaveLength(0);
   });
 
   it("buckets strength and age without inventing a total", () => {
@@ -863,11 +876,16 @@ describe("mutation gate", () => {
     expect(await refused.text()).not.toContain("evil.example");
     expect((await svc.store.getById(old.id))?.isDeleted).toBe(0);
 
-    // The same request with no Origin — the CLI — still prunes it, so the row above was
-    // a live candidate and the refusal above was the gate, not an empty store.
+    // The same request with no Origin — the CLI — still takes it, so the row above was
+    // a live candidate and the refusal above was the gate, not an empty store. Since
+    // v0.4 the default pass archives: the row is demoted, not deleted, and the response
+    // names both halves.
     const local = await fetch(`${base}/decay`, { method: "POST" });
     expect(local.status).toBe(200);
-    expect(((await local.json()) as { pruned: number }).pruned).toBe(1);
+    const report = (await local.json()) as { archived: number; pruned: number; affected: number };
+    expect(report.archived).toBe(1);
+    expect(report.pruned).toBe(0);
+    expect(report.affected).toBe(1);
   });
 
   it("refuses POST /extract from a foreign origin, and stores nothing", async () => {

@@ -14,7 +14,7 @@
 // src/core/types.ts:1 TYPES
 export type MemoryType = "episodic" | "semantic" | "procedural" | "working";
 // src/core/types.ts:2 STATUSES
-export type MemoryStatus = "active" | "archived" | "draft" | "superseded";
+export type MemoryStatus = "active" | "archived" | "draft";
 
 /** src/core/types.ts:23-48 Memory — the row as the server serializes it. */
 export interface Memory {
@@ -87,6 +87,8 @@ export interface DecayCandidate {
   strength: number;
   isDeleted: number;
   text: string;
+  /** `archive` is the default pass (reversible status change); `prune` is the opt-in hard pass. */
+  action: 'archive' | 'prune';
 }
 
 /** src/core/stats.ts:41-59 StatsSummary. */
@@ -253,8 +255,9 @@ export const api = {
   health: (): Promise<{ version: string; [k: string]: unknown }> => request("/health"),
 
   /**
-   * GET /namespaces — added by the server ticket (D5), not in `server.ts` yet.
-   * `store.distinctNamespaces()` is at src/core/store/interface.ts:34.
+   * GET /namespaces — ticket 014 D5, served at src/api/server.ts:211 and fed by
+   * `store.distinctNamespaces()` (src/core/store/interface.ts:34). App.tsx offers these
+   * through a datalist, so the read fan-out (own + shared + legacy) is visible on sight.
    */
   namespaces: (): Promise<{ namespaces: string[] }> => request("/namespaces"),
 
@@ -291,7 +294,8 @@ export const api = {
     request("/extract", sendInit("POST", body)),
 
   /** POST /decay — src/api/server.ts:183-186. */
-  decay: (): Promise<{ pruned: number }> => request("/decay", sendInit("POST")),
+  decay: (): Promise<{ archived: number; pruned: number; affected: number }> =>
+    request('/decay', sendInit('POST')),
 
   /** GET /sessions — src/api/server.ts:261-268. */
   sessions: (limit?: number, offset?: number): Promise<{ root: string; total: number; sessions: SessionInfo[] }> =>

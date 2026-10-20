@@ -30,9 +30,12 @@ export class HashEmbeddingProvider implements EmbeddingProvider {
         vec[i] += ((byte / 127.5) - 1) * (1 + Math.sin(i * 0.11 + token.length));
       }
     }
-    // add length + char signal so empty vs non-empty differs
-    for (let i = 0; i < this.dim; i++) {
-      vec[i] += Math.sin((text.charCodeAt(i % text.length) ?? 0) * 0.07 + i) * 0.1;
+    // add length + char signal so empty vs non-empty differs. Empty text has no length
+    // to index into: % 0 is NaN, which poisons every component and normalizes to NaN.
+    if (text.length > 0) {
+      for (let i = 0; i < this.dim; i++) {
+        vec[i] += Math.sin(text.charCodeAt(i % text.length) * 0.07 + i) * 0.1;
+      }
     }
     return normalize(vec);
   }

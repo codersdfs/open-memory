@@ -25,7 +25,7 @@ import { useRoute } from '../router';
  */
 
 const TYPES: readonly MemoryType[] = ['episodic', 'semantic', 'procedural', 'working'];
-const STATUSES: readonly MemoryStatus[] = ['active', 'archived', 'draft', 'superseded'];
+const STATUSES: readonly MemoryStatus[] = ['active', 'archived', 'draft'];
 
 /** One page, above the drawer's need for the supersede chain — the chain is walked over
  *  these rows, so a shallow page is a short chain. */
@@ -37,7 +37,6 @@ const STATUS_KIND: Record<MemoryStatus, 'ok' | 'neutral' | 'warn' | 'accent'> = 
   active: 'ok',
   archived: 'neutral',
   draft: 'warn',
-  superseded: 'accent',
 };
 
 /** `base.css` styles `.field input, .field select`; a control outside a `.field` carries its own. */
@@ -810,10 +809,10 @@ export default function MemoriesView({ namespace }: { namespace: string }) {
         body={
           detail === null ? null : (
             <>
-              Writes <span className="mono">1</span> new memory and sets the status of{' '}
-              <span className="mono">{truncate(detail.id, 22)}</span> to <span className="mono">superseded</span>. The old
-              memory is <strong>not erased</strong> — a superseded row is a tombstone: it keeps its text and stops being
-              the head of the chain. The namespace gains exactly one row; the list above (which holds{' '}
+              Writes <span className="mono">1</span> new memory and links{' '}
+              <span className="mono">{truncate(detail.id, 22)}</span> to it as superseded — the status column stays{' '}
+              <span className="mono">active</span>. The old memory is <strong>not erased</strong>: it keeps its text and
+              stops being the head of the chain. The namespace gains exactly one row; the list above (which holds{' '}
               <span className="mono">{total}</span> rows right now) changes only as far as the filters allow.
             </>
           )

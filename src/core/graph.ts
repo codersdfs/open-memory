@@ -18,6 +18,8 @@ export interface Graph { nodes: GraphNode[]; edges: GraphEdge[] }
 export interface Page {
   id: string;
   title: string;
+  /** Frontmatter `slug:`; the knowledge index uses it as the page id when present. */
+  slug: string;
   source: string;
   links: string[];
   tags: string[];
@@ -96,6 +98,7 @@ export function parsePage(file: string, raw: string): Page {
   return {
     id,
     title: unquote(fm(head, "title")) || h1?.[1]?.trim() || base(id),
+    slug: unquote(fm(head, "slug")),
     source: unquote(fm(head, "source")),
     links: [...new Set([...fmList(head, "links"), ...bodyLinks(scan)])],
     tags: [...new Set([...fmList(head, "tags"), ...bodyTags(scan)])],

@@ -52,7 +52,7 @@ export function dbExists(p: string): boolean {
   return existsSync(p);
 }
 
-function expandHome(p: string): string {
+export function expandHome(p: string): string {
   if (p === "~") return os.homedir();
   if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(os.homedir(), p.slice(2));
   return p;

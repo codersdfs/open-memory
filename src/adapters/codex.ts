@@ -4,6 +4,13 @@ import type { Adapter } from "./types.js";
 import type { AdapterAction } from "./fs.js";
 import { existsSync, hasCommand, mcpCommandSpec, plan, readTextIfExists, stripBom } from "./fs.js";
 import { hasSection, tomlLiteral, tomlString, upsertSection, writeToml } from "./toml.js";
+import {
+  MANAGED_BLOCK_BEGIN,
+  MANAGED_BLOCK_END,
+  removeManagedBlock,
+  renderAgentsBlock,
+  upsertManagedBlock
+} from "./instructions.js";
 
 /**
  * Codex CLI integration.
@@ -14,8 +21,8 @@ import { hasSection, tomlLiteral, tomlString, upsertSection, writeToml } from ".
  */
 
 const SECTION = "mcp_servers.ai-memory";
-const BEGIN = "<!-- ai-memory:begin -->";
-const END = "<!-- ai-memory:end -->";
+const BEGIN = MANAGED_BLOCK_BEGIN;
+const END = MANAGED_BLOCK_END;
 
 export function codexConfigPath(): string {
   return process.env.CODEX_HOME ? path.join(process.env.CODEX_HOME, "config.toml") : path.join(home(), ".codex", "config.toml");
@@ -37,42 +44,7 @@ export function codexSectionBody(): string[] {
   ];
 }
 
-export const MANAGED_BLOCK_BEGIN = BEGIN;
-export const MANAGED_BLOCK_END = END;
-
-export function renderAgentsBlock(): string {
-  return [
-    BEGIN,
-    "## Memory (ai-memory)",
-    "",
-    "You have a shared long-term memory available as MCP tools (`memory_search`, `memory_remember`,",
-    "`memory_list`, `memory_get`, `memory_forget`, `memory_stats`), and as the `ai-memory` CLI in a shell.",
-    "",
-    "- Search before guessing about past decisions, project conventions, or user preferences.",
-    "- Store durable facts with `memory_remember`. Use `scope: \"shared\"` for anything another agent",
-    "  would need; keep agent-specific notes `scope: \"private\"`.",
-    "- Never store secrets, tokens, or credentials.",
-    END
-  ].join("\n");
-}
-
-/** Replace the managed block, appending it if absent. Never touches other content. */
-export function upsertManagedBlock(content: string, block: string): string {
-  const start = content.indexOf(BEGIN);
-  const end = content.indexOf(END);
-  if (start >= 0 && end > start) {
-    return content.slice(0, start) + block + content.slice(end + END.length);
-  }
-  const sep = content.trim() === "" ? "" : content.endsWith("\n") ? "\n" : "\n\n";
-  return content + sep + block + "\n";
-}
-
-export function removeManagedBlock(content: string): string {
-  const start = content.indexOf(BEGIN);
-  const end = content.indexOf(END);
-  if (start < 0 || end <= start) return content;
-  return (content.slice(0, start) + content.slice(end + END.length)).replace(/\n{3,}/g, "\n\n").trimStart();
-}
+export { MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END, renderAgentsBlock, upsertManagedBlock, removeManagedBlock };
 
 export class CodexAdapter implements Adapter {
   id = "codex";

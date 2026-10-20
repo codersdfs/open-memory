@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { MemoryService } from "../core/memoryService.js";
-import { MemoryClient } from "../cli/http.js";
+import { MemoryClient, unwrapMemory } from "../cli/http.js";
 import { resolveAgent, type MemoryScope } from "../core/scope.js";
 import { callTool, MEMORY_TOOLS, type ToolContext } from "./tools.js";
 
@@ -218,7 +218,7 @@ async function callViaDaemon(
     case "memory_remember": {
       const text = String(args.text ?? "").trim();
       if (!text) return { text: "memory_remember: text is required", structured: null, isError: true };
-      const res = await client.post<{ memory: { id: string; namespace: string } }>("/memories", {
+      const res = await client.post<unknown>("/memories", {
         text,
         type: args.type ?? "semantic",
         agent,
@@ -228,7 +228,11 @@ async function callViaDaemon(
         source: args.source ?? `mcp:${agent}`
       });
       if (!res.ok) return { text: `memory_remember failed: ${res.error}`, structured: null, isError: true };
-      return { text: `stored: ${res.data.memory.id} → ${res.data.memory.namespace}`, structured: res.data.memory };
+      // The daemon answers a write with the bare memory (a stale daemon may wrap it), so the
+      // shared unwrapper is the only safe read: dereferencing .memory threw a TypeError and
+      // memory_remember never replied against a live daemon.
+      const saved = unwrapMemory<{ id: string; namespace: string }>(res.data);
+      return { text: `stored: ${saved.id} → ${saved.namespace}`, structured: saved };
     }
     case "memory_list": {
       const res = await client.get<{ memories: { id: string; type: string; namespace: string; text: string }[]; total: number }>(
@@ -250,11 +254,17 @@ async function callViaDaemon(
         if (!res.ok) return { text: `memory_forget failed: ${res.error}`, structured: null, isError: true };
         return { text: `forgot ${id}`, structured: { id, deleted: true } };
       }
-      const res = await client.get<{ memory: { id: string; type: string; namespace: string; text: string } | null }>(
-        `/memories/${encodeURIComponent(id)}`
-      );
-      if (!res.ok || !res.data.memory) return { text: `no memory ${id}`, structured: null, isError: true };
-      return { text: `[${id}] ${res.data.memory.text}`, structured: res.data.memory };
+      const res = await client.get<unknown>(`/memories/${encodeURIComponent(id)}`);
+      if (!res.ok) return { text: `no memory ${id}`, structured: null, isError: true };
+      // Same shape problem as the write: the route answers with the bare memory, so reading
+      // .memory answered "no memory" for every id that plainly existed.
+      let found: { id: string; type: string; namespace: string; text: string };
+      try {
+        found = unwrapMemory(res.data);
+      } catch {
+        return { text: `no memory ${id}`, structured: null, isError: true };
+      }
+      return { text: `[${id}] ${found.text}`, structured: found };
     }
     case "memory_stats": {
       const res = await client.get<Record<string, unknown>>("/stats" + MemoryClient.query({ agent, scope, all: args.all === true }));

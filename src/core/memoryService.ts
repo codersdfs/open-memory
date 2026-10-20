@@ -9,6 +9,12 @@ import { InMemoryVectorStore } from "./store/memory.js";
 import { resolveDbPath } from "./dbPath.js";
 import { runtimeEnv } from "./settings.js";
 import { resolveScopeKeys, resolveWriteKey, type MemoryScope } from "./scope.js";
+import { normalizeProject, resolveProject } from "./project.js";
+import { deriveKind, KIND_IMPORTANCE } from "./write/kind.js";
+import { assembleBrief } from "./retrieval/brief.js";
+import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, type KnowledgePageView } from "./knowledge/view.js";
+import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
+import type { BriefOptions, BriefResult } from "./types.js";
 import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
 import { jevEnabled, jevRelation, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
 
@@ -101,11 +107,22 @@ export class MemoryService {
     const namespace = input.namespace?.trim()
       ? input.namespace
       : resolveWriteKey({ agent: input.agent, user: input.user, scope: input.scope });
+    // ADR-0020/0021. An explicit `project` (including explicit null) wins; otherwise
+    // the project is whatever repository this process is running in, so an agent that
+    // knows nothing about projects still files its writes under one. Kind is derived
+    // the same way, and an explicit kind also supplies the importance nobody gave.
+    const project = input.project !== undefined
+      ? normalizeProject(input.project)
+      : resolveProject().project;
+    const kind = deriveKind(input.text, { explicit: input.kind, type: input.type });
+    const importance = input.importance ?? (input.kind ? KIND_IMPORTANCE[kind] : undefined);
     const target: MemoryInput = {
       namespace,
+      project,
+      kind,
       type: input.type,
       text: input.text,
-      importance: input.importance,
+      importance,
       strength: input.strength,
       source: input.source,
       tags: input.tags,
@@ -120,6 +137,11 @@ export class MemoryService {
     if ((env.MEMORY_RECONCILE ?? "").trim().toLowerCase() === "off") {
       const existing = await this.store.vectorSearch({
         namespace,
+        project: target.project,
+        // ADR-0023: an ordinary write never reconciles into a knowledge row. A chat
+        // sentence that happens to match a page's section must not reinforce it away,
+        // because the section's text belongs to the file.
+        knowledge: null,
         queryEmbedding: embedding,
         type: target.type,
         limit: 5,
@@ -139,6 +161,12 @@ export class MemoryService {
 
     const neighbours = await this.store.vectorSearch({
       namespace,
+      // Reconcile stays inside one project: the same sentence filed under two
+      // repositories is two facts with two lifetimes, and reinforcing one into the
+      // other would delete the loser from the brief of the project that needed it.
+      project: target.project,
+      // Same reason as the dedup path above: knowledge rows are out of reach here.
+      knowledge: null,
       queryEmbedding: embedding,
       type: target.type,
       limit: 5,
@@ -223,6 +251,65 @@ export class MemoryService {
     return (await this.saveDetailed(input)).memory;
   }
 
+  /**
+   * Bulk save for imports and replayed history (ADR-0018).
+   *
+   * `reconcile` defaults to **off** here, unlike `save`. Write-time reconcile runs a
+   * 5-neighbour vector search per write to decide insert/reinforce/supersede; doing
+   * that for 10k rows is 10k full scans *plus* 10k commits, which is quadratic in
+   * everything that matters. A bulk import is new material by definition — the
+   * caller that is replaying something it already stored can turn reconcile back on
+   * explicitly. Embeddings go through `embedBatch` where the provider offers one, so
+   * a remote embedder costs one round trip instead of one per row.
+   */
+  async saveMany(
+    inputs: SaveInput[],
+    opts: { reconcile?: boolean } = {}
+  ): Promise<{ memories: Memory[]; skipped: number }> {
+    if (inputs.length === 0) return { memories: [], skipped: 0 };
+    if (opts.reconcile) {
+      const memories: Memory[] = [];
+      for (const input of inputs) memories.push((await this.saveDetailed(input)).memory);
+      return { memories, skipped: 0 };
+    }
+    const targets = inputs.map((input) => {
+      const namespace = input.namespace?.trim()
+        ? input.namespace
+        : resolveWriteKey({ agent: input.agent, user: input.user, scope: input.scope });
+      const project = input.project !== undefined
+        ? normalizeProject(input.project)
+        : resolveProject().project;
+      const kind = deriveKind(input.text, { explicit: input.kind, type: input.type });
+      const target: MemoryInput = {
+        namespace,
+        project,
+        kind,
+        type: input.type,
+        text: input.text,
+        importance: input.importance ?? (input.kind ? KIND_IMPORTANCE[kind] : undefined),
+        strength: input.strength,
+        source: input.source,
+        tags: input.tags,
+        supersedesId: input.supersedesId ?? null,
+        visibility: input.visibility,
+        status: input.status,
+        pin: input.pin
+      };
+      return target;
+    });
+    const embeddings = await this.embedder.embedBatch(
+      targets.map((t) => t.text),
+      { inputType: "passage" }
+    );
+    const items = targets.map((input, i) => ({ input, embedding: embeddings[i] }));
+    if (this.store.insertMany) {
+      return { memories: await this.store.insertMany(items), skipped: 0 };
+    }
+    const memories: Memory[] = [];
+    for (const it of items) memories.push(await this.store.insert(it.input, it.embedding));
+    return { memories, skipped: 0 };
+  }
+
   async get(id: string): Promise<Memory | null> {
     return this.store.getById(id);
   }
@@ -239,12 +326,67 @@ export class MemoryService {
     return memory && memory.isDeleted !== 1 ? memory : null;
   }
 
-  async list(opts: { namespace: string; type?: string; includeDeleted?: boolean; status?: string; includeArchived?: boolean; includeDraft?: boolean; limit?: number; offset?: number; query?: string }) {
+  async list(opts: { namespace: string; type?: string; project?: string | null; kind?: string; includeDeleted?: boolean; status?: string; includeArchived?: boolean; includeDraft?: boolean; limit?: number; offset?: number; query?: string }) {
     return this.store.list(opts as never);
+  }
+
+  /**
+   * Project brief (ADR-0022): what a session should know before it starts, with no
+   * query to supply. Partitions resolve like `search` so a shared convention and a
+   * private gotcha both show up; `project` defaults to the repository this process
+   * is running in, exactly like writes default.
+   */
+  async brief(opts: BriefOptions = {}): Promise<BriefResult> {
+    const namespaces =
+      opts.namespaces && opts.namespaces.length > 0
+        ? opts.namespaces
+        : opts.namespace
+          ? [opts.namespace]
+          : resolveScopeKeys({ agent: opts.agent, scope: opts.scope ?? undefined });
+    const project = opts.project !== undefined ? normalizeProject(opts.project) : resolveProject().project;
+    return assembleBrief(this.store, { ...opts, project, namespaces });
   }
 
   async delete(id: string): Promise<void> {
     await this.store.deleteSoft(id);
+  }
+
+  /**
+   * Knowledge index (ADR-0023): markdown pages become searchable rows, in place.
+   *
+   * The store has no filesystem access by design, so the sync lives here — it is
+   * the one object that owns both the embedder and the store.
+   */
+  async syncKnowledge(opts: SyncKnowledgeOptions = {}): Promise<SyncKnowledgeReport> {
+    return syncKnowledge({ store: this.store, embedder: this.embedder }, opts);
+  }
+
+  /** Every knowledge page in the given partitions (default: this user's layers). */
+  async knowledge(opts: { namespaces?: string[]; namespace?: string; agent?: string; scope?: MemoryScope } = {}): Promise<KnowledgeIndexView> {
+    const namespaces = this.knowledgeNamespaces(opts);
+    return knowledgeIndex(this.store, { namespaces });
+  }
+
+  async knowledgePage(opts: { namespaces?: string[]; namespace?: string; agent?: string; scope?: MemoryScope } & { id: string }): Promise<KnowledgePageView | null> {
+    const pages = await knowledgePages(this.store, { namespaces: this.knowledgeNamespaces(opts) });
+    return pages.find((p) => p.id === opts.id) ?? null;
+  }
+
+  /** Explicit link expansion. Reading through links is never implicit (ADR-0023). */
+  async knowledgeNeighbors(opts: { namespaces?: string[]; namespace?: string; agent?: string; scope?: MemoryScope } & { id: string; depth?: number }): Promise<{ id: string; neighbors: KnowledgePageView[] }> {
+    const namespaces = this.knowledgeNamespaces(opts);
+    const pages = await knowledgePages(this.store, { namespaces });
+    const edges = pages.flatMap((p) => p.links);
+    const ids = neighborsOf(edges, opts.id, opts.depth ?? 1);
+    return { id: opts.id, neighbors: pages.filter((p) => ids.includes(p.id)) };
+  }
+
+  private knowledgeNamespaces(opts: { namespaces?: string[]; namespace?: string; agent?: string; scope?: MemoryScope }): string[] {
+    return opts.namespaces && opts.namespaces.length > 0
+      ? opts.namespaces
+      : opts.namespace
+        ? [opts.namespace]
+        : resolveScopeKeys({ agent: opts.agent, scope: opts.scope ?? undefined });
   }
 
   async updateMeta(
@@ -274,13 +416,23 @@ export class MemoryService {
     return this.retriever.search({ ...opts, namespaces });
   }
 
-  async extractAndSave(turnText: string, namespace: string): Promise<Memory[]> {
-    const extracted = await this.extractor.extract(turnText);
+  /**
+   * Extract and store. `referenceDate` is the moment the turn was said, so a replayed
+   * old turn stamps "yesterday" onto the right day instead of onto today; callers that
+   * have no better answer omit it and get the wall clock.
+   */
+  async extractAndSave(turnText: string, namespace: string, referenceDate?: number): Promise<Memory[]> {
+    const extracted = await this.extractor.extract(turnText, referenceDate ?? Date.now());
+    // A replayed turn carries the project of the repository being replayed, not of
+    // whatever directory this process happens to sit in.
+    const project = resolveProject().project;
     const saved: Memory[] = [];
     for (const ex of extracted) {
       const mem = await this.save({
         namespace,
+        project,
         type: ex.type,
+        kind: deriveKind(ex.text, { type: ex.type }),
         text: ex.text,
         importance: ex.importance,
         tags: ex.tags,

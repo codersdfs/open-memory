@@ -177,6 +177,10 @@ describe("byVectorDim", () => {
   const row = (embedding: number[]): Memory => ({
     id: Math.random().toString(36).slice(2),
     namespace: "t:1",
+    project: null,
+    kind: "note",
+    knowledgeId: null,
+    knowledgeSection: null,
     type: "semantic",
     text: "x",
     embedding,

@@ -1,4 +1,7 @@
-import { createRegistry, defaultAdapters, cliEntryPath, mcpCommandSpec } from "./index.js";
+import { createRegistry, defaultAdapters, isBuiltIn, cliEntryPath, mcpCommandSpec } from "./index.js";
+import { GenericAdapter } from "./generic.js";
+import { agentsFilePath, readSpecs, validateSpec, writeSpecs } from "./specs.js";
+import { plan } from "./fs.js";
 import { resolveAgent, resolveUser, resolveWriteKey } from "../core/scope.js";
 import { resolveDbPath, dbExists } from "../core/dbPath.js";
 import { existsSync } from "node:fs";
@@ -130,12 +133,115 @@ export async function runAgentCommand(positionals: string[], flags: Flags, ctx: 
       return 0;
     }
 
+    case "specs": {
+      const { specs, errors } = readSpecs();
+      if (ctx.json) {
+        ctx.out(JSON.stringify({ file: agentsFilePath(), agents: specs, errors }, null, 2));
+        return 0;
+      }
+      ctx.out(agentsFilePath());
+      const ids = Object.keys(specs);
+      if (ids.length === 0) ctx.out("  (no declared agents)");
+      for (const id of ids) ctx.out(`  ${id.padEnd(12)} ${specs[id]!.mcpFile}${isBuiltIn(id) ? "   ← built-in id: ignored, link that one instead" : ""}`);
+      for (const error of errors) ctx.err(`  ${error}`);
+      return 0;
+    }
+
+    case "add": {
+      const id = positionals[1];
+      if (!id) {
+        ctx.err("agent add: an id is required, e.g. ai-memory agent add cursor --mcp-file ~/.cursor/mcp.json");
+        return 2;
+      }
+      const mcpFile = flag(flags, "mcp-file");
+      if (!mcpFile) {
+        ctx.err("agent add: --mcp-file <path> is required — the config file to register the MCP server in");
+        return 2;
+      }
+      const env: Record<string, string> = {};
+      for (const pair of (flag(flags, "env") ?? "").split(",")) {
+        const trimmed = pair.trim();
+        if (!trimmed) continue;
+        const eq = trimmed.indexOf("=");
+        if (eq <= 0) {
+          ctx.err(`agent add: --env expects KEY=VALUE, got "${trimmed}"`);
+          return 2;
+        }
+        env[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+      }
+      const declared = validateSpec(id, {
+        mcpFile,
+        jsonPath: flag(flags, "json-path"),
+        format: flag(flags, "format"),
+        env: Object.keys(env).length > 0 ? env : undefined,
+        instructions: flag(flags, "instructions")
+      });
+      if (typeof declared === "string") {
+        ctx.err(`agent add: ${declared}`);
+        return 2;
+      }
+
+      const file = agentsFilePath();
+      const { specs, errors } = readSpecs();
+      // A file we cannot parse is not a file to append to: writing it back would
+      // silently drop whatever the user actually declared there.
+      if (errors.length > 0) {
+        ctx.err(`agent add: refusing to rewrite ${file}`);
+        for (const error of errors) ctx.err(`  ${error}`);
+        return 1;
+      }
+      const existed = id in specs;
+      if (isBuiltIn(id)) {
+        ctx.err(
+          `agent add: "${id}" is a built-in adapter, and its entry is more than a config path — a declaration would drop ` +
+            `its hooks or managed instructions. Link it as it is: ai-memory agent link --agent ${id} --write`
+        );
+        return 2;
+      }
+      specs[id] = declared;
+      writeSpecs(specs, write);
+      renderActions(
+        ctx,
+        id,
+        [plan(file, `${existed ? "update" : "declare"} agent "${id}" → ${declared.mcpFile}`, true, JSON.stringify({ agents: { [id]: declared } }, null, 2))],
+        write
+      );
+      // Declaring is half of it — register into the client's own config as well,
+      // so one command leaves the agent talking to memory.
+      renderActions(ctx, id, await new GenericAdapter(id, declared).link({ write }), write);
+      return 0;
+    }
+
+    case "remove": {
+      const id = positionals[1];
+      if (!id) {
+        ctx.err("agent remove: an id is required");
+        return 2;
+      }
+      const file = agentsFilePath();
+      const { specs, errors } = readSpecs();
+      if (errors.length > 0) {
+        ctx.err(`agent remove: refusing to rewrite ${file}`);
+        for (const error of errors) ctx.err(`  ${error}`);
+        return 1;
+      }
+      if (!(id in specs)) {
+        ctx.err(`agent remove: "${id}" is not declared in ${file}`);
+        return 1;
+      }
+      delete specs[id];
+      writeSpecs(specs, write);
+      ctx.out(`${write ? "removed" : "would remove"} declared agent "${id}"`);
+      ctx.out(`  its config file is untouched — run: ai-memory agent unlink --agent ${id} --write`);
+      return 0;
+    }
+
     case "doctor": {
       return await doctor(ctx);
     }
 
     default:
-      ctx.err(`agent: unknown subcommand "${sub}" (init | list | status | doctor | link | unlink)`);
+      ctx.err(`agent: unknown subcommand "${sub}" (init | list | status | specs | add | remove | doctor | link | unlink)`);
       return 2;
   }
 }
@@ -171,6 +277,21 @@ async function doctor(ctx: CommandCtx): Promise<number> {
     // have run `agent link` yet. Doctor only fails on things that cannot work.
     checks.push({ name: `agent:${a.id}`, ok: true, detail: a.detect() ? s.detail : "not installed" });
   }
+
+  // A declaration that never loads is a silent no-op, which is exactly what doctor is
+  // for: report the file, not only the adapters that made it through it.
+  const declarations = readSpecs();
+  const collisions = Object.keys(declarations.specs).filter(isBuiltIn);
+  checks.push({
+    name: "declarations",
+    ok: declarations.errors.length === 0 && collisions.length === 0,
+    detail:
+      declarations.errors.length > 0
+        ? declarations.errors.join("; ")
+        : collisions.length > 0
+          ? `${agentsFilePath()}: built-in id(s) ignored — ${collisions.join(", ")}`
+          : `${Object.keys(declarations.specs).length} declared in ${agentsFilePath()}`
+  });
 
   const failed = checks.filter((c) => !c.ok);
   if (ctx.json) ctx.out(JSON.stringify({ ok: failed.length === 0, checks }, null, 2));

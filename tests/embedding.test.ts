@@ -6,6 +6,7 @@ import { ApiEmbeddingProvider } from "../src/core/embedding/openai.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import type { EmbeddingProvider } from "../src/core/embedding/provider.js";
+import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
 import { HybridRetriever } from "../src/core/retrieval/hybrid.js";
 
 const env = (o: Record<string, string>) => o as NodeJS.ProcessEnv;
@@ -181,3 +182,13 @@ describe("vector weight follows the embedder", () => {
   });
 });
 
+
+// #8: the length/char signal loop indexed charCodeAt(i % text.length), and % 0 is
+// NaN, so "" produced an all-NaN vector that JSON-serialized to nulls and scored 0.
+describe("HashEmbeddingProvider", () => {
+  it("embeds the empty string as a finite vector, not NaN", async () => {
+    const v = await new HashEmbeddingProvider().embed("");
+    expect(v).toHaveLength(384);
+    expect(v.every(Number.isFinite)).toBe(true);
+  });
+});

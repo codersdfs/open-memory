@@ -10,8 +10,10 @@ import { createEmbeddingProvider } from "../core/embedding/index.js";
 import { runtimeEnv } from "../core/settings.js";
 import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
-import type { Memory, MemoryType, SearchResult } from "../core/types.js";
-import { stripEmbedding } from "../core/types.js";
+import type { BriefResult, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
+import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/view.js";
+import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
+import { isKind, KINDS, stripEmbedding } from "../core/types.js";
 
 /**
  * `ai-memory` — the one command every agent uses (ADR-0007).
@@ -23,33 +25,42 @@ import { stripEmbedding } from "../core/types.js";
  */
 
 const TYPES = ["episodic", "semantic", "procedural", "working"] as const;
-const STATUSES = ["active", "draft", "archived", "superseded"] as const;
+// The same set as core/types.ts STATUSES, which is the same set the store's CHECK accepts.
+const STATUSES = ["active", "draft", "archived"] as const;
 
 const USAGE = `ai-memory — shared memory for coding agents
 
 Usage: ai-memory <command> [options] [args]
 
 Memory
-  save <text>            --type semantic --importance 0.5 --tags a,b --scope private|shared
-  search <query>         --k 5 --threshold 0.35 --budget 800 --scope private|shared --type t
+  save <text>            --type semantic --kind decision --importance 0.5 --tags a,b --scope private|shared
+  search <query>         --k 5 --threshold 0.35 --budget 800 --scope private|shared --type t --kind k --project p
+  brief                  what this project already decided: conventions, decisions, gotchas, open, recent
+                         --budget 600 --since 14 --project p
   get <id>               print one memory
-  list                   --limit 20 --type t --status active
+  list                   --limit 20 --type t --kind k --project p --status active
   forget <id...>         soft delete (kept, restorable)
   restore <id...>        undo a forget
   supersede <id> <text>  replace one memory with a newer one
-  meta <id>              --status active|draft|archived|superseded --pin 0|1
+  meta <id>              --status active|draft|archived --pin 0|1
   stats                  counts per type for the resolved scope(s)
   decay                  apply lifecycle decay / pruning
   extract <text>         pull candidate memories out of free text and save them
   reembed                rewrite every stored vector with the current embedder
+  knowledge              ls | show <id> | neighbors <id> | sync | link <from> <to>
+                         markdown pages as linked knowledge: --dir <vault> --depth 1 --dry-run
 
 Setup & introspection
-  setup                  create the memory home dir; --copy-db to migrate the old store
+  setup                  create the memory home dir; --copy-db migrates the old store; --link registers agents
   db info                which store would be used, and why
+  db compact             VACUUM the store file: give back what soft delete kept
   daemon restart         stop the running daemon and start a fresh one
   mcp                    run the MCP stdio server (agents spawn this)
   inject                 read a hook payload on stdin, print context for this turn
-  agent <sub>            init | list | doctor | link | unlink (per-agent integration)
+  agent <sub>            init | list | status | doctor | link | unlink (per-agent integration)
+  agent add <id>         --mcp-file <path> [--json-path mcpServers] [--env K=V] [--instructions <f>]
+  agent remove <id>      drop a declared agent (its config file stays; use agent unlink)
+  agent specs            agents you declared in the memory home's agents.json
   context refresh        rewrite the managed instructions block for linked agents
   import <sub>           one-shot import from the other agents' files (see: import --help)
 
@@ -153,9 +164,19 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   }
   const scope = flagString(a, "scope") as MemoryScope | undefined;
   const agent = flagString(a, "agent");
+  const kindFlag = flagString(a, "kind");
+  if (kindFlag !== undefined && !isKind(kindFlag)) {
+    // A typo here must not become a "note" that never survives 30 days: kind decides
+    // retention, so an unknown one is an error, not a hint.
+    ctx.err(`save: --kind must be one of ${KINDS.join(", ")}`);
+    return 2;
+  }
+  const projectFlag = flagString(a, "project");
   const payload = {
     text,
     type,
+    kind: kindFlag,
+    project: projectFlag,
     namespace: flagString(a, "namespace"),
     agent,
     scope: scope === "shared" ? ("shared" as const) : scope === "private" ? ("private" as const) : undefined,
@@ -179,6 +200,8 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   const mem = await svc.save({
     text,
     type,
+    kind: kindFlag as MemoryKind | undefined,
+    project: projectFlag,
     namespace: payload.namespace ?? resolveWriteKey({ agent, scope: payload.scope }),
     importance: payload.importance,
     tags: payload.tags,
@@ -264,6 +287,12 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
   const budgetTokens = flagNumber(a, "budget") ?? 800;
   const threshold = flagNumber(a, "threshold") ?? 0.35;
   const type = flagString(a, "type") as MemoryType | undefined;
+  const kind = flagString(a, "kind") as MemoryKind | undefined;
+  if (kind !== undefined && !isKind(kind)) {
+    ctx.err(`search: --kind must be one of ${KINDS.join(", ")}`);
+    return 2;
+  }
+  const project = flagString(a, "project");
   // R1: opt-in, because the default answer is meant to be read, not debugged.
   const explain = flagBool(a, "explain");
 
@@ -276,7 +305,7 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
     const { namespaces } = await resolveNamespaces(r, a);
     const res = await r.client().get<SearchResult>(
       "/memories/search" +
-        MemoryClient.query({ query, namespaces: namespaces.join(","), k, budgetTokens, threshold, type, explain })
+        MemoryClient.query({ query, namespaces: namespaces.join(","), k, budgetTokens, threshold, type, kind, project, explain })
     );
     if (!res.ok) {
       ctx.err(`search: ${res.error}`);
@@ -294,6 +323,8 @@ async function cmdSearch(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): 
     namespaces,
     agent: resolveAgent(agent),
     type,
+    kind,
+    project,
     k,
     budgetTokens,
     threshold,
@@ -354,12 +385,14 @@ async function cmdList(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   const scope = flagString(a, "scope") as MemoryScope | undefined;
   const limit = flagNumber(a, "limit") ?? 20;
   const type = flagString(a, "type") as MemoryType | undefined;
+  const kind = flagString(a, "kind");
+  const project = flagString(a, "project");
   const status = flagString(a, "status");
 
   if (!flagBool(a, "all") && (await r.useDaemon())) {
     const res = await r.client().get<{ memories: Memory[]; total: number }>(
       "/memories" +
-        MemoryClient.query({ namespace, agent, scope, limit, type, status })
+        MemoryClient.query({ namespace, agent, scope, limit, type, kind, project, status })
     );
     if (!res.ok) {
       ctx.err(`list: ${res.error}`);
@@ -378,7 +411,7 @@ async function cmdList(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   const all: Memory[] = [];
   let total = 0;
   for (const ns of namespaces) {
-    const page = await svc.list({ namespace: ns, type, limit, status: status as never });
+    const page = await svc.list({ namespace: ns, type, kind, project, limit, status: status as never });
     all.push(...page.memories);
     total += page.total;
   }
@@ -532,6 +565,50 @@ async function cmdStats(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
   return 0;
 }
 
+async function cmdBrief(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const project = flagString(a, "project");
+  const budgetTokens = flagNumber(a, "budget") ?? 600;
+  const sinceDays = flagNumber(a, "since") ?? 14;
+  const { namespaces } = await resolveNamespaces(r, a);
+
+  if (!flagBool(a, "all") && (await r.useDaemon())) {
+    const res = await r.client().get<BriefResult>(
+      "/brief" +
+        MemoryClient.query({ namespaces: namespaces.join(","), project, budgetTokens, sinceDays })
+    );
+    if (!res.ok) {
+      // A daemon started before this route existed answers 404 "not found". Falling back
+      // to an in-process read is right here: a brief is read-only and cheap, and refusing
+      // to print one until the operator restarts a daemon is a worse failure.
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`brief: ${res.error}`);
+        return 1;
+      }
+    } else {
+      if (ctx.json) ctx.out(JSON.stringify(res.data, null, 2));
+      else {
+        ctx.out(res.data.text);
+        ctx.out(`\n→ ${res.data.tokensUsed}/${res.data.budgetTokens} tokens across ${namespaces.join(", ")}`);
+      }
+      return 0;
+    }
+  }
+
+  const svc = await r.service();
+  const brief = await svc.brief({
+    namespaces,
+    project,
+    budgetTokens,
+    sinceMs: sinceDays * 24 * 60 * 60 * 1000
+  });
+  if (ctx.json) ctx.out(JSON.stringify(brief, null, 2));
+  else {
+    ctx.out(brief.text);
+    ctx.out(`\n→ ${brief.tokensUsed}/${brief.budgetTokens} tokens across ${namespaces.join(", ")}`);
+  }
+  return 0;
+}
+
 async function cmdDecay(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   if (await r.useDaemon()) {
     const res = await r.client().post<unknown>("/decay", {});
@@ -544,8 +621,9 @@ async function cmdDecay(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
   }
   const svc = await r.service();
   const { runDecay } = await import("../core/lifecycle/decay.js");
-  const result = await runDecay(svc.store as never);
-  ctx.out(ctx.json ? JSON.stringify(result, null, 2) : `decay: ${JSON.stringify(result)}`);
+  // Number-shaped return kept for scripts; the default pass archives rather than deletes.
+  const affected = await runDecay(svc.store as never);
+  ctx.out(ctx.json ? JSON.stringify({ affected }, null, 2) : `decay: ${affected} row(s) archived or pruned`);
   return 0;
 }
 
@@ -593,13 +671,196 @@ async function cmdSetup(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
 
   steps.push("next: ai-memory agent link --write   (registers MCP + context for each agent)");
   ctx.out(ctx.json ? JSON.stringify({ home, dbPath: target, legacy: dbExists(legacy) ? legacy : null, steps }, null, 2) : steps.join("\n"));
+
+  if (flagBool(a, "link")) {
+    // The store is set up; linking is the step everyone forgets. The one command that
+    // exists to set this up can also do it — dry run unless --write, like `agent link`.
+    const { runAgentCommand } = await import("../adapters/cli.js");
+    return await runAgentCommand(["link"], { write: flagBool(a, "write") }, ctx);
+  }
+  return 0;
+}
+
+async function cmdKnowledge(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const which = a.positionals[0] ?? "ls";
+  const id = a.positionals[1];
+  const { namespaces } = await resolveNamespaces(r, a);
+  const onDaemon = !flagBool(a, "all") && (await r.useDaemon());
+
+  if (which === "sync") {
+    const dir = flagString(a, "dir");
+    const dryRun = flagBool(a, "dry-run");
+    if (onDaemon) {
+      const res = await r.client().post<SyncKnowledgeReport>("/knowledge/sync", { dir, dryRun });
+      if (res.ok) {
+        printSync(ctx, res.data);
+        return 0;
+      }
+      // A daemon older than this route answers 404; syncing in-process is safe (the
+      // write path is the same code) and beats telling the operator to restart.
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`knowledge sync: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printSync(ctx, await svc.syncKnowledge({ dir, dryRun }));
+    return 0;
+  }
+
+  const query = MemoryClient.query({ namespaces: namespaces.join(",") });
+  if (which === "ls") {
+    const index = onDaemon
+      ? await r.client().get<KnowledgeIndexView>(`/knowledge${query}`)
+      : null;
+    if (index && !index.ok && !/not found/i.test(index.error)) {
+      ctx.err(`knowledge: ${index.error}`);
+      return 1;
+    }
+    if (index?.ok) return printIndex(ctx, index.data);
+    return printIndex(ctx, await (await r.service()).knowledge({ namespaces }));
+  }
+
+  if (which === "show" || which === "neighbors") {
+    if (!id) {
+      ctx.err(`knowledge ${which}: page id required`);
+      return 2;
+    }
+    const path = which === "show" ? `/knowledge/${encodeURIComponent(id)}` : `/knowledge/${encodeURIComponent(id)}/neighbors${query}`;
+    const res = onDaemon ? await r.client().get<KnowledgePageView | { id: string; neighbors: KnowledgePageView[] }>(path) : null;
+    if (res && !res.ok && !/not found/i.test(res.error)) {
+      ctx.err(`knowledge ${which}: ${res.error}`);
+      return 1;
+    }
+    if (res?.ok) {
+      if (which === "show") return printPage(ctx, res.data as KnowledgePageView);
+      const n = res.data as { id: string; neighbors: KnowledgePageView[] };
+      return printNeighbors(ctx, n.id, n.neighbors);
+    }
+    const svc = await r.service();
+    if (which === "show") {
+      const page = await svc.knowledgePage({ namespaces, id });
+      if (!page) {
+        ctx.err(`knowledge show: unknown page "${id}"`);
+        return 1;
+      }
+      return printPage(ctx, page);
+    }
+    const result = await svc.knowledgeNeighbors({ namespaces, id, depth: flagNumber(a, "depth") ?? 1 });
+    return printNeighbors(ctx, result.id, result.neighbors);
+  }
+
+  if (which === "link") {
+    const to = a.positionals[2];
+    if (!id || !to) {
+      ctx.err("knowledge link: <from> <to> required");
+      return 2;
+    }
+    const { addLink } = await import("../core/graph.js");
+    const { vaultDir } = await import("../core/graph.js");
+    const file = await addLink(flagString(a, "dir") ?? vaultDir(), id, to);
+    // The file is the truth, so re-index rather than writing a row by hand.
+    const svc = await r.service();
+    const report = await svc.syncKnowledge({ dir: flagString(a, "dir") });
+    if (ctx.json) ctx.out(JSON.stringify({ linked: file, report }, null, 2));
+    else {
+      ctx.out(`linked ${id} → ${to} in ${file}`);
+      printSync(ctx, report);
+    }
+    return 0;
+  }
+
+  ctx.err(`knowledge: unknown subcommand "${which}" (expected: ls | show | neighbors | sync | link)`);
+  return 2;
+}
+
+function printSync(ctx: Ctx, report: SyncKnowledgeReport): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(report, null, 2));
+    return;
+  }
+  const head = report.dryRun ? "dry run — nothing written" : "synced";
+  ctx.out(
+    `${head}: ${report.pages} page(s), ${report.sections} section(s) → ` +
+      `${report.inserted} new, ${report.updated} updated, ${report.unchanged} unchanged, ` +
+      `${report.removed} removed, ${report.adopted} adopted, ${report.dangling} dangling link(s)`
+  );
+}
+
+function printIndex(ctx: Ctx, index: KnowledgeIndexView): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(index, null, 2));
+    return 0;
+  }
+  if (index.pages.length === 0) {
+    ctx.out("no knowledge pages indexed — run: ai-memory knowledge sync");
+    return 0;
+  }
+  for (const page of index.pages) {
+    ctx.out(`- ${page.id}  ${page.title}  (${page.sections} sections, ${page.links}→ ${page.backlinks}←)`);
+  }
+  if (index.dangling.length > 0) {
+    ctx.out(`dangling: ${index.dangling.map((e) => `${e.from}→${e.target}`).join(", ")}`);
+  }
+  return 0;
+}
+
+function printPage(ctx: Ctx, page: KnowledgePageView): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(page, null, 2));
+    return 0;
+  }
+  ctx.out(`${page.id}  ${page.title}${page.project ? `  [${page.project}]` : ""}`);
+  for (const section of page.sections) {
+    ctx.out(`  ${section.key}${section.heading ? `  ${section.heading}` : ""}  (${section.chars} chars)`);
+  }
+  if (page.links.length > 0) ctx.out(`links:     ${page.links.map((e) => e.target).join(", ")}`);
+  if (page.backlinks.length > 0) ctx.out(`backlinks: ${page.backlinks.map((e) => e.from).join(", ")}`);
+  return 0;
+}
+
+function printNeighbors(ctx: Ctx, id: string, neighbors: KnowledgePageView[]): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify({ id, neighbors }, null, 2));
+    return 0;
+  }
+  if (neighbors.length === 0) ctx.out(`${id} has no neighbours`);
+  else for (const page of neighbors) ctx.out(`- ${page.id}  ${page.title}`);
   return 0;
 }
 
 async function cmdDb(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   const which = a.positionals[0] ?? "info";
+  if (which === "compact") {
+    // Reclaims what deletes leave behind. Runs in-process rather than through the
+    // daemon: VACUUM needs the file to itself for a moment, and a daemon that keeps
+    // serving rows while the file is rewritten is a lock, not a feature.
+    const { SqliteVectorStore } = await import("../core/store/sqlite.js");
+    const store = new SqliteVectorStore(flagString(a, "db") ?? resolveDbPath());
+    await store.init();
+    try {
+      // `--purge <days>` is the destructive half and is opt-in: soft delete is an
+      // audit trail, so removing tombstones needs an explicit age. VACUUM alone only
+      // gives back the pages already on the freelist.
+      const purgeDays = flagNumber(a, "purge");
+      let purged: number | null = null;
+      if (purgeDays !== undefined && purgeDays !== null) {
+        purged = await store.purgeDeleted!({ olderThanMs: Math.max(0, purgeDays) * 86400000 });
+      }
+      const report = await store.compact!();
+      const saved = report.bytesBefore - report.bytesAfter;
+      if (ctx.json) ctx.out(JSON.stringify({ ...report, purged }, null, 2));
+      else {
+        if (purged !== null) ctx.out(`purged: ${purged} tombstone(s)`);
+        ctx.out(`compacted: ${report.bytesBefore} -> ${report.bytesAfter} bytes (${saved >= 0 ? "-" : "+"}${Math.abs(saved)})`);
+      }
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
   if (which !== "info") {
-    ctx.err(`db: unknown subcommand "${which}" (expected: info)`);
+    ctx.err(`db: unknown subcommand "${which}" (expected: info | compact)`);
     return 2;
   }
   const explicit = flagString(a, "db");
@@ -680,6 +941,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdSupersede(runner, ctx, a);
       case "meta":
         return await cmdMeta(runner, ctx, a);
+      case "brief":
+        return await cmdBrief(runner, ctx, a);
+      case "knowledge":
+        return await cmdKnowledge(runner, ctx, a);
       case "stats":
         return await cmdStats(runner, ctx, a);
       case "decay":

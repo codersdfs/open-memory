@@ -395,3 +395,60 @@ describe("daemon restart", () => {
     expect(io.errors.join("\n")).toContain("npx tsx src/api/server.ts");
   });
 });
+
+describe("project memory CLI (ADR-0020/0021/0022)", () => {
+  const briefDir = mkdtempSync(path.join(os.tmpdir(), "ai-memory-cli-brief-"));
+  const briefDb = path.join(briefDir, "memory.db");
+
+  it("files a write under --project and prices the kind", () => {
+    const save = run(
+      ["save", "We decided to keep the console zero-dependency", "--kind", "decision", "--project", "memory", "--json"],
+      briefDb
+    );
+    expect(save.code).toBe(0);
+    const saved = JSON.parse(save.stdout) as { project: string | null; kind: string; importance: number };
+    expect(saved.project).toBe("memory");
+    expect(saved.kind).toBe("decision");
+    // An explicit kind supplies the importance nobody gave (ADR-0021).
+    expect(saved.importance).toBeCloseTo(0.8, 5);
+  });
+
+  it("prints a brief with durable rows first and no other project's memory", () => {
+    const saved = run(["save", "Always run npm run lint before committing", "--kind", "convention", "--project", "memory", "--json"], briefDb);
+    expect(saved.code).toBe(0);
+    const other = run(["save", "Always squash before merging", "--project", "other", "--json"], briefDb);
+    expect(other.code).toBe(0);
+
+    const brief = run(["brief", "--project", "memory", "--json"], briefDb);
+    expect(brief.code).toBe(0);
+    const parsed = JSON.parse(brief.stdout) as {
+      text: string;
+      project: string;
+      tokensUsed: number;
+      counts: Record<string, number>;
+    };
+    expect(parsed.project).toBe("memory");
+    expect(parsed.text.indexOf("[convention]")).toBeGreaterThanOrEqual(0);
+    expect(parsed.text).toContain("[decision");
+    expect(parsed.text.indexOf("[convention]")).toBeLessThan(parsed.text.indexOf("[decision"));
+    expect(parsed.text).not.toContain("squash");
+    expect(parsed.counts.conventions).toBe(1);
+    expect(parsed.counts.decisions).toBe(1);
+    expect(parsed.tokensUsed).toBeGreaterThan(0);
+    expect(parsed.tokensUsed).toBeLessThanOrEqual(600);
+  });
+
+  it("rejects a kind that is not one of the six", () => {
+    const r = run(["save", "something important", "--kind", "nonsense"], briefDb);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("--kind");
+  });
+
+  it("filters list by --kind and --project", () => {
+    const r = run(["list", "--kind", "convention", "--project", "memory", "--json"], briefDb);
+    expect(r.code).toBe(0);
+    const parsed = JSON.parse(r.stdout) as { memories: { kind: string; project: string | null }[] };
+    expect(parsed.memories.every((m) => m.kind === "convention" && m.project === "memory")).toBe(true);
+    expect(parsed.memories.length).toBe(1);
+  });
+});

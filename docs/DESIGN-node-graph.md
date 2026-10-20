@@ -2,6 +2,12 @@
 
 Status: v1 shipped — `src/core/graph.ts`, `/graph`, `/positions`, `src/ui/graph.{html,js}`. v2 (body wikilinks, `vault/` root, local graph, filters, colour groups) is planned in `wayfinder/tickets/012-task-vault-knowledge-graph.md`; that ticket supersedes the Open section below.
 
+> Cross-ref (ADR-0023, v0.7): links are now also *stored*, not only drawn. `knowledge sync`
+> writes each page's edges into `knowledge_links` (`to_id = NULL` for a dangling target), and
+> `GET /knowledge`, `GET /knowledge/:id` and `GET /knowledge/:id/neighbors` answer from the
+> database. The graph canvas described here still reads the files directly; both paths share
+> `parsePage`/`linkTarget`, so they cannot disagree about what a link is.
+
 ## Problem
 
 wiki/*.md pages are linked with [[wikilinks]] (plus local md links).

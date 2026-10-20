@@ -115,3 +115,9 @@ Order: D1 → D2 → D3 → D4/D5/D6/D7 → tests.
 - **seed** `vault/{index,graph-view}.md` + `vault/adr/vault-as-knowledge-root.md`; README graph bullet corrected.
 - **verified** `npm test` 201 passed (7 new graph cases); `tsc -p tsconfig.lint.json` exit 0; a real server served `/graph` with `folder`/`tags`/`file` per node and `/graph.html` 200.
 - **not verified** the browser surface past HTTP 200 — no UI harness in this repo; `/graph.html` needs one manual pass (click a node → local graph, filter, legend).
+
+### Re-verified (2026-10-13)
+
+- Nested fixture vault (`a.md` → `[[adr/b]]`, `adr/b.md` → `[[a]]`, plus a dot-directory to skip), run as `VAULT_DIR=/tmp/wv npx tsx scripts/wiki-links.ts`: `2 nodes · 1 edges · 0 dangling`, ids `a` and `adr/b`, the hidden directory ignored, no repo file touched.
+- `tests/graph.test.ts` still carries the D1 cases (body `[[links]]`, links ignored inside code spans and fences, cross-folder basename resolution). Full suite: 282 passed / 27 files.
+- The client-side clauses stay unverified as above: `src/ui/graph.js` has the toolbar, the `tag:`/`path:`/substring filter, `local` + depth BFS, folder colour groups with a `localStorage` override, and hover neighbour focus — but nothing in this repo exercises the canvas.

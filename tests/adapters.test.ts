@@ -24,7 +24,7 @@ import { cliEntryPath, mcpCommandSpec } from "../src/adapters/fs.js";
 
 let home: string;
 const saved: Record<string, string | undefined> = {};
-const ENV = ["HOME", "USERPROFILE", "CODEX_HOME", "PI_HOME", "DSH_HOME", "AI_MEMORY_AGENT", "AI_MEMORY_CLI", "AI_MEMORY_MCP_COMMAND"];
+const ENV = ["HOME", "USERPROFILE", "AI_MEMORY_HOME", "CODEX_HOME", "PI_HOME", "DSH_HOME", "AI_MEMORY_AGENT", "AI_MEMORY_CLI", "AI_MEMORY_MCP_COMMAND"];
 
 beforeEach(() => {
   home = mkdtempSync(path.join(os.tmpdir(), "ai-memory-adapters-"));
@@ -290,5 +290,155 @@ describe("agent CLI", () => {
     writeFileSync(path.join(home, ".claude.json"), "{}");
     expect(await runContextCommand(["refresh"], { json: true, write: true }, c2)).toBe(0);
     expect(existsSync(path.join(home, ".claude.json"))).toBe(true);
+  });
+});
+
+/**
+ * Declared agents — the answer to "my client is not one of the four".
+ *
+ * The property that matters is the same one the built-in adapters are held to: a
+ * client's config file survives link/unlink byte for byte apart from our entry.
+ */
+describe("declared agents (agents.json)", () => {
+  const clientFile = () => path.join(home, ".cursor", "mcp.json");
+  // The memory home is `~/.ai-memory`, so the declaration file sits one level in.
+  const specsFile = () => path.join(home, ".ai-memory", "agents.json");
+
+  function seedClient(file = clientFile()): void {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ mcpServers: { other: { command: "x" } }, theme: "dark" }, null, 2));
+  }
+
+  /** The memory home only exists once setup has run, so seed it by hand. */
+  function seedSpecs(raw: string): void {
+    mkdirSync(path.dirname(specsFile()), { recursive: true });
+    writeFileSync(specsFile(), raw);
+  }
+
+  it("adds, links, reports, unlinks and removes a client with no adapter class", async () => {
+    seedClient();
+    const file = clientFile();
+
+    // dry run: no declaration, no entry
+    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": file }, ctx())).toBe(0);
+    expect(existsSync(specsFile())).toBe(false);
+    expect(JSON.parse(readFileSync(file, "utf8")).mcpServers["ai-memory"]).toBeUndefined();
+
+    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": file, write: true }, ctx())).toBe(0);
+    const cfg = JSON.parse(readFileSync(file, "utf8"));
+    expect(cfg.mcpServers.other).toEqual({ command: "x" });
+    expect(cfg.theme).toBe("dark");
+    expect(cfg.mcpServers["ai-memory"].type).toBe("stdio");
+    expect(cfg.mcpServers["ai-memory"].env.AI_MEMORY_AGENT).toBe("cursor");
+    expect(cfg.mcpServers["ai-memory"].args).toEqual([process.env.AI_MEMORY_CLI, "mcp"]);
+    expect(JSON.parse(readFileSync(specsFile(), "utf8")).agents.cursor.mcpFile).toBe(file);
+
+    // the registry serves it, and says it is linked
+    expect(createRegistry().ids()).toContain("cursor");
+    const s = { ...ctx(), json: true };
+    expect(await runAgentCommand(["status"], { agent: "cursor" }, s)).toBe(0);
+    const rows = JSON.parse(s.lines.join("")) as { id: string; linked: boolean }[];
+    expect(rows.find((r) => r.id === "cursor")).toMatchObject({ linked: true });
+
+    // idempotent
+    const before = readFileSync(file, "utf8");
+    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": file, write: true }, ctx())).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe(before);
+
+    // unlink removes our entry and nothing else
+    expect(await runAgentCommand(["unlink"], { agent: "cursor", write: true }, ctx())).toBe(0);
+    const after = JSON.parse(readFileSync(file, "utf8"));
+    expect(after.mcpServers.other).toEqual({ command: "x" });
+    expect(after.mcpServers["ai-memory"]).toBeUndefined();
+    expect(after.theme).toBe("dark");
+
+    // remove drops the declaration; the registry forgets it
+    expect(await runAgentCommand(["remove", "cursor"], { write: true }, ctx())).toBe(0);
+    expect(createRegistry().ids()).not.toContain("cursor");
+    expect(JSON.parse(readFileSync(specsFile(), "utf8")).agents).toEqual({});
+  });
+
+  it("rejects a declaration with no config file", async () => {
+    const c = ctx();
+    expect(await runAgentCommand(["add", "cursor"], {}, c)).toBe(2);
+    expect(c.errs.join("\n")).toMatch(/--mcp-file/);
+    expect(existsSync(specsFile())).toBe(false);
+  });
+
+  it("refuses a built-in id instead of silently dropping its hooks", async () => {
+    seedClient();
+    const c = ctx();
+    expect(await runAgentCommand(["add", "claude"], { "mcp-file": clientFile(), write: true }, c)).toBe(2);
+    expect(c.errs.join("\n")).toMatch(/built-in adapter/);
+    expect(existsSync(specsFile())).toBe(false);
+    expect(JSON.parse(readFileSync(clientFile(), "utf8")).mcpServers["ai-memory"]).toBeUndefined();
+
+    // A hand-edited collision is refused at load too, and doctor names it rather than
+    // letting a declaration quietly do less than the adapter it replaced.
+    mkdirSync(path.dirname(process.env.AI_MEMORY_CLI!), { recursive: true });
+    writeFileSync(process.env.AI_MEMORY_CLI!, "// stub\n");
+    seedSpecs(JSON.stringify({ agents: { claude: { mcpFile: clientFile() } } }));
+    expect(createRegistry().get("claude")).toBeInstanceOf(ClaudeAdapter);
+    expect(createRegistry().ids().sort()).toEqual(["claude", "codex", "dsh", "pi"]);
+
+    const d = ctx();
+    expect(await runAgentCommand(["doctor"], {}, d)).toBe(1);
+    expect(d.lines.join("\n")).toMatch(/built-in id\(s\) ignored — claude/);
+
+    // The escape hatch: the declaration is still removable by hand.
+    expect(await runAgentCommand(["remove", "claude"], { write: true }, ctx())).toBe(0);
+    expect(await runAgentCommand(["doctor"], {}, ctx())).toBe(0);
+  });
+
+  it("honours a hand-written declaration with an instructions file", async () => {
+    seedClient();
+    const rules = path.join(home, "RULES.md");
+    writeFileSync(rules, "# House rules\n\nBe terse.\n");
+    seedSpecs(JSON.stringify({ agents: { zed: { mcpFile: clientFile(), instructions: rules } } }));
+
+    expect(createRegistry().get("zed")).toBeTruthy();
+    expect(await runAgentCommand(["link"], { agent: "zed", write: true }, ctx())).toBe(0);
+
+    const cfg = JSON.parse(readFileSync(clientFile(), "utf8"));
+    expect(cfg.mcpServers["ai-memory"].env.AI_MEMORY_AGENT).toBe("zed");
+    const written = readFileSync(rules, "utf8");
+    expect(written).toContain("Be terse.");
+    expect(written).toContain("ai-memory:begin");
+
+    expect(await runAgentCommand(["unlink"], { agent: "zed", write: true }, ctx())).toBe(0);
+    const stripped = readFileSync(rules, "utf8");
+    expect(stripped).toContain("Be terse.");
+    expect(stripped).not.toContain("ai-memory:begin");
+  });
+
+  it("edits a TOML client section-wise", async () => {
+    const file = path.join(home, "client.toml");
+    writeFileSync(file, 'approval = "never"\n\n[history]\npersistence = "save-all"\n');
+
+    expect(await runAgentCommand(["add", "tomlclient"], { "mcp-file": file, format: "toml", write: true }, ctx())).toBe(0);
+    const written = readFileSync(file, "utf8");
+    expect(written).toContain("[mcp_servers.ai-memory]");
+    expect(written).toContain("[mcp_servers.ai-memory.env]");
+    expect(written).toContain('approval = "never"');
+    expect(written).toContain("[history]");
+
+    expect(await runAgentCommand(["unlink"], { agent: "tomlclient", write: true }, ctx())).toBe(0);
+    const stripped = readFileSync(file, "utf8");
+    expect(stripped).not.toContain("ai-memory");
+    expect(stripped).toContain('approval = "never"');
+  });
+
+  it("ignores a broken declaration file instead of failing the whole command", async () => {
+    seedSpecs("{ oops");
+    const c = ctx();
+    expect(await runAgentCommand(["list"], {}, c)).toBe(0);
+    expect(c.lines.join("\n")).toContain("claude");
+    expect(createRegistry().ids()).toEqual(["claude", "codex", "dsh", "pi"]);
+
+    // and refuses to write over it
+    const c2 = ctx();
+    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": clientFile(), write: true }, c2)).toBe(1);
+    expect(c2.errs.join("\n")).toMatch(/refusing to rewrite/);
+    expect(readFileSync(specsFile(), "utf8")).toBe("{ oops");
   });
 });

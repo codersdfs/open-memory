@@ -4,6 +4,8 @@ import { buildServer } from "../src/api/server.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import { unwrapMemory } from "../src/cli/http.js";
+import { resolveWriteKey } from "../src/core/scope.js";
 
 describe("api", () => {
   let base = "";
@@ -19,6 +21,39 @@ describe("api", () => {
   afterAll(async () => { await close(); });
 
   const post = (p: string, body: unknown) => fetch(base + p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  it("a scoped write lands in the caller's layer, not the legacy default", async () => {
+    const expected = resolveWriteKey({ agent: "tester", scope: "shared" });
+    const res = await post("/memories", { agent: "tester", scope: "shared", type: "semantic", text: "a scoped write stays in the shared layer" });
+    const body = (await res.json()) as { namespace: string };
+    expect(body.namespace).toBe(expected);
+    // and it is not the legacy partition the route used to force
+    expect(body.namespace).not.toBe("default:default");
+  });
+
+  it("a scoped read finds what a scoped write stored", async () => {
+    const text = "the private note is readable back over the daemon";
+    await post("/memories", { agent: "tester", scope: "private", type: "semantic", text });
+    const qs = new URLSearchParams({ query: text, agent: "tester", scope: "private" });
+    const res = await fetch(`${base}/memories/search?${qs.toString()}`);
+    const body = (await res.json()) as { memories: { text: string }[] };
+    expect(body.memories.map((m) => m.text)).toContain(text);
+  });
+
+  it("supersede over the daemon keeps the partition it replaces", async () => {
+    const created = (await (await post("/memories", { namespace: "test:reg", type: "semantic", text: "the older note about partitions" })).json()) as { id: string };
+    const res = await post(`/memories/${created.id}/supersede`, { type: "semantic", text: "the newer note about partitions" });
+    expect(((await res.json()) as { namespace: string }).namespace).toBe("test:reg");
+  });
+
+  it("answers a write and a get with the bare memory, the shape the MCP client unwraps", async () => {
+    const created = (await (await post("/memories", { namespace: "test:reg", type: "semantic", text: "shape check" })).json()) as Record<string, unknown>;
+    expect(created.memory).toBeUndefined();
+    expect(typeof created.id).toBe("string");
+    const got = (await (await fetch(`${base}/memories/${String(created.id)}`)).json()) as Record<string, unknown>;
+    expect(got.memory).toBeUndefined();
+    expect(unwrapMemory<{ id: string }>(got).id).toBe(created.id);
+  });
 
   it("POST /memories and POST /memories/search", async () => {
     const createRes = await post("/memories", { namespace: "test:1", type: "semantic", text: "user lives in Berlin", importance: 0.9 });

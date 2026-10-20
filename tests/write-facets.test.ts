@@ -28,13 +28,44 @@ describe("deriveFacets", () => {
     expect(deriveFacets("shipped on 2026/10/18 with and/or CI/CD")).toEqual([]);
   });
 
+  it("derives an entity from a Chinese title", () => {
+    expect(deriveFacets("读了《深入理解计算机系统》第三章")).toContain("entity:深入理解计算机系统");
+  });
+
+  it("derives entities from CamelCase and acronyms, and ignores a shouted line", () => {
+    expect(deriveFacets("RustDesk connects to the box")).toContain("entity:rustdesk");
+    expect(deriveFacets("the MCP server starts on boot")).toContain("entity:mcp");
+    // All-caps English is words before it is an acronym; a shouting line would otherwise
+    // mint one entity per word.
+    expect(deriveFacets("I WANT TO SHIP THIS")).toEqual([]);
+  });
+
+  it("derives a topic from a known domain noun", () => {
+    expect(deriveFacets("sqlite stores the vectors as JSON")).toContain("topic:sqlite");
+  });
+
+  it("derives a topic from a word the sentence repeats", () => {
+    expect(deriveFacets("rustdesk is installed, and rustdesk starts on boot")).toEqual(["topic:rustdesk"]);
+  });
+
+  it("does not reuse an entity value as a topic", () => {
+    // `memoryService` is the name of the thing; it is not also its subject.
+    expect(deriveFacets("the `memoryService` writes rows").filter((t) => t.startsWith("topic:"))).toEqual([]);
+  });
+
   it("keeps the inherited facet even when the new row fills the tag list", () => {
     const many = Array.from({ length: MAX_TAGS }, (_, i) => `unofficial${i}`);
     expect(inheritFacets(["entity:pnpm"], many)).toContain("entity:pnpm");
   });
 
   it("derives nothing from a plain sentence", () => {
-    expect(deriveFacets("use pnpm for every install")).toEqual([]);
+    expect(deriveFacets("edited the file")).toEqual([]);
+  });
+
+  it("is deterministic", () => {
+    const text = "frank prefers pnpm; RustDesk 连着《设计文档》";
+    expect(deriveFacets(text)).toEqual(deriveFacets(text));
+    expect(deriveFacets(text)).toEqual(["entity:设计文档", "entity:rustdesk", "topic:pnpm"]);
   });
 });
 

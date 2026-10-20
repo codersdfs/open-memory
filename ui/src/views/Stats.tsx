@@ -22,7 +22,8 @@ import { absTime, bytes, relTime, score3, truncate } from '../lib/format';
  * mirrors src/core/lifecycle/decay.ts).
  */
 
-const PREDICATES = 'episodic older than 90 days with importance <= 0.3; working older than 7 days';
+const PREDICATES =
+  'archive: never retrieved, older than 30 days, importance < 0.6 (status change only); hard prune (opt-in): episodic older than 90 days with importance and strength <= 0.5, working older than 7 days';
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -554,7 +555,7 @@ export default function StatsView({ namespace }: { namespace: string }) {
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [decaying, setDecaying] = useState(false);
-  const [pruned, setPruned] = useState<number | null>(null);
+  const [decayResult, setDecayResult] = useState<{ archived: number; pruned: number; affected: number } | null>(null);
   const [decayError, setDecayError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -585,7 +586,7 @@ export default function StatsView({ namespace }: { namespace: string }) {
     api
       .decay()
       .then((r) => {
-        setPruned(r.pruned);
+        setDecayResult(r);
         setConfirmOpen(false);
         setNonce((n) => n + 1);
       })
@@ -647,6 +648,19 @@ export default function StatsView({ namespace }: { namespace: string }) {
       header: 'type',
       width: '1%',
       render: (row) => <span style={{ fontSize: 11, color: 'var(--fg)' }}>{row.type}</span>,
+    },
+    {
+      key: 'action',
+      header: 'action',
+      width: '1%',
+      render: (row) => (
+        <span
+          title={row.action === 'archive' ? 'reversible: status becomes archived' : 'opt-in hard pass: soft-deletes the row'}
+          style={{ fontSize: 11, color: row.action === 'archive' ? 'var(--dim)' : 'var(--danger)' }}
+        >
+          {row.action}
+        </span>
+      ),
     },
     {
       key: 'created',
@@ -738,7 +752,7 @@ export default function StatsView({ namespace }: { namespace: string }) {
             disabled={decaying}
             style={{ opacity: decaying ? 0.5 : 1, cursor: decaying ? 'not-allowed' : 'pointer' }}
             onClick={() => {
-              setPruned(null);
+              setDecayResult(null);
               setDecayError(null);
               setConfirmOpen(true);
             }}
@@ -747,9 +761,10 @@ export default function StatsView({ namespace }: { namespace: string }) {
           </button>
         }
       >
-        {pruned !== null ? (
+        {decayResult !== null ? (
           <div className="hairline" style={{ marginBottom: 12, padding: '7px 9px', fontSize: 11, color: 'var(--fg)' }}>
-            pruned <span className="mono">{pruned}</span> row{pruned === 1 ? '' : 's'}.
+            archived <span className="mono">{decayResult.archived}</span>, pruned{' '}
+            <span className="mono">{decayResult.pruned}</span> row{decayResult.affected === 1 ? '' : 's'}.
           </div>
         ) : null}
         {decayError !== null ? (
@@ -766,8 +781,8 @@ export default function StatsView({ namespace }: { namespace: string }) {
           rowKey={(row) => row.id}
           empty={
             <Empty
-              title="nothing to prune"
-              body="no row matches the decay predicates right now — nothing here is both old and weak."
+              title="nothing to archive"
+              body="no row matches the decay predicates right now — nothing here is both old, never retrieved and weak."
             />
           }
         />
@@ -776,24 +791,25 @@ export default function StatsView({ namespace }: { namespace: string }) {
       <Confirm
         open={confirmOpen}
         danger
-        title="prune decay candidates?"
-        confirmLabel={decaying ? 'pruning…' : 'prune'}
+        title="run decay?"
+        confirmLabel={decaying ? 'running…' : 'run decay'}
         disabled={decaying}
         onCancel={() => setConfirmOpen(false)}
         onConfirm={runDecay}
         body={
           <>
             <div>
-              this would prune <span className="mono">{candidates.length}</span> row
-              {candidates.length === 1 ? '' : 's'} matching:
+              this would affect <span className="mono">{candidates.length}</span> row
+              {candidates.length === 1 ? '' : 's'} in this preview:
             </div>
             <div className="mono" style={{ marginTop: 6, fontSize: 11, color: 'var(--dim)' }}>
               {PREDICATES}
             </div>
             {/* The preview is the current partition; POST /decay takes no namespace and
-                prunes the whole store, so the number it returns can be larger. */}
+                affects the whole store, so the number it returns can be larger. */}
             <div style={{ marginTop: 6, fontSize: 11, color: 'var(--faint)', lineHeight: 1.6 }}>
-              the count is the {stats.namespace} partition; the prune itself runs across every partition.
+              the count is the {stats.namespace} partition; the decay run itself works across every partition,
+              archiving by default and only deleting in the opt-in hard pass.
             </div>
           </>
         }

@@ -5,6 +5,11 @@ dist/
 *.db-shm
 test-*.db*
 .env
+# A copy of .env under any other name (`.env.bak`, `.env.local`, `.env.old`) is still a
+# copy of every key in it: `.env` alone matched nothing else, and a `git add -A` would
+# have committed a live NIM and JEV key. `.env.example` stays tracked on purpose.
+.env*
+!.env.example
 
 # local tooling state, not project source
 _asar/
@@ -19,6 +24,13 @@ vault/
 rea-usage.md
 _vfy.sh
 _wslsetup.sh
+
+# Personal working notes for this machine only — network identifiers, tailnet names,
+# local tooling decisions. Present but not versioned.
+.promotions.json
+agent-integration-plan.md
+context-diet-plan.md
+remote-pc-herdr.md
 
 # the console's toolchain: dev-only, never published (ADR-0007/0008)
 ui/node_modules/

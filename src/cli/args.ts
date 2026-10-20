@@ -88,6 +88,8 @@ const REQUIRES_VALUE = new Set([
   "source",
   "status",
   "pin",
+  "kind",
+  "project",
   "mode",
   "query",
   "from",
@@ -98,10 +100,16 @@ const REQUIRES_VALUE = new Set([
   "name",
   "url",
   "target",
-  "format"
+  "format",
+  "mcp-file",
+  "json-path",
+  "env",
+  "instructions",
+  "dir",
+  "depth"
 ]);
 
-const BOOLEAN_FLAGS = new Set(["json", "write", "dry-run", "all", "help", "version", "no-daemon", "force", "quiet", "verbose", "yes"]);
+const BOOLEAN_FLAGS = new Set(["json", "write", "dry-run", "all", "help", "version", "no-daemon", "force", "quiet", "verbose", "yes", "link"]);
 
 export function flagString(a: ParsedArgs, name: string): string | undefined {
   const v = a.flags[name];

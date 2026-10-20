@@ -169,9 +169,12 @@ describe("request scope (query params / CLI flags / MCP args)", () => {
     expect(r.scopes).toEqual(["shared"]);
   });
 
-  it("all:true sweeps both layers for the current user", () => {
+  it("all:true sweeps every partition the user owns, legacy included", () => {
     const r = resolveRequestScope({ agent: "dsh", all: true });
-    expect(r.namespaces).toHaveLength(2);
+    // private + shared + the v0.2.0 legacy partition. Without the last one `--all`
+    // covered LESS than a plain request, which already fans out over the legacy family.
+    expect(r.namespaces).toHaveLength(3);
+    expect(r.namespaces).toContain(LEGACY_NAMESPACE);
     expect(r.scopes).toEqual(["private", "shared"]);
   });
 

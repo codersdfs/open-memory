@@ -1,9 +1,10 @@
 import type { EmbeddingProvider } from "../embedding/provider.js";
 import type { VectorStore } from "../store/interface.js";
 import type { Memory, ScoreBreakdown, SearchOptions, SearchResult, SearchResultItem } from "../types.js";
-import { bm25Score } from "./bm25.js";
+import { bm25Score, tokenize, type Bm25CorpusStats } from "./bm25.js";
+import { assembleFragment } from "./assemble.js";
 import { mmr } from "./mmr.js";
-import { countTokens, budgetEnforce } from "./tokens.js";
+import { budgetEnforce } from "./tokens.js";
 import { LEGACY_NAMESPACE } from "../scope.js";
 
 /**
@@ -36,6 +37,8 @@ export class HybridRetriever {
   private mmrLambda: number;
   /** How far the best vector hit must lead its partition's median cosine to count. */
   private semanticMargin: number;
+  /** Read-time projection of long memories onto their matching lines (ADR-0014). */
+  private assembleEnabled: boolean;
   constructor(
     private store: VectorStore,
     private embedder: EmbeddingProvider,
@@ -66,6 +69,9 @@ export class HybridRetriever {
     // with no shared words, lower it to reach further.
     const margin = Number(process.env.MEMORY_SEMANTIC_MARGIN ?? 0.2);
     this.semanticMargin = Number.isFinite(margin) ? margin : 0.2;
+    // Rollback for the read-time projection, same shape as MEMORY_RECONCILE=off:
+    // `off` returns whole memories exactly as v0.3 did. It is also the A/B arm.
+    this.assembleEnabled = process.env.MEMORY_ASSEMBLE !== "off";
   }
 
   /**
@@ -92,13 +98,74 @@ export class HybridRetriever {
       includeDeleted: opts.includeDeleted ?? false,
       status: opts.status,
       includeArchived: opts.includeArchived,
-      includeDraft: opts.includeDraft
+      includeDraft: opts.includeDraft,
+      project: opts.project,
+      kind: opts.kind,
+      knowledge: opts.knowledge
     });
+
+    // v0.4 candidate union (ADR-0012). Until now the only way into `scored` was
+    // this vector list, and BM25 only re-ranked what the embedding had already
+    // chosen — so a row with the query's exact words could never come back if
+    // its cosine fell outside the top-20. Measured on a real 295-row partition:
+    // 32.5% of targets sat outside the vector top-20 and recall@5 *equalled*
+    // P(target in vector top-20) exactly; joining lexical candidates recovered
+    // 65.0% -> 95.0% recall@5 (CJK queries 7.5% -> 100%, because the hash
+    // embedder tokenizes on [^a-z0-9]+ and scores Chinese at random). The union
+    // is bounded on purpose: merging every query term's candidates instead of
+    // the top-`overFetch` dropped recall back to 82.1%, because the extra
+    // candidates crowded real matches out of the budget.
+    const lexicalHits = this.store.lexicalCandidates
+      ? await this.store.lexicalCandidates({
+          namespace,
+          query: opts.query,
+          limit: overFetch,
+          type: opts.type,
+          includeDeleted: opts.includeDeleted ?? false,
+          status: opts.status,
+          includeArchived: opts.includeArchived,
+          includeDraft: opts.includeDraft,
+          project: opts.project,
+          kind: opts.kind,
+          knowledge: opts.knowledge
+        })
+      : [];
+    const candidates = new Map<string, { memory: Memory; vectorScore: number }>();
+    for (const hit of vectorHits) candidates.set(hit.memory.id, hit);
+    for (const hit of lexicalHits) {
+      // A row only the words found gets vectorScore 0: it still has to clear the
+      // same relevance gate, so being lexically plausible is not a free pass.
+      if (!candidates.has(hit.memory.id)) {
+        candidates.set(hit.memory.id, { memory: hit.memory, vectorScore: 0 });
+      }
+    }
+
+    // BM25 corpus statistics for this candidate set, not for an imagined corpus
+    // of one-sentence memories. The hardcoded avgLen of 20 tokens in bm25.ts was
+    // calibrated on short rows; against 1,200-character session chunks (~275
+    // tokens) the length penalty divided every term by ~14 and BM25 collapsed to
+    // ~0.01 on rows holding the query verbatim — which is how exact-match
+    // evidence failed the relevance gate. df likewise makes a rare term decisive.
+    const queryTokens = new Set(tokenize(opts.query));
+    let totalDocLen = 0;
+    const df = new Map<string, number>();
+    for (const { memory } of candidates.values()) {
+      const terms = tokenize(memory.text);
+      totalDocLen += terms.length;
+      for (const term of new Set(terms)) {
+        if (queryTokens.has(term)) df.set(term, (df.get(term) ?? 0) + 1);
+      }
+    }
+    const stats: Bm25CorpusStats = {
+      avgLen: candidates.size > 0 ? totalDocLen / candidates.size : 20,
+      docs: candidates.size,
+      df
+    };
 
     // enrich with BM25 + recency + importance + pin boost (ADR-0006)
     const now = Date.now();
-    const scored: Scored[] = vectorHits.map(({ memory, vectorScore }) => {
-      const b = bm25Score(opts.query, memory.text);
+    const scored: Scored[] = [...candidates.values()].map(({ memory, vectorScore }) => {
+      const b = bm25Score(opts.query, memory.text, stats);
       const ageDays = (now - memory.createdAt) / (1000 * 60 * 60 * 24);
       const recencyScore = Math.exp(-ageDays / this.halfLifeDays);
       const strengthScore = memory.strength;
@@ -140,7 +207,16 @@ export class HybridRetriever {
     // embedder is real: the hash cosine is ~0.9 to everything, so it can lead nothing.
     let semanticTopId: string | null = null;
     if (this.weights.vector > 0 && vectorHits.length > 0) {
-      const spread = await this.store.cosineSpread({ namespace, queryEmbedding });
+      const spread = await this.store.cosineSpread({
+        namespace,
+        queryEmbedding,
+        project: opts.project,
+        kind: opts.kind,
+        // The semantic gate compares a query against the population it is being
+        // ranked in, so a knowledge-only search must take its median from
+        // knowledge rows only, or the margin measures the wrong corpus.
+        knowledge: opts.knowledge
+      });
       const best = vectorHits[0]!;
       if (best.vectorScore - spread.median >= this.semanticMargin) semanticTopId = best.memory.id;
     }
@@ -192,6 +268,13 @@ export class HybridRetriever {
    */
   async search(opts: SearchOptions): Promise<SearchResult> {
     const budgetTokens = opts.budgetTokens ?? 800;
+    // v0.4: k is a real cap, not just an over-fetch hint. It used to reach only
+    // `overFetch`, so the token budget alone decided the result size — measured on
+    // a real bench run, 148 of 152 queries came back with 2-3 blocks for k=5 and
+    // the median system_tokens was 620 of an 800 budget. The caller asked for five
+    // and got whatever happened to fit. k now trims after the budget, so a large k
+    // can never overrun the token cap and a small k is actually respected.
+    const k = Math.max(1, opts.k ?? 5);
     const partitions = (opts.namespaces && opts.namespaces.length > 0 ? opts.namespaces : [opts.namespace]).filter(
       (n): n is string => typeof n === "string" && n.length > 0
     );
@@ -231,12 +314,16 @@ export class HybridRetriever {
           _orig: Scored;
         }
     );
+    // MMR order is the order. Re-sorting here by score undid Stage 2: the near-duplicate
+    // that MMR demoted went straight back above the diverse pick, so the budget cut it off.
     const diversified = mmr(mmrInput as never[], this.mmrLambda).map((m: unknown) => (m as { _orig: Scored })._orig);
 
-    // sort by score desc before budget
-    diversified.sort((a, b) => b.score - a.score);
-
-    // Hard budget enforcement
+    // Hard budget enforcement. A row that fits whole is kept whole; only a row
+    // that does not fit is projected (ADR-0014), because the projection is lossy:
+    // measured on the benchmark, projecting *every* long memory cost evidence
+    // coverage (any-gold 61.8% → 56.6%, single-hop 55/70 → 43/70) — the gold turn
+    // is not always the line that overlaps the question most. Projecting only into
+    // leftover space cannot lose a row that already fit.
     const budgetInput = diversified.map((s) => ({
       id: s.memory.id,
       score: s.score,
@@ -246,24 +333,39 @@ export class HybridRetriever {
 
     // Need to keep mapping to full memory fields; budgetEnforce expects text+score
     const withBudget = budgetEnforce(
-      budgetInput.map((b) => ({ ...b, text: b.text, score: b.score })),
-      budgetTokens
+      budgetInput,
+      budgetTokens,
+      this.assembleEnabled
+        ? {
+            project: (text, maxTokens) => {
+              const projected = assembleFragment(text, { query: opts.query, maxTokens });
+              return projected.trimmed ? projected.text : null;
+            }
+          }
+        : {}
     );
 
-    // Reconstruct SearchResultItem with token counts and scores
+    // Reconstruct SearchResultItem with token counts and scores. `k` applies here,
+    // after the budget: both limits must hold, and neither may be silently ignored.
+    const limited = withBudget.kept.slice(0, k);
     const kept = new Map(diversified.map((s) => [s.memory.id, s]));
-    const memories: SearchResultItem[] = withBudget.kept
+    const memories: SearchResultItem[] = limited
       .map((m) => {
         const s = kept.get(m.id);
         if (!s) return null;
         return {
           ...s.memory,
+          // What the caller will actually read: projected to the matching lines and
+          // possibly clipped by the budget, not the whole stored row.
+          text: m.text,
           ...(opts.explain ? { explain: s.breakdown } : {}),
           score: s.score,
           vectorScore: s.vectorScore,
           bm25Score: s.bm25Score,
           recencyScore: s.recencyScore,
-          tokens: countTokens(s.memory.text)
+          // The row may have been clipped by the budget, so report what will
+          // actually be read rather than the cost of the full text.
+          tokens: m.tokens
         } satisfies SearchResultItem;
       })
       .filter((m): m is SearchResultItem => m !== null);
@@ -282,8 +384,10 @@ export class HybridRetriever {
 
     return {
       memories,
-      tokensUsed: withBudget.tokensUsed,
-      truncated: withBudget.truncated,
+      // Sum of what the caller receives, not of what the budget considered: the
+      // k-trim happens after accounting and would otherwise overstate cost.
+      tokensUsed: memories.reduce((sum, m) => sum + m.tokens, 0),
+      truncated: withBudget.truncated || limited.length < withBudget.kept.length,
       summary: withBudget.summary,
       agent: opts.agent,
       scopes: uniquePartitions

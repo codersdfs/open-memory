@@ -1,0 +1,18 @@
+# ADR-0022: The brief is a query the agent does not have to ask
+
+- **Status:** Accepted (2026-10-19) — direction B. `memory_brief` (MCP), `GET|POST /brief`, `ai-memory brief`, and the no-query path of the auto-injection hook.
+- **Options:** keep "the agent must search" vs **assemble a deterministic project brief on demand** (chosen) vs an LLM-summarised context vs inject the top-N search results for a synthetic query like "project context".
+- **Why not a synthetic query:** a query *ranks*; it answers "which rows are most similar to these words". A session that starts with no question needs the opposite: **coverage** — every durable convention, every decision still standing, every gotcha already paid for, in a stable order. Searching for "project context" returns the rows that share those words, which is a different set every time the wording changes, and it cannot promise that a decision is in there at all.
+- **Why fixed sections:** conventions → decisions → gotchas → open tasks → recent events. The order is the cost of rediscovery: a convention you break causes a review comment, a decision re-litigated costs a meeting, a gotcha re-hit costs an afternoon, an open task is today, a recent event is context. Unused shares pass down, so a project with no gotchas spends that space on decisions rather than returning a short brief.
+- **Budget:** 600 tokens by default (caller-settable), split 0.25 / 0.30 / 0.20 / 0.15 / 0.10. Section shares bound the item text; because the rendered block is prepended to a prompt, `assembleBrief` then trims the last item of the last non-empty section until the *rendered* count fits the cap and sets `truncated`. A brief that overshoots its own budget is a bug that charges the agent twice.
+- **Deterministic on purpose:** same store + same `now` → byte-identical text, so it can be diffed, cached and tested. Ranking is `importance → strength → createdAt → id` for conventions/gotchas and `strength → createdAt → id` for decisions/open/recent; the id tiebreak is what makes the order stable when two rows look identical, and identical rows (same normalized text) are de-duplicated with the stronger one keeping its place.
+- **`recent` is deliberately type-shaped:** only `episodic` rows from the last 7 days with `importance >= 0.5`, because a decision written today already appears above and re-listing it would spend the newest-section budget on a duplicate.
+- **No LLM, no cost, no key:** same constraint as ADR-0002. The brief is a `list` with a project filter and five orderings; the model reads it, it does not write it.
+- **Not a substitute for search:** the brief carries the rows whose *kind* makes them durable, not the row that answers the current question. `memory_search` / `memory_brief` are complementary: the hook injects the brief when the turn has no query and a search when it does.
+
+## Consequences
+
+- `assembleBrief(store, input)` lives in `src/core/retrieval/brief.ts`; `MemoryService.brief` resolves namespaces exactly like `search` (own partition + `shared` + `default:default`), so a convention written through the shared layer reaches every agent.
+- The auto-injection hook uses the brief only when the brief has at least one item; otherwise it falls back to the old wide search, so a store that has not yet been written with kinds does not lose its pinned context.
+- Cost: five bounded `list` calls (`FETCH_LIMIT = 80` rows per section per partition) instead of one search — measured in the tens of milliseconds on a 300-row store.
+- `tests/project-memory.test.ts` pins the section order, the budget clamp, the byte-identical repetition, the supersede case and the project filter.

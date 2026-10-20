@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import { STATUSES } from "../src/core/types.js";
 
 function freshService() {
   return new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider() });
@@ -11,6 +12,22 @@ describe("store", () => {
   let svc: MemoryService;
   beforeEach(async () => { svc = freshService(); await svc.init(); });
   afterEach(() => { try { svc.close(); } catch {} });
+
+  // The advertised statuses and the schema are one set: `superseded` sat in STATUSES while
+  // the CHECK rejected it, so the console dropdown and `meta --status superseded` failed at
+  // the row. This fails the moment the two drift apart again.
+  it("stores every advertised status — STATUSES and the CHECK constraint agree", async () => {
+    const sqlite = new MemoryService({ dbPath: ":memory:" });
+    await sqlite.init();
+    try {
+      for (const status of STATUSES) {
+        const saved = await sqlite.save({ namespace: "a:1", type: "semantic", text: `a row whose status is ${status}` });
+        await expect(sqlite.updateMeta(saved.id, { status })).resolves.toBeTruthy();
+      }
+    } finally {
+      try { sqlite.close(); } catch {}
+    }
+  });
 
   it("saves and retrieves by namespace", async () => {
     await svc.save({ namespace: "a:1", type: "semantic", text: "user lives in Berlin" });

@@ -118,3 +118,14 @@ ADR-0009 → `settings.ts` + merged construction (+ tests) → `byVectorDim` (+ 
 - **A migration is not atomic.** An interrupt leaves mixed widths — safe (skipped rows are skipped, not fatal) but degraded, and that is exactly why `unreadableRows` stays visible until the count is zero rather than being cleared by a successful *start*.
 - **`settings.json` is a new write path into the user's home.** Tolerant read, whitelist, temp+rename, no keys — the four rules are the whole defence, and `tests/settings.test.ts` is what keeps them from drifting.
 - **Remote embedding is a real spend.** The dry-run count is the only thing between a click and N API calls, so it is mandatory on the confirm screen, never "~N".
+
+---
+
+## Done (2026-10-13)
+
+- **D1** `byVectorDim` counts every width instead of trusting the first row (`src/core/stats.ts`), and `storedDim()` is untouched. `console-api.test.ts:118` asserts the default `/stats` shape is unchanged and `:267` that `byVectorDim` appears only under `full=1`.
+- **D2** `src/core/settings.ts`: whitelist of `SETTING_KEYS`, tolerant read, atomic write (temp + rename), unknown/secret-shaped keys refused; precedence real env > `settings.json` > default merged at the two construction sites. `tests/settings.test.ts` covers the four file rules.
+- **D3/D4** `GET|POST /embedding` plus `/embedding/reembed` in `src/api/server.ts`. The 400s are the factory's own message (`:297` unknown provider, `:305`/`:311` missing key env var), a key the environment already sets is refused with the shadowed list (`GET` reports the same list), `needsRestart` is measured against the live embedder, and no file is written on a failed validation. Reembed dry-run vs real run vs idempotent retry: `:364`.
+- **Panel** `ui/src/views/Stats.tsx` renders live provider/model/dim/source, the presets read from the factory, the env-var names each provider needs (presence only, never a value), `shadowed`, `needsRestart` and the unreadable-row count.
+- **Verified** `npm test` 282 passed / 27 files; `npm run lint` exit 0; `npm --prefix ui run typecheck` exit 0; `npm run ui:build` exit 0; `npm run build` exit 0.
+- **Not verified** the manual migration path on this machine: only `hash` is configured (no NIM/OpenAI key), so the `needsRestart: true` → restart refused by `init()` → reembed → every row unreadable → restart → `unreadableRows: 0` sequence was not walked end to end.

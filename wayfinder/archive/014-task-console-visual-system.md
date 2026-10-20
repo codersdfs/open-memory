@@ -104,3 +104,12 @@ ADR-0008 → `ui/` shell + tokens + proxy + router → Recall → Memories + gov
 - **Two toolchains, one CI.** Root `npm ci` no longer installs everything needed to run the project end to end; the CI step is the mitigation, and `npm pack` from a laptop that never installed `ui/` deps is the hole that remains.
 - **A framed graph that ignores `?theme=`** is a silent dark box in the light theme — one string in, one `if` in `graph.js`, no second source of colour.
 - **pi's `.jsonl` is a format we do not own.** Contained in `src/core/sessions.ts` (013 D6), unchanged by this ticket.
+
+---
+
+## Done (2026-10-13)
+
+- **One UI.** `/` and `/app` both serve `dist/src/ui-next`, asserted by `tests/console-api.test.ts:131` ("serves the console at / and /app, and never a stale inspector page"). `src/ui/{index.html,app.js,style.css}` are gone and nothing in the repo links them (grep for the three names: no hits outside `ui/dist`).
+- **Shell and views** `ui/src/{App.tsx,router.tsx,theme.ts}` + `views/{Recall,Memories,Sessions,Graph,Stats}.tsx`; D1 two token sets (Vantablack default, Paper) from one set of custom properties with the three-state control; D2 no CDN — `ui/index.html` and `ui/src` contain no `cdn.` and no `https://` URL, fonts are system stacks; D5 `GET /namespaces` (`console-api.test.ts:173`); D6 `/` in Memories and Recall, `j`/`k` in `ui/src/components/DataTable.tsx:132`, `Esc` on the drawers, `⌘`+`↵` in Recall; D9 the graph is framed, passes `?theme=` and follows live theme changes over the `om-theme` postMessage (`src/ui/graph.js:24,34`); D10 view/query/filters live in the hash (`ui/src/router.tsx`); D11 no token-savings chart and no fabricated latency.
+- **Verified** `npm test` 282 passed / 27 files (includes `ui/src/lib/{score,supersede,format}.test.ts`); `npm run lint` exit 0; `npm --prefix ui run typecheck` exit 0; `npm run ui:build` exit 0; `npm run build` exit 0; `npm pack --dry-run` lists `dist/src/ui-next/index.html`; with `ui/dist` moved away, `npm run build` still exits 0 and prints `ui/dist absent — run: npm run ui:build (shipping no console)`, so the package build never depends on the UI dev deps.
+- **Not verified** the manual browser pass: both themes on every view, the `0.72` → `0.35` preset changing the hit count on one query, a create → pin → status → supersede → soft-delete → restore round-trip on the real store, and a real session from `~/.pi/agent/sessions`. No UI harness in this repo, same gap 012 records.

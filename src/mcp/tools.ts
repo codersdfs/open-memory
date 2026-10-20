@@ -1,5 +1,5 @@
 import type { MemoryService } from "../core/memoryService.js";
-import type { Memory, MemoryType, SearchResult } from "../core/types.js";
+import type { Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import { stripEmbedding } from "../core/types.js";
 import { resolveAgent, resolveRequestScope, resolveWriteKey, type MemoryScope } from "../core/scope.js";
 
@@ -40,6 +40,18 @@ const SCOPE_PROP = {
 
 const TYPE_PROP = { type: "string", enum: ["episodic", "semantic", "procedural", "working"] };
 
+const KIND_PROP = {
+  type: "string",
+  enum: ["decision", "convention", "gotcha", "fact", "task", "note"],
+  description:
+    "What kind of memory this is. decision/convention/gotcha are never aged out; fact/task/note expire after 90/7/30 days if never used. Omit to let the store classify by wording."
+};
+
+const PROJECT_PROP = {
+  type: "string",
+  description: "Project slug this memory belongs to. Defaults to the repository this server is running in, and null means unscoped."
+};
+
 export const MEMORY_TOOLS: McpTool[] = [
   {
     name: "memory_search",
@@ -53,9 +65,25 @@ export const MEMORY_TOOLS: McpTool[] = [
         k: { type: "integer", description: "Max memories to return (default 5)." },
         budgetTokens: { type: "integer", description: "Hard token cap for the result (default 800)." },
         threshold: { type: "number", description: "Minimum hybrid score (default 0.35)." },
-        type: TYPE_PROP
+        type: TYPE_PROP,
+        kind: KIND_PROP,
+        project: PROJECT_PROP
       },
       required: ["query"]
+    }
+  },
+  {
+    name: "memory_brief",
+    description:
+      "Everything this project already decided, without searching: conventions, decisions, gotchas, open tasks and what happened recently, in one budgeted block. Use it at the start of a session on an existing repository, before asking the user how things work here.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: SCOPE_PROP,
+        project: PROJECT_PROP,
+        budgetTokens: { type: "integer", description: "Hard token cap (default 600)." },
+        sinceDays: { type: "integer", description: "How far back `open` and `recent` look (default 14)." }
+      }
     }
   },
   {
@@ -68,6 +96,8 @@ export const MEMORY_TOOLS: McpTool[] = [
         text: { type: "string", description: "The memory, self-contained and specific." },
         scope: SCOPE_PROP,
         type: TYPE_PROP,
+        kind: KIND_PROP,
+        project: PROJECT_PROP,
         importance: { type: "number", description: "0..1, default 0.5." },
         tags: { type: "array", items: { type: "string" } },
         source: { type: "string", description: "Where this came from (file, task, conversation)." }
@@ -83,7 +113,9 @@ export const MEMORY_TOOLS: McpTool[] = [
       properties: {
         scope: SCOPE_PROP,
         limit: { type: "integer", description: "Default 20." },
-        type: TYPE_PROP
+        type: TYPE_PROP,
+        kind: KIND_PROP,
+        project: PROJECT_PROP
       }
     }
   },
@@ -107,8 +139,29 @@ export const MEMORY_TOOLS: McpTool[] = [
     }
   },
   {
+    name: "memory_knowledge",
+    description:
+      "Read the knowledge index built from the vault's markdown pages: list pages, show one page's sections and links, expand a page's neighbours, or sync the .md files into memory. Use it to answer \"what do we have written down about X\" and \"what is connected to this page\". `sync` re-reads the vault; everything else is a read.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        op: {
+          type: "string",
+          enum: ["list", "show", "neighbors", "sync"],
+          description: "list (default): pages; show: one page; neighbors: pages linked from/to that page; sync: index the vault now."
+        },
+        id: { type: "string", description: "Page id for show/neighbors." },
+        depth: { type: "integer", description: "Neighbour hops for neighbors (1-3, default 1)." },
+        dir: { type: "string", description: "Vault directory for sync (default VAULT_DIR or `vault`)." },
+        dryRun: { type: "boolean", description: "sync only: report what would change without writing." },
+        scope: SCOPE_PROP
+      }
+    }
+  },
+  {
     name: "memory_stats",
-    description: "Counts per scope and type, plus which embedding provider is in use.",
+    description:
+      "Counts per scope and type, including archived rows and rows that have never been retrieved, plus which embedding provider is in use.",
     inputSchema: {
       type: "object",
       properties: { scope: SCOPE_PROP, all: { type: "boolean" } }
@@ -129,11 +182,28 @@ const asScope = (v: unknown): MemoryScope | undefined => (v === "shared" ? "shar
 function renderSearch(r: SearchResult, budget: number): string {
   if (r.memories.length === 0) return "no memories matched";
   const lines = r.memories.map((m) => {
-    const flags = [m.type, m.namespace, typeof m.score === "number" ? m.score.toFixed(3) : "-"].join("/");
+    const flags = [m.type, m.kind, m.namespace, typeof m.score === "number" ? m.score.toFixed(3) : "-"].join("/");
     return `[${m.id}] (${flags}) ${m.text.replace(/\s+/g, " ").trim()}`;
   });
   lines.push(`tokens: ${r.tokensUsed}/${budget}${r.truncated ? " (truncated)" : ""}`);
   return lines.join("\n");
+}
+
+/**
+ * Count active rows in one partition that have never been retrieved.
+ *
+ * `lastUsedAt` is not a column `list()` can filter on, so this pages through the
+ * partition. It is worth the scan: 308 of 335 rows in the real store have never been
+ * retrieved, and that ratio is the difference between a memory and a write-only log.
+ */
+async function countNeverRetrieved(service: MemoryService, namespace: string): Promise<number> {
+  const pageSize = 500;
+  let count = 0;
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await service.list({ namespace, status: "active", limit: pageSize, offset });
+    for (const memory of page.memories) if (memory.lastUsedAt === null) count++;
+    if (page.memories.length === 0 || offset + page.memories.length >= page.total) return count;
+  }
 }
 
 /** Dispatch one `tools/call`. Errors become tool results, never protocol failures. */
@@ -153,6 +223,8 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           namespaces,
           agent: ctx.defaultAgent,
           type: args.type as MemoryType | undefined,
+          kind: args.kind as MemoryKind | undefined,
+          project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
           k: args.k === undefined ? 5 : Number(args.k),
           budgetTokens,
           threshold: args.threshold === undefined ? 0.35 : Number(args.threshold)
@@ -160,6 +232,32 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
         return {
           text: renderSearch(result, budgetTokens),
           structured: { ...result, memories: result.memories.map(stripEmbedding) }
+        };
+      }
+
+      case "memory_brief": {
+        const { namespaces } = resolveRequestScope({
+          agent: ctx.defaultAgent,
+          scope: asScope(args.scope) ?? ctx.defaultScope
+        });
+        const sinceDays = args.sinceDays === undefined ? 14 : Math.max(1, Number(args.sinceDays));
+        const brief = await ctx.service.brief({
+          namespaces,
+          project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
+          budgetTokens: args.budgetTokens === undefined ? undefined : Number(args.budgetTokens),
+          sinceMs: sinceDays * 24 * 60 * 60 * 1000
+        });
+        // The brief is written for a prompt, so it is returned verbatim rather than
+        // re-rendered here: two renderers would drift, and this one is the contract.
+        return {
+          text: brief.text,
+          structured: {
+            ...brief,
+            sections: brief.sections.map((s) => ({
+              ...s,
+              items: s.items.map((item) => ({ ...item }))
+            }))
+          }
         };
       }
 
@@ -172,6 +270,8 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           namespace,
           text,
           type: (args.type as MemoryType | undefined) ?? "semantic",
+          kind: args.kind as MemoryKind | undefined,
+          project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
           importance: args.importance === undefined ? undefined : Number(args.importance),
           tags: Array.isArray(args.tags) ? (args.tags as string[]).map(String) : undefined,
           source: args.source === undefined ? `mcp:${ctx.defaultAgent}` : String(args.source)
@@ -202,7 +302,13 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
         const memories: Memory[] = [];
         let total = 0;
         for (const ns of namespaces) {
-          const page = await ctx.service.list({ namespace: ns, type: args.type as MemoryType | undefined, limit });
+          const page = await ctx.service.list({
+            namespace: ns,
+            type: args.type as MemoryType | undefined,
+            kind: args.kind === undefined ? undefined : String(args.kind),
+            project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
+            limit
+          });
           memories.push(...page.memories);
           total += page.total;
         }
@@ -241,18 +347,106 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           scope: asScope(args.scope) ?? ctx.defaultScope,
           all: args.all === true
         });
-        const perScope: Record<string, { total: number; byType: Record<string, number> }> = {};
+        // Archived rows are excluded from `total` (list() hides them by default) and from
+        // every retrieval path, so without these two counters an operator cannot see the
+        // gap between "rows in the store" and "rows an agent can actually be handed".
+        const perScope: Record<
+          string,
+          {
+            total: number;
+            byType: Record<string, number>;
+            archived: number;
+            archivedRatio: number;
+            neverRetrieved: number;
+            neverRetrievedRatio: number;
+          }
+        > = {};
         for (const ns of namespaces) {
           const byType: Record<string, number> = {};
           for (const t of ["episodic", "semantic", "procedural", "working"] as const) {
             byType[t] = (await ctx.service.list({ namespace: ns, type: t, limit: 1 })).total;
           }
-          perScope[ns] = { total: (await ctx.service.list({ namespace: ns, limit: 1 })).total, byType };
+          const total = (await ctx.service.list({ namespace: ns, limit: 1 })).total;
+          const archived = (await ctx.service.list({ namespace: ns, status: "archived", limit: 1 })).total;
+          const neverRetrieved = await countNeverRetrieved(ctx.service, ns);
+          perScope[ns] = {
+            total,
+            byType,
+            archived,
+            // Over active+archived rows, the population an operator is deciding whether to
+            // restore or clear; `total` alone is only the live half.
+            archivedRatio: total + archived === 0 ? 0 : archived / (total + archived),
+            neverRetrieved,
+            // Over live rows only, because that is the context a caller can reach today.
+            neverRetrievedRatio: total === 0 ? 0 : neverRetrieved / total
+          };
         }
-        const text = namespaces.map((ns) => `${ns}: ${perScope[ns]!.total}`).join("\n");
+        const text = namespaces
+          .map((ns) => {
+            const s = perScope[ns]!;
+            const archivedNote = s.archived > 0 ? ` (+${s.archived} archived)` : "";
+            return `${ns}: ${s.total}${archivedNote} — never retrieved ${s.neverRetrieved}/${s.total}`;
+          })
+          .join("\n");
         return {
           text,
           structured: { scopes: namespaces, perScope, embedding: ctx.service.embedder.name, dim: ctx.service.embedder.dim }
+        };
+      }
+
+      case "memory_knowledge": {
+        const op = String(args.op ?? "list");
+        const { namespaces } = resolveRequestScope({
+          agent: ctx.defaultAgent,
+          scope: asScope(args.scope) ?? ctx.defaultScope
+        });
+        const id = args.id === undefined ? "" : String(args.id);
+
+        if (op === "sync") {
+          const report = await ctx.service.syncKnowledge({
+            dir: args.dir === undefined ? undefined : String(args.dir),
+            dryRun: args.dryRun === true
+          });
+          const head = report.dryRun ? "dry run — nothing written" : "synced";
+          return {
+            text:
+              `${head}: ${report.pages} page(s), ${report.sections} section(s) → ` +
+              `${report.inserted} new, ${report.updated} updated, ${report.unchanged} unchanged, ` +
+              `${report.removed} removed, ${report.dangling} dangling link(s), ${report.embedCalls} embedding call(s)`,
+            structured: report
+          };
+        }
+
+        if (op === "show" || op === "neighbors") {
+          if (!id) return { text: `memory_knowledge: id is required for ${op}`, structured: null, isError: true };
+          if (op === "neighbors") {
+            const result = await ctx.service.knowledgeNeighbors({ namespaces, id, depth: args.depth === undefined ? 1 : Number(args.depth) });
+            return {
+              text: result.neighbors.length === 0
+                ? `${id} has no neighbours`
+                : `neighbours of ${id}:\n${result.neighbors.map((p) => `- [${p.id}] ${p.title}`).join("\n")}`,
+              structured: result
+            };
+          }
+          const page = await ctx.service.knowledgePage({ namespaces, id });
+          if (!page) return { text: `unknown knowledge page: ${id}`, structured: null, isError: true };
+          const lines = [
+            `[${page.id}] ${page.title}`,
+            ...page.sections.map((s) => `- ${s.key}: ${s.heading || "(preamble)"} (${s.chars} chars)`),
+            page.links.length > 0 ? `links: ${page.links.map((e) => e.target).join(", ")}` : "links: none",
+            page.backlinks.length > 0 ? `backlinks: ${page.backlinks.map((e) => e.from).join(", ")}` : "backlinks: none"
+          ];
+          return { text: lines.join("\n"), structured: page };
+        }
+
+        const index = await ctx.service.knowledge({ namespaces });
+        return {
+          text:
+            index.pages.length === 0
+              ? "no knowledge pages indexed — run op=sync with the vault directory"
+              : index.pages.map((p) => `- [${p.id}] ${p.title} (${p.sections} sections, ${p.links}→ ${p.backlinks}←)`).join("\n") +
+                (index.dangling.length > 0 ? `\ndangling: ${index.dangling.map((e) => `${e.from}→${e.target}`).join(", ")}` : ""),
+          structured: index
         };
       }
 

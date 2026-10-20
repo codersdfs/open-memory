@@ -136,4 +136,22 @@ describe("block rendering", () => {
     expect(block).toMatch(/may be stale/);
     expect(block).toContain("C:/code");
   });
+
+  // A recalled fact without a date cannot be told apart from a wrong one: the agent has
+  // no way to know that "shipped v2" is four months old. Only rows that are *about* a
+  // moment get stamped; an instruction is not.
+  it("stamps episodic and semantic rows with their date", () => {
+    const block = renderBlock(
+      [
+        { id: "1", text: "shipped v2", type: "episodic", namespace: "shared:u", createdAt: Date.UTC(2026, 9, 18) },
+        { id: "2", text: "deploy script", type: "procedural", namespace: "claude:u", createdAt: Date.UTC(2026, 9, 18) },
+        { id: "3", text: "old fact", type: "semantic", namespace: "shared:u", createdAt: Date.UTC(2026, 9, 1), tags: ["at:2026-09-28", "judged:jev"] }
+      ],
+      { agent: "claude", cwd: null }
+    );
+    expect(block).toContain("- (shared/episodic) [2026-10-18] shipped v2");
+    expect(block).toContain("- (private/procedural) deploy script");
+    // The resolved `at:` tag is when it was true, so it outranks the storage time.
+    expect(block).toContain("- (shared/semantic) [2026-09-28] old fact");
+  });
 });
