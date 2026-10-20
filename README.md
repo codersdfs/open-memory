@@ -456,7 +456,9 @@ Single partition, 1100-char rows, real `insert`/`save` path, this machine, end-t
 
 (The "before" column is the same harness on the tree that already had ADR-0017/0018 but not ADR-0019; the ADR-0017 section above carries the older JSON-vector `vectorSearch` numbers.)
 
-Extrapolated to 10^5 rows: ~~2.8 s~~ → **~0.68 s / 0.69 GB** at 384 dims (inside the 700 ms budget), ~~6.0 s~~ → **~2.07 s / 1.31 GB** at 2048 dims. The 2048-dim case needs an index — a quantised shortlist plus exact rescore, or IVF — which is the named open half of [ADR-0019](docs/adr/0019-term-df-and-rarity-gate.md), not a layout problem. The full harness, its limits and the phase breakdown are in [docs/scale-bench.md](docs/scale-bench.md) (`node scripts/scale-bench.mjs --rows 10000 --dim 384 --ns 1`).
+Extrapolated to 10^5 rows: ~~2.8 s~~ → **~0.68 s / 0.69 GB** at 384 dims (inside the 700 ms budget), ~~6.0 s~~ → **~2.07 s / 1.31 GB** at 2048 dims. The full harness, its limits and the phase breakdown are in [docs/scale-bench.md](docs/scale-bench.md) (`node scripts/scale-bench.mjs --rows 10000 --dim 384 --ns 1`).
+
+**The 2048-dim column was attacked and the attack was documented as a miss.** An int8 shortlist (one signed byte per dimension plus a `maxAbs` scale, ranked on those bytes, with the shortlist re-scored exactly against the float32 blob) buys **1.45×** — 181.6 → 125.5 ms at 10,000 rows — for **+25% disk**, and lands at ~1.09 s at 10^5 rows. It is therefore **off by default** (`MEMORY_Q8=on` opts in). The phase split says why it stops there: reading four times fewer bytes per row saved 26 ms of 116 ms, and the rest is per-row object construction and the JOIN — costs that only fall if fewer *rows* are read. That is an index ([IVF/ANN](docs/adr/0026-int8-off-by-default.md)), which is the next version's work and not a column addition. [ADR-0025](docs/adr/0025-int8-shortlist.md) · [ADR-0026](docs/adr/0026-int8-off-by-default.md)
 
 ## Project layout
 
@@ -525,3 +527,5 @@ See `CONTEXT.md`. Canonical terms: **Memory**, **Episodic/Semantic/Procedural/Wo
 - `0022-brief-assembly`
 - `0023-knowledge-dimension`
 - `0024-realtime-benchmark`
+- `0025-int8-shortlist`
+- `0026-int8-off-by-default`

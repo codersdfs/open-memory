@@ -118,6 +118,34 @@ So 384 dimensions at 10^5 rows now lands at roughly the 700 ms budget instead of
 over it, and the remaining overrun is the vector scan at 2048 dimensions, which is an
 index problem (ADR-0019's open half), not a layout one.
 
+## The int8 shortlist, measured and left off (ADR-0025 / ADR-0026)
+
+An attempt to fix the 2048-d column by reading four times fewer bytes per row is in the
+tree as an opt-in path (`MEMORY_Q8=on`): each vector keeps a per-dimension signed byte
+plus a `maxAbs` scale, the scan ranks on those, and only the shortlist is re-scored
+against the float32 blob.
+
+10,000 rows at 2048d, same data, each mode in its own process:
+
+| | q8 off (default) | q8 on |
+| --- | --- | --- |
+| p50 | 181.6 ms | 125.5 ms |
+| p95 | 206.7 ms | 141.4 ms |
+| bytes/row | 14,112 | 17,702 |
+| 10^5 projection (p50) | 1,586 ms | ~1,094 ms |
+
+1.45×, +25% disk, and still over budget — so it is **off by default**. The reason it
+cannot be pushed further is that the cost was never mostly the bytes:
+
+| Query on the same store | Time |
+| --- | --- |
+| `SELECT id, vec, norm` (8,192 B/row) | 116.0 ms |
+| `SELECT id, q8, scale, norm` (2,048 B/row) | 90.4 ms |
+
+Four times fewer bytes bought 26 ms. The rest is per-row object construction, the JOIN,
+and result-set marshalling, which shrink only if the number of *rows* read shrinks. That
+is what an index does and a narrower blob does not.
+
 ## Where the time goes
 
 | rows | dim | `vectorSearch` p50 | `lexicalCandidates` p50 | `search` p50 |
@@ -208,3 +236,7 @@ again, which is where an index would go.
 | `--keep-db` | off | keep the temp DB and print its path |
 | `--no-store-phases` | off | skip the per-phase `store.vectorSearch` / `lexicalCandidates` timings |
 | `--quiet` | off | no human summary on stderr (stdout stays one JSON line) |
+
+The int8 shortlist is controlled by the environment, not a flag, because it is a store
+setting rather than a benchmark setting: `MEMORY_Q8=on` before the run compares the two
+paths on otherwise identical data (ADR-0026 explains why the default is off).

@@ -109,6 +109,98 @@ function cosineFast(query: Float32Array, queryNorm: number, vec: Float32Array, v
   return denom === 0 ? 0 : dot / denom;
 }
 
+// ---------------------------------------------------------------------------
+// int8 shortlist (ADR-0025). Each vector keeps a per-row max-abs scale and one
+// signed byte per dimension; a scan ranks on those, then the winners are
+// re-scored exactly against the float32 blob.
+//
+// The premise worth remembering: at 2048d the *blob read* was measured at 61% of
+// a search and the dot product at 7%, which suggested reading four times fewer
+// bytes. Doing that saved only 26 ms of 116 ms — the rest of that phase is
+// per-row object construction and the JOIN, and those do not shrink when the
+// payload does. Measured end to end: 1.45x (181.6 -> 125.5 ms at 10k rows),
+// still over budget at 10^5, hence off by default (ADR-0026).
+// ---------------------------------------------------------------------------
+
+/**
+ * int8 quantisation of one vector: `q[i] = round(v[i] / maxAbs * 127)`.
+ *
+ * The result must agree with `unpackQ8` element for element, and the reason is a
+ * trap worth spelling out: the bytes are produced as unsigned (`v + 256` for
+ * negatives) and are meant to be read back as SIGNED. `cosineQ8` multiplies two
+ * of these together, so if one side is still a `Buffer` (unsigned elements) while
+ * the other came through `unpackQ8` (signed), the same dimension contributes
+ * +130 on one side and -126 on the other. The dot product flips sign and the true
+ * neighbour ranks LAST instead of first — measured: a self-query scored -0.55 and
+ * ranked 2000/2000, with recall@20 = 0. Returning `Int8Array` and not `Buffer` is
+ * what keeps both sides in the same unit.
+ */
+function quantizeVector(vec: ArrayLike<number>): { q8: Int8Array; scale: number } {
+  let maxAbs = 0;
+  for (let i = 0; i < vec.length; i++) {
+    const a = Math.abs(vec[i]);
+    if (a > maxAbs) maxAbs = a;
+  }
+  const out = new Int8Array(vec.length);
+  if (maxAbs === 0) return { q8: out, scale: 0 };
+  const k = 127 / maxAbs;
+  for (let i = 0; i < vec.length; i++) {
+    // Math.round against the signed target: no `+256`, because Int8Array already
+    // wraps -126 to the same byte a Uint8Array would store as 130.
+    out[i] = Math.round(vec[i] * k);
+  }
+  return { q8: out, scale: maxAbs };
+}
+
+/**
+ * Int8 view over a blob read back from SQLite.
+ *
+ * `node:sqlite` hands back a plain `Uint8Array`, and `Buffer.from(uint8Array)` does
+ * NOT copy it: it is placed in Node's shared buffer pool, so the resulting Buffer's
+ * `byteOffset` is an offset into an 8 KB pool, not into the original bytes. Building
+ * `new Int8Array(buf.buffer, buf.byteOffset, buf.length)` from that reads whatever
+ * happens to sit at that pool offset — silently wrong data, and the reason the first
+ * version of this path returned the same top-20 for every query. Copy through
+ * `Uint8Array.from` so the view is over bytes this function owns.
+ */
+function unpackQ8(raw: any): Int8Array {
+  const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw as any);
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return new Int8Array(copy.buffer);
+}
+
+/** L2 norm of the integer copy, used to normalise the quantised query side. */
+function vectorNorm64(vec: Int8Array): number {
+  let n = 0;
+  for (let i = 0; i < vec.length; i++) n += vec[i] * vec[i];
+  return Math.sqrt(n);
+}
+
+/**
+ * Approximate cosine from the int8 copy. Both sides must be expressed in their
+ * ORIGINAL units before dividing: `dot(q8_q, q8_v)` is in units of
+ * `127*127/(qScale*rowScale)`, so multiplying by `(qScale*rowScale)/(127*127)`
+ * yields the true dot product. The norms in the denominator are the exact float32
+ * norms, never the quantised ones — mixing a quantised query norm with a float row
+ * norm scales scores by an arbitrary constant and destroys the ranking entirely
+ * (measured: recall@20 fell to 0 before this was fixed).
+ */
+function cosineQ8(
+  q: Int8Array,
+  qScale: number,
+  qNorm: number,
+  row: Int8Array,
+  rowScale: number,
+  rowNorm: number
+): number {
+  let dot = 0;
+  for (let i = 0; i < q.length; i++) dot += q[i] * row[i];
+  const denom = qNorm * rowNorm;
+  if (denom === 0) return 0;
+  return (dot * (qScale * rowScale)) / (127 * 127 * denom);
+}
+
 
 // Lazy load node:sqlite. Resolved through `createRequire` so the id never enters a
 // bundler's resolver: a dynamic `import("node:sqlite")` — even with @vite-ignore — came out
@@ -308,6 +400,13 @@ export class SqliteVectorStore implements VectorStore {
         norm REAL NOT NULL
       );
     `);
+    // ADR-0025: the int8 copy and its per-row scale are added in place. A store
+    // written before this version has neither column, so both arrive by ALTER and
+    // the backfill below fills them — no rebuild, no data loss, no version flag.
+    const cols = this.db.prepare(`PRAGMA table_info(memory_vectors)`).all() as { name: string }[];
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has("q8")) this.db.exec(`ALTER TABLE memory_vectors ADD COLUMN q8 BLOB`);
+    if (!have.has("scale")) this.db.exec(`ALTER TABLE memory_vectors ADD COLUMN scale REAL`);
     for (;;) {
       const batch = this.db
         .prepare(
@@ -340,6 +439,32 @@ export class SqliteVectorStore implements VectorStore {
       if (batch.length < 5000) break;
     }
     this.db.exec("PRAGMA user_version = 2");
+
+    // Same driver as above, one column over: rows whose q8 is still NULL were
+    // written by a version that predates it (or by a crash mid-backfill). Driving on
+    // the data rather than a flag keeps this re-entrant and lets an old database
+    // opened by a new binary repair itself on first open.
+    for (;;) {
+      const batch = this.db
+        .prepare(
+          `SELECT memory_id, vec FROM memory_vectors WHERE q8 IS NULL LIMIT 5000`
+        )
+        .all() as { memory_id: string; vec: Buffer }[];
+      if (batch.length === 0) break;
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const stmt = this.db.prepare(`UPDATE memory_vectors SET q8 = ?, scale = ? WHERE memory_id = ?`);
+        for (const row of batch) {
+          const { q8, scale } = quantizeVector(unpackVector(row.vec));
+          stmt.run(q8, scale, row.memory_id);
+        }
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw err;
+      }
+      if (batch.length < 5000) break;
+    }
   }
 
   /** Vector row write. Caller owns the transaction. */
@@ -350,9 +475,12 @@ export class SqliteVectorStore implements VectorStore {
     }
     let norm = 0;
     for (const v of embedding) norm += v * v;
+    // ADR-0025: the int8 copy is written in the same statement as the float32 one,
+    // so a row can never be visible to a scan without its shortlist representation.
+    const { q8, scale } = quantizeVector(embedding);
     this.db
-      .prepare(`INSERT OR REPLACE INTO memory_vectors (memory_id, dim, vec, norm) VALUES (?, ?, ?, ?)`)
-      .run(id, embedding.length, packVector(embedding), Math.sqrt(norm));
+      .prepare(`INSERT OR REPLACE INTO memory_vectors (memory_id, dim, vec, norm, q8, scale) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(id, embedding.length, packVector(embedding), Math.sqrt(norm), q8, scale);
   }
 
   /** Full rows for a set of ids, one query. Missing ids are simply absent. */
@@ -838,6 +966,11 @@ export class SqliteVectorStore implements VectorStore {
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
     this.ensure();
     const { whereSql, params } = candidateWhere(opts, "m");
+    const q = opts.queryEmbedding;
+    if (this.q8Enabled()) {
+      const hit = this.vectorSearchQ8(whereSql, params, q, opts.limit);
+      if (hit) return hit;
+    }
     const rows = this.db
       .prepare(
         `SELECT m.id AS id, v.vec AS vec, v.dim AS dim, v.norm AS norm
@@ -845,7 +978,6 @@ export class SqliteVectorStore implements VectorStore {
           WHERE ${whereSql}`
       )
       .all(...(params as any)) as { id: string; vec: Buffer; dim: number; norm: number }[];
-    const q = opts.queryEmbedding;
     const qf = new Float32Array(q);
     let qn = 0;
     for (let i = 0; i < q.length; i++) qn += q[i] * q[i];
@@ -869,6 +1001,121 @@ export class SqliteVectorStore implements VectorStore {
       const memory = memoryFromRow(row);
       // The scan already had this vector in hand; reading it back would be a second
       // trip for data the caller (MMR) genuinely needs.
+      memory.embedding = Array.from(s.vec);
+      return [{ memory, vectorScore: s.vectorScore }];
+    });
+  }
+
+  /**
+   * ADR-0025 rollback lever, defaulting to OFF.
+   *
+   * Measured on 10k rows at 2048d, same machine and same data: p50 181.6 ms off vs
+   * 125.5 ms on (1.45x), which extrapolates to ~1.09 s at 10^5 rows — still over the
+   * 700 ms budget, and the q8 + scale columns cost +25% disk at that width
+   * (14,112 -> 17,702 bytes/row). A 1.45x that does not reach the target is not worth
+   * paying storage for by default, so the faster path is opt-in until an index (not a
+   * narrower blob) makes the difference an order of magnitude. See ADR-0026.
+   *
+   * Set MEMORY_Q8=on (or 1/true) to enable it.
+   */
+  private q8Enabled(): boolean {
+    const v = (process.env.MEMORY_Q8 ?? "").trim().toLowerCase();
+    return v === "on" || v === "1" || v === "true";
+  }
+
+  /**
+   * int8 shortlist + float32 rerank (ADR-0025).
+   *
+   * Phase A scores the compact int8 copy for the whole candidate set; phase B re-reads
+   * the float32 blob for the shortlist only and ranks that exactly. The returned
+   * ordering is therefore the *exact* ordering of the shortlist, not an approximation of
+   * the full set — which is why the multiplier below is 4: the shortlist must be wide
+   * enough that nothing genuinely in the top-k is excluded by quantisation noise.
+   *
+   * What this does and does not buy: the scan reads 4x fewer bytes per row, and that was
+   * measured at 1.45x end to end (181.6 -> 125.5 ms at 10k rows / 2048d). It is not more,
+   * because per-row object construction and the JOIN dominate that phase and do not care
+   * how wide the payload is. Passive behind MEMORY_Q8 (off by default, ADR-0026).
+   *
+   * Returns null when the fast path cannot answer (a row still missing its q8, or a
+   * candidate set smaller than the limit), and the caller falls back to the full scan.
+   * A half-populated table is the one case where being slower is strictly better than
+   * being wrong.
+   */
+  private vectorSearchQ8(
+    whereSql: string,
+    params: (string | number)[],
+    q: number[],
+    limit: number
+  ): { memory: Memory; vectorScore: number }[] | null {
+    // Phase A: ids, int8 bytes, scale and the exact norm. No float32 blob.
+    const rows = this.db
+      .prepare(
+        `SELECT m.id AS id, v.q8 AS q8, v.dim AS dim, v.norm AS norm, v.scale AS scale
+           FROM memories m JOIN memory_vectors v ON v.memory_id = m.id
+          WHERE ${whereSql}`
+      )
+      .all(...(params as any)) as {
+        id: string;
+        q8: Uint8Array | null;
+        dim: number;
+        norm: number;
+        scale: number | null;
+      }[];
+    if (rows.length === 0) return null;
+    for (const r of rows) if (r.q8 === null || r.scale === null) return null;
+
+    const qf = new Float32Array(q);
+    const qn = vectorNorm(qf);
+    const { q8: qq, scale: qScale } = quantizeVector(q);
+
+    const approx: { id: string; approxScore: number }[] = [];
+    for (const r of rows) {
+      // Width rule is the same as the exact path: a stale row is skipped, not fatal.
+      if (r.dim !== q.length) continue;
+      approx.push({
+        // qn is the FLOAT norm of the query, matching r.norm which is the float norm
+        // of the row. Passing the int8 norm here instead would mix units and the
+        // ranking collapses (measured: recall@20 = 0).
+        id: r.id,
+        approxScore: cosineQ8(qq, qScale, qn, unpackQ8(r.q8), r.scale as number, r.norm),
+      });
+    }
+    if (approx.length === 0) return [];
+    approx.sort((a, b) => b.approxScore - a.approxScore);
+
+    const shortlistSize = Math.min(approx.length, Math.max(limit * 4, 20 * 4));
+    // If the shortlist would cover the whole candidate set there is nothing to
+    // save by quantising — the caller's full scan reads the same bytes once.
+    if (shortlistSize >= approx.length) return null;
+
+    const shortlist = approx.slice(0, shortlistSize);
+    // Phase B: exact float32 rerank over the shortlist only.
+    const vecRows = this.db
+      .prepare(
+        `SELECT memory_id, vec, norm FROM memory_vectors
+          WHERE memory_id IN (${shortlist.map(() => "?").join(", ")})`
+      )
+      .all(...(shortlist.map((s) => s.id) as any)) as {
+      memory_id: string;
+      vec: Buffer;
+      norm: number;
+    }[];
+    const byId = new Map(vecRows.map((r) => [r.memory_id, r]));
+    const scored: { id: string; vectorScore: number; vec: Float32Array }[] = [];
+    for (const s of shortlist) {
+      const vr = byId.get(s.id);
+      if (!vr) continue;
+      const vec = unpackVector(vr.vec);
+      scored.push({ id: s.id, vectorScore: cosineFast(qf, qn, vec, vr.norm), vec });
+    }
+    scored.sort((a, b) => b.vectorScore - a.vectorScore);
+    const top = scored.slice(0, limit);
+    const rowsById = this.fetchByIds(top.map((s) => s.id));
+    return top.flatMap((s) => {
+      const row = rowsById.get(s.id);
+      if (!row) return [];
+      const memory = memoryFromRow(row);
       memory.embedding = Array.from(s.vec);
       return [{ memory, vectorScore: s.vectorScore }];
     });

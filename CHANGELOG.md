@@ -194,7 +194,27 @@ rows, embeddings and namespaces are kept; new columns are backfilled in place.
   `search p95`, per-mode recall, budget overruns and sync errors. 13 unit tests on the pure part
   (`src/bench/realtime.ts`). [ADR-0024](docs/adr/0024-realtime-benchmark.md)
 
+- **An opt-in int8 shortlist for wide vectors, because 2048-d retrieval was 3× over budget.**
+  `memory_vectors` gains a per-dimension signed byte and a `maxAbs` scale per row; with
+  `MEMORY_Q8=on` a search ranks the whole candidate set on those bytes and re-scores only the
+  shortlist against the float32 blob, which returns the exact ordering for the rows it keeps.
+  Measured at 10,000 rows / 2048d: p50 181.6 → 125.5 ms (1.45×), at the cost of +25% disk
+  (14,112 → 17,702 bytes/row). **Off by default**: a 1.45× that lands at ~1.09 s at 10^5 rows is
+  still over the 700 ms budget, and the phase split shows why it cannot be pushed further — reading
+  four times fewer bytes per row saved 26 ms of 116 ms, because the rest is per-row object
+  construction and the JOIN, which only shrink if fewer *rows* are read.
+  [ADR-0025](docs/adr/0025-int8-shortlist.md) · [ADR-0026](docs/adr/0026-int8-off-by-default.md)
+
 ### Fixed
+
+- **The int8 shortlist returned nothing useful for any query.** `quantizeVector` stored negatives
+  as unsigned bytes (`-126` as `130`) and returned a `Buffer`, while rows came back as `Int8Array`
+  through `unpackQ8`; `cosineQ8` then multiplied `+130` by `-126` on the same dimension and the dot
+  product changed sign. An exact self-query scored `-0.55` and ranked 2000 of 2000 rows, so recall@k
+  was 0 — with a green suite, because no test compared the two paths. `quantizeVector` now returns
+  `Int8Array` and writes the rounded value straight into it. `tests/q8-shortlist.test.ts` pins the
+  two paths to the same ids, the same order and a self-query above 0.99 in both modes.
+  [ADR-0025](docs/adr/0025-int8-shortlist.md).
 
 - **`agent unlink` orphaned a TOML subsection.** Removing `[mcp_servers.ai-memory]` left
   its own child table `[mcp_servers.ai-memory.env]` behind with the `AI_MEMORY_AGENT` line
