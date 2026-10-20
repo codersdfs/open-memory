@@ -207,6 +207,34 @@ rows, embeddings and namespaces are kept; new columns are backfilled in place.
 
 ### Fixed
 
+- **Twelve more MCP clients, and the paths they were pointed at were not theirs.** "Use it
+  from any agent" used to mean four built-ins plus a hand-written declaration per client.
+  `agent list` now knows sixteen: the four built-ins and a table of paths for Cursor,
+  Windsurf, Cline, Zed, Continue, VS Code, Gemini CLI, opencode, Qwen, Crush, Amp and Aider,
+  so `agent link --agent cursor --write` works on a fresh install. The list is a function of
+  the table, not of what this machine has installed — a client missing from `agent list` reads
+  as "unsupported" — and `installed` / `not found` is a directory probe, not a guess.
+  Two of those configs are JSONC (Zed and VS Code ship comments in theirs), so they are edited
+  by splicing text rather than by a `JSON.parse` round-trip: `link` then `unlink` gives back a
+  byte-identical file, and the splicer re-parses its own output and compares the target path
+  before writing, so a splice bug surfaces as an error instead of a mangled editor config.
+
+- **Every known-client path pointed into the memory store.** `resolveHome()` names the store
+  (`~/.ai-memory`), not the user's home, and the detection code used it, so `agent doctor`
+  printed `~/.ai-memory/.cursor/mcp.json` — a file no editor reads — and detection then found
+  the store's own directories and reported every client as installed. The two are now separate:
+  known clients resolve against `homedir()`, the store against `resolveHome()`.
+
+- **`GenericAdapter.detect()` returned `true` for known clients too.** It was written for
+  declarations, where naming an agent is itself the claim that it is installed. Known clients
+  go through the same class, so a bare `agent link --write` would have written into all twelve
+  configs, present or not. A known client now probes its own directory; a declaration still
+  answers `true`.
+
+- **`makeRegistry` kept the last adapter for a duplicated id and `all()` returned duplicates.**
+  Callers append in priority order, so the intended meaning is first-wins: built-ins shadow
+  known clients, and known clients shadow declarations.
+
 - **The int8 shortlist returned nothing useful for any query.** `quantizeVector` stored negatives
   as unsigned bytes (`-126` as `130`) and returned a `Buffer`, while rows came back as `Int8Array`
   through `unpackQ8`; `cosineQ8` then multiplied `+130` by `-126` on the same dimension and the dot

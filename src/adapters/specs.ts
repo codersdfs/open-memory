@@ -16,7 +16,15 @@ export interface AgentSpec {
   mcpFile: string;
   /** Where the server map lives: dotted JSON key path (`mcp.servers`), or the TOML table prefix. Defaults per format. */
   jsonPath?: string;
-  format?: "json" | "toml";
+  /**
+   * `json` (default), `jsonc` or `toml`.
+   *
+   * `jsonc` exists because two of the largest clients store JSON with comments:
+   * Zed's `settings.json` opens with a commented header, and VS Code's is documented
+   * as JSONC. A `json` declaration against those files is *refused* rather than
+   * corrupted, so the distinction has to be declarable.
+   */
+  format?: "json" | "jsonc" | "toml";
   /** Extra env for the spawned server entry, on top of `AI_MEMORY_AGENT=<id>`. */
   env?: Record<string, string>;
   /** Optional instructions file (AGENTS.md, rules file) that gets the managed memory block. */
@@ -44,7 +52,9 @@ export function validateSpec(id: string, raw: unknown): AgentSpec | string {
   const r = raw as Record<string, unknown>;
   const mcpFile = typeof r.mcpFile === "string" ? r.mcpFile.trim() : "";
   if (!mcpFile) return `"${id}": needs "mcpFile"`;
-  if (r.format !== undefined && r.format !== "json" && r.format !== "toml") return `"${id}": format must be "json" or "toml"`;
+  if (r.format !== undefined && r.format !== "json" && r.format !== "jsonc" && r.format !== "toml") {
+    return `"${id}": format must be "json", "jsonc" or "toml"`;
+  }
   if (r.jsonPath !== undefined && typeof r.jsonPath !== "string") return `"${id}": jsonPath must be a string`;
   if (r.instructions !== undefined && typeof r.instructions !== "string") return `"${id}": instructions must be a path string`;
 
@@ -63,7 +73,7 @@ export function validateSpec(id: string, raw: unknown): AgentSpec | string {
   return {
     mcpFile: expandHome(mcpFile),
     ...(jsonPath ? { jsonPath } : {}),
-    format: r.format === "toml" ? "toml" : "json",
+    format: r.format === "toml" ? "toml" : r.format === "jsonc" ? "jsonc" : "json",
     ...(env ? { env } : {}),
     ...(instructions ? { instructions } : {})
   };

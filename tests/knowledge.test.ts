@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawnSyncChild, closeAllChildren } from "./helpers/child.js";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -383,7 +383,7 @@ describe("surfaces", () => {
     writePage("alpha", `## How tokens work\n\n${PROSE.alpha}\n`, "---\ntitle: Alpha page\nslug: alpha\n---\n");
     const db = join(dir, "cli-memory.db");
     const run = (args: string[]) =>
-      spawnSync(process.execPath, [join(root, "node_modules", "tsx", "dist", "cli.mjs"), join(root, "src", "cli", "index.ts"), ...args], {
+      spawnSyncChild(process.execPath, [join(root, "node_modules", "tsx", "dist", "cli.mjs"), join(root, "src", "cli", "index.ts"), ...args], {
         cwd: root,
         encoding: "utf8",
         env: {
@@ -407,4 +407,8 @@ describe("surfaces", () => {
     const index = JSON.parse(list.stdout) as { pages: { id: string }[] };
     expect(index.pages.map((p) => p.id)).toEqual(["alpha"]);
   });
+});
+
+afterAll(async () => {
+  await closeAllChildren();
 });

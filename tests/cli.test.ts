@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { spawnSync } from "node:child_process";
+import { describe, it, expect, afterAll } from "vitest";
+import { spawnSyncChild, closeAllChildren } from "./helpers/child.js";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +18,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(root, "src", "cli", "index.ts");
 
 function run(args: string[], dbPath: string, env: Record<string, string> = {}) {
-  const res = spawnSync(process.execPath, [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), CLI, ...args], {
+  const res = spawnSyncChild(process.execPath, [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), CLI, ...args], {
     cwd: root,
     encoding: "utf8",
     env: {
@@ -39,6 +39,14 @@ function run(args: string[], dbPath: string, env: Record<string, string> = {}) {
 
 const tmp = mkdtempSync(path.join(os.tmpdir(), "ai-memory-cli-"));
 const db = path.join(tmp, "memory.db");
+
+// Every child this file starts is gone before the file ends. Without this the
+// suite leaves a few hundred idle node.exe behind, and the run that inherits
+// them takes 2.5x as long and fails a test that passes on its own.
+afterAll(async () => {
+  await closeAllChildren();
+  rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+});
 
 describe("ai-memory CLI", () => {
   it("prints usage with no arguments", () => {
@@ -188,7 +196,6 @@ describe("cli entrypoint file", () => {
     // must at least resolve to a real file in a built checkout.
     const candidates = [path.join(root, "dist", "cli", "index.js"), CLI];
     expect(candidates.some((c) => existsSync(c))).toBe(true);
-    rmSync(tmp, { recursive: true, force: true });
   });
 });
 

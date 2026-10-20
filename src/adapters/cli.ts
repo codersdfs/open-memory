@@ -1,10 +1,11 @@
-import { createRegistry, defaultAdapters, isBuiltIn, cliEntryPath, mcpCommandSpec } from "./index.js";
+import { createRegistry, defaultAdapters, isBuiltIn, cliEntryPath, mcpCommandSpec, findKnown, knownAdapter, knownAgentIds, type Adapter } from "./index.js";
 import { GenericAdapter } from "./generic.js";
 import { agentsFilePath, readSpecs, validateSpec, writeSpecs } from "./specs.js";
 import { plan } from "./fs.js";
 import { resolveAgent, resolveUser, resolveWriteKey } from "../core/scope.js";
 import { resolveDbPath, dbExists } from "../core/dbPath.js";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 
 /**
  * `ai-memory agent …` and `ai-memory context …` (ADR-0007).
@@ -58,14 +59,49 @@ function renderActions(
   else if (write && changed === 0) ctx.out("\nnothing to change");
 }
 
+/**
+ * Which adapters a sweeping command (`init`, `link`, `unlink`, `context refresh`)
+ * acts on when the user did not name one.
+ *
+ * The registry lists every known client so `list`/`status` can show "supported but
+ * not installed"; acting on them in bulk is a different question. A client is a
+ * target when it is installed, or when it already holds a link of ours — the second
+ * half is what makes `unlink` able to clean up after an editor that was uninstalled.
+ */
+async function sweepTargets(adapters: Adapter[]): Promise<Adapter[]> {
+  const out: Adapter[] = [];
+  for (const a of adapters) {
+    if (a.detect()) {
+      out.push(a);
+      continue;
+    }
+    if ((await a.status()).linked) out.push(a);
+  }
+  return out;
+}
+
+/** `doctor` reports the installs this machine actually has, not the catalogue. */
+async function reportable(adapters: Adapter[]): Promise<Adapter[]> {
+  const out: Adapter[] = [];
+  for (const a of adapters) if (a.detect() || (await a.status()).linked) out.push(a);
+  return out;
+}
+
 export async function runAgentCommand(positionals: string[], flags: Flags, ctx: CommandCtx): Promise<number> {
   const sub = positionals[0] ?? "list";
   const only = flag(flags, "agent");
   const write = bool(flags, "write");
   const registry = createRegistry();
-  const selected = only ? registry.get(only) : undefined;
+  let selected = only ? registry.get(only) : undefined;
+  // A detected client is in the registry; an installed-later one is not. Naming it
+  // explicitly has to work anyway, or the answer to "I just installed Zed" is
+  // "reinstall ai-memory", which is not an answer.
   if (only && !selected) {
-    ctx.err(`agent: unknown agent "${only}" (known: ${registry.ids().join(", ")})`);
+    const known = findKnown(only);
+    if (known) selected = knownAdapter(known);
+  }
+  if (only && !selected) {
+    ctx.err(`agent: unknown agent "${only}" (known: ${knownAgentIds().join(", ")})`);
     return 2;
   }
 
@@ -85,7 +121,7 @@ export async function runAgentCommand(positionals: string[], flags: Flags, ctx: 
     }
 
     case "init": {
-      const targets = selected ? [selected] : registry.all().filter((a) => a.detect());
+      const targets = selected ? [selected] : await sweepTargets(registry.all());
       const all: unknown[] = [];
       for (const a of targets) {
         const actions = await a.link({ write });
@@ -98,7 +134,7 @@ export async function runAgentCommand(positionals: string[], flags: Flags, ctx: 
     }
 
     case "link": {
-      const targets = selected ? [selected] : registry.all().filter((a) => a.detect());
+      const targets = selected ? [selected] : await sweepTargets(registry.all());
       if (targets.length === 0) {
         ctx.err(`agent link: no agent detected; pass --agent <id> (known: ${registry.ids().join(", ")})`);
         return 1;
@@ -112,7 +148,7 @@ export async function runAgentCommand(positionals: string[], flags: Flags, ctx: 
     }
 
     case "unlink": {
-      const targets = selected ? [selected] : registry.all().filter((a) => a.detect());
+      const targets = selected ? [selected] : await sweepTargets(registry.all());
       for (const a of targets) {
         const actions = await a.unlink({ write });
         if (ctx.json) ctx.out(JSON.stringify({ agent: a.id, write, actions }, null, 2));
@@ -192,10 +228,17 @@ export async function runAgentCommand(positionals: string[], flags: Flags, ctx: 
       }
       const existed = id in specs;
       if (isBuiltIn(id)) {
-        ctx.err(
-          `agent add: "${id}" is a built-in adapter, and its entry is more than a config path — a declaration would drop ` +
-            `its hooks or managed instructions. Link it as it is: ai-memory agent link --agent ${id} --write`
-        );
+        // Two different reasons, and telling them apart is the difference between
+        // an explanation and a riddle. A class-built adapter would lose real work
+        // (hooks, TOML section); a known client is already wired by path, so a
+        // declaration is simply redundant.
+        const message = findKnown(id)
+          ? `agent add: "${id}" is already a known client (${findKnown(id)!.spec(homedir()).mcpFile}). ` +
+            `Link it directly: ai-memory agent link --agent ${id} --write. ` +
+            `Declare it only if its config file lives somewhere else, under a different id.`
+          : `agent add: "${id}" is a built-in adapter, and its entry is more than a config path — a declaration would drop ` +
+            `its hooks or managed instructions. Link it as it is: ai-memory agent link --agent ${id} --write`;
+        ctx.err(message);
         return 2;
       }
       specs[id] = declared;
@@ -271,11 +314,12 @@ async function doctor(ctx: CommandCtx): Promise<number> {
   checks.push({ name: "identity", ok: true, detail: `agent=${agent} user=${user} write→${resolveWriteKey({ agent })}` });
 
   const registry = createRegistry();
-  for (const a of registry.all()) {
+  for (const a of await reportable(registry.all())) {
     const s = await a.status();
     // A detected-but-unlinked agent is advice, not breakage: the user may simply not
-    // have run `agent link` yet. Doctor only fails on things that cannot work.
-    checks.push({ name: `agent:${a.id}`, ok: true, detail: a.detect() ? s.detail : "not installed" });
+    // have run `agent link` yet. Doctor only fails on things that cannot work, and it
+    // only lists what this machine can actually run — the rest is the catalogue.
+    checks.push({ name: `agent:${a.id}`, ok: true, detail: a.detect() ? s.detail : s.detail });
   }
 
   // A declaration that never loads is a silent no-op, which is exactly what doctor is
@@ -310,8 +354,7 @@ export async function runContextCommand(positionals: string[], flags: Flags, _ct
   }
   const write = bool(flags, "write");
   const registry = createRegistry();
-  for (const adapter of registry.all()) {
-    if (!adapter.detect()) continue;
+  for (const adapter of await reportable(registry.all())) {
     const actions = await adapter.link({ write });
     if (_ctx.json) _ctx.out(JSON.stringify({ agent: adapter.id, write, actions }, null, 2));
     else renderActions(_ctx, adapter.id, actions, write);
