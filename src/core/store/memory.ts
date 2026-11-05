@@ -149,7 +149,11 @@ export class InMemoryVectorStore implements VectorStore {
     }
     if (opts.query) arr = arr.filter((m) => m.text.toLowerCase().includes(opts.query!.toLowerCase()));
     const total = arr.length;
-    arr.sort((a, b) => (b.pin - a.pin) || (b.createdAt - a.createdAt));
+    // Same key the SQL store uses (`ORDER BY pin DESC, created_at DESC, id ASC`), id as a
+    // final tie-break so a page is deterministic when rows share a created_at millisecond —
+    // Windows clock granularity (~15.6 ms) makes exact ties routine on a bulk insert, and
+    // an arbitrary tie order here would let a page drop a row a cross-layer merge expected.
+    arr.sort((a, b) => (b.pin - a.pin) || (b.createdAt - a.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const limit = opts.limit ?? 100;
     const offset = opts.offset ?? 0;
     return { memories: arr.slice(offset, offset + limit), total };

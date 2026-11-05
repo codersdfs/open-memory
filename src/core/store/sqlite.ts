@@ -834,7 +834,7 @@ export class SqliteVectorStore implements VectorStore {
     const limit = opts.limit ?? 100;
     const offset = opts.offset ?? 0;
     const rows = this.db
-      .prepare(`SELECT * FROM memories WHERE ${whereSql} ORDER BY pin DESC, created_at DESC LIMIT ? OFFSET ?`)
+      .prepare(`SELECT * FROM memories WHERE ${whereSql} ORDER BY pin DESC, created_at DESC, id ASC LIMIT ? OFFSET ?`)
       .all(...(params as any), limit, offset) as Row[];
     return { memories: this.attachVectors(rows.map(memoryFromRow)), total: totalRow.c };
   }

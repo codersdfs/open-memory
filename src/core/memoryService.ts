@@ -326,7 +326,7 @@ export class MemoryService {
     return memory && memory.isDeleted !== 1 ? memory : null;
   }
 
-  async list(opts: { namespace: string; type?: string; project?: string | null; kind?: string; includeDeleted?: boolean; status?: string; includeArchived?: boolean; includeDraft?: boolean; limit?: number; offset?: number; query?: string }) {
+  async list(opts: { namespace: string; type?: string; project?: string | null; kind?: string; includeDeleted?: boolean; status?: string; includeArchived?: boolean; includeDraft?: boolean; limit?: number; offset?: number; query?: string; withVectors?: boolean }) {
     return this.store.list(opts as never);
   }
 

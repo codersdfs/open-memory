@@ -298,27 +298,55 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           agent: ctx.defaultAgent,
           scope: asScope(args.scope) ?? ctx.defaultScope
         });
-        const limit = args.limit === undefined ? 20 : Number(args.limit);
-        const memories: Memory[] = [];
-        let total = 0;
-        for (const ns of namespaces) {
-          const page = await ctx.service.list({
+        // The same 1..1000 clamp the HTTP GET /memories route applies (server.ts). Without it
+        // `limit = -1` slipped through to SQLite as `LIMIT -1` (unlimited), the layers each
+        // returned everything, and the `.slice(0, limit)` below silently dropped the OLDEST row
+        // — a new shape of wrong. A non-numeric limit is refused by name rather than reaching
+        // the store, where it would fail open to an empty page on the in-memory backend and a
+        // type error on SQLite one — two backends, two behaviors.
+        const rawLimit = args.limit === undefined ? 20 : Number(args.limit);
+        if (!Number.isFinite(rawLimit)) {
+          return { text: "memory_list: limit must be a finite number", structured: null, isError: true };
+        }
+        const limit = Math.max(1, Math.min(1000, Math.floor(rawLimit)));
+        // One page per resolved namespace, each ordered `pin DESC, created_at DESC, id ASC` by
+        // the store — the SAME tie-broken key the merge below uses, so the global top-`limit` is
+        // genuinely a subset of the union of the per-layer top-`limit` pages: a row not in its
+        // own partition's first `limit` (that exact key, no loose tie) cannot be in the merged
+        // first `limit`. Fetching the layers concurrently mirrors the cross-partition search
+        // fan-out (ADR-0007); `withVectors: false` because every embedding is stripped a few
+        // lines below (ADR-0030 — same reasoning, an index read that never sees a vector).
+        const pages = await Promise.all(namespaces.map((ns) =>
+          ctx.service.list({
             namespace: ns,
             type: args.type as MemoryType | undefined,
             kind: args.kind === undefined ? undefined : String(args.kind),
             project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
-            limit
-          });
+            limit,
+            withVectors: false
+          })
+        ));
+        const memories: Memory[] = [];
+        let total = 0;
+        for (const page of pages) {
           memories.push(...page.memories);
           total += page.total;
         }
+        // Re-order across the layers into one scope-wide sequence, then apply the caller's cap
+        // once. Concatenating the pages, as this did, returned up to `limit × layers` rows *and*
+        // put every private row ahead of every shared one regardless of age — the opposite of the
+        // tool's promise: "list the most recent memories in the resolved scope(s)". The id
+        // tie-break matches the store, so the merged order is byte-stable for a fixed store.
+        const recent = memories
+          .sort((a, b) => (b.pin - a.pin) || (b.createdAt - a.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+          .slice(0, limit);
         const text =
-          memories.length === 0
+          recent.length === 0
             ? "no memories"
-            : memories
+            : recent
                 .map((m) => `[${m.id}] (${m.type}/${m.namespace}) ${m.text.replace(/\s+/g, " ").slice(0, 160)}`)
-                .join("\n") + `\n→ ${memories.length} of ${total}`;
-        return { text, structured: { memories: memories.map(stripEmbedding), total, scopes: namespaces } };
+                .join("\n") + `\n→ ${recent.length} of ${total}`;
+        return { text, structured: { memories: recent.map(stripEmbedding), total, scopes: namespaces } };
       }
 
       case "memory_get": {

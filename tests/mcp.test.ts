@@ -248,3 +248,84 @@ describe("callTool dispatch", () => {
     expect((res.structured as { namespace: string }).namespace).toBe("shared:mcpuser");
   });
 });
+
+/**
+ * `memory_list` read across the scope fan-out (issue #1).
+ *
+ * The default read covers the private layer, the shared layer and the legacy
+ * partition. Before the fix it called `list({limit})` once per layer and
+ * concatenated the pages, so it returned up to `limit × layers` rows and every
+ * private row sat ahead of every shared row regardless of age — the exact
+ * opposite of the tool's promise, "list the most recent memories". Ages are pinned
+ * by mutating `createdAt` after insert (the decay-test idiom) so ordering is tested
+ * against the clock, not a sleep.
+ */
+describe("memory_list merges the scope fan-out into one recent-first page", () => {
+  async function scoped(): Promise<{ store: InMemoryVectorStore; service: MemoryService }> {
+    const store = new InMemoryVectorStore();
+    const service = new MemoryService({ store, dedupThreshold: 0.99 });
+    await service.init();
+    return { store, service };
+  }
+  const put = async (store: InMemoryVectorStore, namespace: string, text: string, createdAt: number) => {
+    const m = await store.insert({ namespace, type: "semantic", text, importance: 0.6 }, [0.1, 0.2, 0.3]);
+    m.createdAt = createdAt;
+    return m;
+  };
+  const ids = (res: any) => (res.structured.memories as { id: string }[]).map((m) => m.id);
+
+  it("returns the shared row first when it is newer than every private row", async () => {
+    const { store, service } = await scoped();
+    const sharedNewest = await put(store, "shared:mcpuser", "shared newest", 3000);
+    const privateOlder = await put(store, "claude:mcpuser", "private older", 2000);
+    const privateOldest = await put(store, "claude:mcpuser", "private oldest", 1000);
+
+    const res: any = await callTool({ service, defaultAgent: "claude" }, "memory_list", { limit: 3 });
+    // Global recency across the fan-out, not page order. The pre-fix concatenation
+    // put both `claude:` rows ahead of the newer `shared:` row.
+    expect(ids(res)).toEqual([sharedNewest.id, privateOlder.id, privateOldest.id]);
+    expect(res.structured.total).toBe(3); // sum of per-layer counts
+  });
+
+  it("caps the merged result at limit even though each layer is fetched at limit", async () => {
+    const { store, service } = await scoped();
+    for (let i = 0; i < 5; i++) await put(store, "claude:mcpuser", `p${i}`, 100 + i);
+    for (let i = 0; i < 5; i++) await put(store, "shared:mcpuser", `s${i}`, 100 + i);
+
+    const res: any = await callTool({ service, defaultAgent: "claude" }, "memory_list", { limit: 4 });
+    expect(ids(res)).toHaveLength(4); // concatenation returned 4 + 4 = 8 (each populated layer at `limit`)
+    expect(res.text).toMatch(/→ 4 of 10/); // capped shown against the true total
+  });
+
+  it("keeps a pinned row first across the merge, even when it sits in a later layer and is older", async () => {
+    const { store, service } = await scoped();
+    // The pinned row goes in the SHARED layer (second in the fan-out) and is the OLDEST row.
+    const pinnedOld = await put(store, "shared:mcpuser", "pinned, oldest", 100);
+    await store.updateMeta(pinnedOld.id, { pin: 1 });
+    // A newer unpinned private row is exactly what the concatenation surfaced first — the
+    // private layer leads the fan-out and this row leads its page — so this fixture fails
+    // pre-fix and only passes once pin leads the cross-layer sort.
+    await put(store, "claude:mcpuser", "unpinned private, newest", 9000);
+
+    const res: any = await callTool({ service, defaultAgent: "claude" }, "memory_list", { limit: 5 });
+    expect(ids(res)[0]).toBe(pinnedOld.id);
+  });
+
+  it("refuses a non-finite limit instead of failing open differently per backend", async () => {
+    const { service } = await scoped();
+    const res: any = await callTool({ service, defaultAgent: "claude" }, "memory_list", { limit: "abc" });
+    expect(res.isError).toBe(true);
+    expect(res.text).toMatch(/finite/);
+  });
+
+  it("clamps a negative limit to one row rather than silently dropping the oldest", async () => {
+    const { store, service } = await scoped();
+    await put(store, "claude:mcpuser", "older", 100);
+    await put(store, "claude:mcpuser", "newer", 200);
+    // `limit = -1` used to reach SQLite as `LIMIT -1` (unlimited) and then `.slice(0, -1)`
+    // dropped the newest-merged row's tail; the clamp makes it exactly one — the newest.
+    const res: any = await callTool({ service, defaultAgent: "claude" }, "memory_list", { limit: -1 });
+    expect(ids(res)).toEqual([expect.any(String)]);
+    expect(res.text).not.toMatch(/→ 0 of/);
+  });
+});
