@@ -5,6 +5,43 @@ Notable changes. The package is `open-memory`; the command stays `ai-memory`.
 Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
 on-disk format is the part that does not.
 
+## 0.4.0-beta.2 — 2026-11-05
+
+A real-time retrieval pass plus a correctness fix, and the first build whose committed tree
+actually matches the 0.4.x work the beta.1 notes already described (the storage cache, curation,
+project memory, knowledge dimension and explainable-recall code landed here rather than at the
+beta.1 tag).
+
+### Changed
+
+- **Coverage is now idf-weighted for ranking** ([ADR-0028](docs/adr/0028-idf-weighted-coverage-and-prf.md)).
+  ADR-0027 made plain `coverage` the sort/gate/budget key, but on a single-conversation corpus a question
+  that names the protagonist ("What is Caroline's identity?") scores half the store identically to the row
+  that answers it, because the name sits in every chunk. The *sort*, MMR and budget now weight each asked
+  word by its document frequency (`term_df`), while the relevance *gate* still reads the unweighted share —
+  so admission semantics are unchanged, only ordering. Measured on a new model-free evidence ruler
+  (`bench/evhit.mjs`, LoCoMo conv-26, 152 questions, NIM embeddings): evidence-any 68 → 76%,
+  evidence-all 57 → 66%.
+- **A pseudo-relevance second pass was built, measured net-negative, and shipped off** (ADR-0028). It
+  reaches rows that hold a multi-hop answer's second half without the question's vocabulary, but the merged
+  rows crowd a fixed token budget single-hop rows need (evidence-any 76 → 72%), so `MEMORY_PRF` is `off`
+  by default; `MEMORY_PRF=on` opts in — the same disposition the int8 shortlist got.
+- **`realtime-bench` no longer calls a model on every write.** A judge key in `settings.json` was silently
+  putting an LLM round-trip inside each `save` (write p50 3 → 209 ms), moving the run's saturation point with
+  an unrelated service. The bench pins `MEMORY_JEV=off` before starting (a real env value still wins).
+
+### Fixed
+
+- **`memory_list` now merges the scope fan-out into one recent-first page** (issue #1). It used to call
+  `list({limit})` per resolved namespace and concatenate the pages, so it returned up to `limit × layers`
+  rows and put every private row ahead of every shared one regardless of age — the opposite of "list the
+  most recent memories in the resolved scope(s)." It now fetches each layer at `limit`, sorts the merged set
+  `pin DESC, created_at DESC, id ASC`, and slices to `limit` once (`total` stays the per-layer sum). The `id`
+  tie-break is pushed into both stores' `ORDER BY` so a page is deterministic when rows share a millisecond
+  (Windows clock granularity makes exact ties routine on bulk import), which is what makes the per-layer-top-
+  `limit` subset claim hold literally. `limit` is clamped to 1..1000 like the HTTP route; a non-finite limit
+  is refused rather than failing open differently per backend.
+
 ## 0.4.0-beta.1 — 2026-10-20
 
 Five passes in one release: recall, scale, project memory, the knowledge dimension, and a

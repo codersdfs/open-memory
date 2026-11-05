@@ -1,7 +1,7 @@
 # Open Memory — local-first memory for pi agents
 
-> **Status: `0.3.0-beta.1`** — first published build. The storage format is settled; the
-> HTTP and MCP surfaces can still move between prereleases.
+> **Status: `0.4.0-beta.2`** — pre-release. The storage format is settled; the HTTP and MCP surfaces
+> can still move between prereleases.
 
 ![the console: a query, the floor preset that made seven hits appear, the token budget,
 and the score decomposition behind every hit](docs/images/console-recall-dark.png)
