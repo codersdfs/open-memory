@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { archiveStale } from "../src/core/lifecycle/decay.js";
+import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
 import { projectSlug, normalizeProject, resolveProject, resetProjectCache } from "../src/core/project.js";
 import { deriveKind, isDurableKind, KIND_RETENTION_MS, KIND_IMPORTANCE } from "../src/core/write/kind.js";
 import type { MemoryKind, MemoryType } from "../src/core/types.js";
@@ -223,5 +224,107 @@ describe("kind-aware decay", () => {
     expect(archived).toBe(1);
     const listed = await svc.list({ namespace: NS, status: "archived", limit: 10 });
     expect(listed.memories[0]!.text).toContain("rotate the NIM key");
+  });
+});
+
+/**
+ * ADR-0042: management rides the dimension. A project exists because rows carry it,
+ * so every operation here must be explainable as a statement over `memories.project`
+ * — and the one row management is allowed to create (the init marker) must cost the
+ * brief nothing.
+ */
+describe("project management", () => {
+  it("init writes one durable marker into the shared layer, and is idempotent", async () => {
+    const first = await svc.initProject({ project: "alpha", user: "frank" });
+    expect(first.created).toBe(true);
+    expect(first.memory!.namespace).toBe(SHARED);
+    expect(first.memory!.kind).toBe("decision");
+    expect(first.memory!.tags).toContain("project:init");
+    const again = await svc.initProject({ project: "alpha", user: "frank" });
+    expect(again.created).toBe(false);
+    expect((await svc.list({ namespace: SHARED, project: "alpha", limit: 10 })).total).toBe(1);
+  });
+
+  it("files the note as the marker's decision instead of the generic sentence", async () => {
+    const out = await svc.initProject({ project: "beta", note: "We decided to track beta work in this store", user: "frank" });
+    expect(out.created).toBe(true);
+    expect(out.memory!.text).toContain("beta work");
+  });
+
+  it("keeps the marker out of the brief — visibility is not a brief line", async () => {
+    await svc.initProject({ project: "memory", user: "frank" });
+    const brief = await svc.brief({ namespaces: [NS, SHARED], project: "memory", now: NOW });
+    expect(brief.text).not.toContain("initialized");
+  });
+
+  it("lists every project with counts, kinds and last activity; unscoped included", async () => {
+    await seed({ text: "Always squash before merging in alpha", project: "alpha", kind: "convention" });
+    await seed({ text: "We chose pnpm for alpha because scripts compose", project: "alpha", kind: "decision" });
+    await seed({ text: "a preference about the user, not a repository", project: null });
+    // Archived rows are audit, not a live population: the count says what a read can hand out.
+    const archived = await seed({ text: "an alpha row decay archived", project: "alpha" });
+    await svc.updateMeta(archived.id, { status: "archived" });
+
+    const projects = await svc.listProjects();
+    const alpha = projects.find((p) => p.project === "alpha")!;
+    expect(alpha.rows).toBe(2);
+    expect(alpha.byKind).toEqual({ convention: 1, decision: 1 });
+    expect(alpha.lastActivityAt).toBeGreaterThan(0);
+    const unscoped = projects.find((p) => p.project === null)!;
+    expect(unscoped.rows).toBe(1);
+  });
+
+  it("rename moves every row, tombstones included, and guards an occupied target", async () => {
+    await seed({ text: "alpha convention row", project: "alpha", kind: "convention" });
+    const tombstoned = await seed({ text: "alpha decision row", project: "alpha", kind: "decision" });
+    await svc.delete(tombstoned.id);
+    await seed({ text: "beta row that stays", project: "beta" });
+
+    // A rename onto an occupied slug folds two efforts' history: legal, never a typo's side effect.
+    await expect(svc.renameProject("alpha", "beta")).rejects.toThrow(/merge/);
+    const out = await svc.renameProject("alpha", "beta", { merge: true });
+    expect(out.renamed).toBe(2);
+
+    const beta = (await svc.listProjects()).find((p) => p.project === "beta")!;
+    expect(beta.rows).toBe(2);
+    // The audit trail belongs to the project it documented, so it moves too.
+    expect((await svc.get(tombstoned.id))!.project).toBe("beta");
+    await expect(svc.renameProject("nope", "gamma")).rejects.toThrow(/unknown project/);
+  });
+
+  it("forget soft-deletes by default and restore revives row by row", async () => {
+    const row = await seed({ text: "an alpha row worth keeping", project: "alpha" });
+    const out = await svc.forgetProject("alpha");
+    expect(out.deleted).toBe(1);
+    expect((await svc.list({ namespace: NS, project: "alpha", limit: 10 })).total).toBe(0);
+    await svc.updateMeta(row.id, { isDeleted: 0 });
+    expect((await svc.list({ namespace: NS, project: "alpha", limit: 10 })).total).toBe(1);
+  });
+
+  it("detach unscopes instead of deleting", async () => {
+    await seed({ text: "a row that outlives its project", project: "alpha" });
+    const out = await svc.forgetProject("alpha", { mode: "detach" });
+    expect(out.detached).toBe(1);
+    const unscoped = await svc.list({ namespace: NS, project: null, limit: 10 });
+    expect(unscoped.total).toBe(1);
+    expect((await svc.listProjects()).find((p) => p.project === "alpha")).toBeUndefined();
+  });
+
+  it("rejects slugs that do not normalize", async () => {
+    await expect(svc.initProject({ project: "***", user: "frank" })).rejects.toThrow(/no project/);
+    await expect(svc.forgetProject("***")).rejects.toThrow(/does not normalize/);
+  });
+
+  it("answers listProjects from a sweep when the store predates the capability", async () => {
+    await seed({ text: "a row in a legacy store", project: "legacy" });
+    const bare = new Proxy(store, {
+      get(target, prop, recv) {
+        if (prop === "listProjects") return undefined;
+        return Reflect.get(target, prop, recv);
+      }
+    });
+    const legacy = new MemoryService({ store: bare, embedder: new HashEmbeddingProvider() });
+    const projects = await legacy.listProjects();
+    expect(projects.map((p) => p.project)).toContain("legacy");
   });
 });

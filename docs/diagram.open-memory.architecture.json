@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "open-memory 记忆系统架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "open-memory-architecture.html",
+    "repository": {
+      "url": "https://github.com/codersdfs/open-memory.git",
+      "revision": "c3065a4b9aa32b64dc008acf1c9fc246bf909cf0"
+    },
+    "views": [
+      { "id": "write-path", "label": "写入路径", "focus": ["agents", "mcp", "service", "scope", "gate", "reconcile", "embed", "store"], "note": "从 agent 调用到落盘：分区解析、形状闸门、reconcile 判重，最后写入 float32 向量与词项索引。" },
+      { "id": "read-path", "label": "读取路径", "focus": ["agents", "mcp", "service", "scope", "hybrid", "budget", "store"], "note": "候选并集 → 混合打分 → 相关度闸门 → MMR → 硬预算与投影。" },
+      { "id": "lifecycle", "label": "知识与生命周期", "focus": ["knowledge", "store", "decay"], "note": "Markdown 知识页与过期归档如何维护同一份库。" }
+    ]
+  },
+  "layout": { "mode": "grid", "cols": 4, "origin": [40, 80], "gapX": 80, "gapY": 70, "cellW": 150, "cellH": 74 },
+  "components": [
+    { "id": "agents", "type": "external", "label": "AI Agents", "sublabel": "claude · codex · dsh · pi", "tag": "MCP / HTTP / CLI", "row": 0, "col": 0, "sources": [{ "path": "src/adapters/index.ts" }] },
+    { "id": "mcp", "type": "frontend", "label": "接入层", "sublabel": "MCP 8 工具 · HTTP · Console", "tag": "ADR-0003", "row": 1, "col": 0, "sources": [{ "path": "src/mcp/tools.ts", "line": 57 }, { "path": "src/api/server.ts" }] },
+    { "id": "service", "type": "backend", "label": "MemoryService", "sublabel": "save / search / brief", "tag": "core", "row": 1, "col": 1, "sources": [{ "path": "src/core/memoryService.ts", "line": 35 }] },
+    { "id": "scope", "type": "security", "label": "Scope 分区解析", "sublabel": "agent:user · shared · legacy", "tag": "ADR-0007", "row": 1, "col": 2, "sources": [{ "path": "src/core/scope.ts", "line": 124 }] },
+    { "id": "gate", "type": "security", "label": "写入闸门", "sublabel": "形状闸门 → 启发式 → jev 裁判", "tag": "ADR-0015", "row": 2, "col": 0, "sources": [{ "path": "src/core/extraction/extractor.ts" }, { "path": "src/core/judgment/judge.ts" }] },
+    { "id": "reconcile", "type": "backend", "label": "写时 Reconcile", "sublabel": "insert · reinforce · supersede", "tag": "ADR-0011", "row": 2, "col": 1, "sources": [{ "path": "src/core/write/reconciler.ts", "line": 123 }] },
+    { "id": "hybrid", "type": "backend", "label": "HybridRetriever", "sublabel": "候选并集 · BM25+新近+强度", "tag": "ADR-0012", "row": 2, "col": 2, "sources": [{ "path": "src/core/retrieval/hybrid.ts", "line": 83 }] },
+    { "id": "budget", "type": "backend", "label": "预算装配", "sublabel": "MMR λ=0.6 → 硬预算 → 投影", "tag": "ADR-0014", "row": 2, "col": 3, "sources": [{ "path": "src/core/retrieval/tokens.ts", "line": 41 }, { "path": "src/core/retrieval/assemble.ts", "line": 77 }] },
+    { "id": "embed", "type": "backend", "label": "Embedder", "sublabel": "hash 384d · openai · nim", "tag": "向量空间唯一", "row": 3, "col": 0, "sources": [{ "path": "src/core/embedding/index.ts" }, { "path": "src/core/embedding/hash.ts" }] },
+    { "id": "store", "type": "database", "label": "SqliteVectorStore", "sublabel": "memory.db (WAL) · node:sqlite", "tag": "float32 BLOB", "row": 3, "col": 1, "sources": [{ "path": "src/core/store/sqlite.ts", "line": 255 }, { "path": "src/core/store/sqlite.ts", "line": 396 }] },
+    { "id": "knowledge", "type": "messagebus", "label": "知识页同步", "sublabel": "vault/*.md → knowledgeId", "tag": "ADR-0023", "row": 3, "col": 2, "sources": [{ "path": "src/core/knowledge/sync.ts", "line": 126 }] },
+    { "id": "decay", "type": "backend", "label": "生命周期", "sublabel": "归档优先 · 硬清理需 opt-in", "tag": "ADR-0016", "row": 3, "col": 3, "sources": [{ "path": "src/core/lifecycle/decay.ts" }, { "path": "src/core/write/kind.ts", "line": 24 }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "单进程：零依赖，一个 SQLite 文件", "wraps": ["mcp", "service", "scope", "gate", "reconcile", "hybrid", "budget", "embed", "store", "knowledge", "decay"] }
+  ],
+  "connections": [
+    { "id": "agents-to-mcp", "from": "agents", "to": "mcp", "variant": "emphasis" },
+    { "id": "mcp-to-service", "from": "mcp", "to": "service", "label": "调用" },
+    { "id": "service-to-scope", "from": "service", "to": "scope", "label": "解析读写分区", "variant": "security" },
+    { "id": "service-to-gate", "from": "service", "to": "gate", "label": "extractAndSave", "fromSide": "bottom", "toSide": "top" },
+    { "id": "gate-to-reconcile", "from": "gate", "to": "reconcile", "label": "候选句子" },
+    { "id": "reconcile-to-embed", "from": "reconcile", "to": "embed", "label": "嵌入 + 5 近邻", "fromSide": "bottom", "toSide": "top" },
+    { "id": "embed-to-store", "from": "embed", "to": "store", "label": "float32 BLOB + 词项" },
+    { "id": "store-to-knowledge", "from": "store", "to": "knowledge", "variant": "dashed" },
+    { "id": "service-to-hybrid", "from": "service", "to": "hybrid", "label": "search", "variant": "emphasis" },
+    { "id": "hybrid-to-budget", "from": "hybrid", "to": "budget", "label": "MMR 后排序" },
+    { "id": "budget-to-agents", "from": "budget", "to": "agents", "variant": "dashed", "fromSide": "right", "toSide": "top" },
+    { "id": "hybrid-to-store", "from": "hybrid", "to": "store", "label": "向量 ∪ 词项候选", "fromSide": "bottom", "toSide": "top" },
+    { "id": "store-to-decay", "from": "store", "to": "decay", "label": "从未被取用", "variant": "dashed", "fromSide": "bottom", "toSide": "bottom" },
+    { "id": "decay-to-knowledge", "from": "decay", "to": "knowledge", "variant": "dashed", "fromSide": "left", "toSide": "right" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "写入", "items": ["形状闸门拒绝表格行与代码块，实测 165/180 条垃圾被拦，仅 5 条误杀", "5 个同分区近邻决定 insert / reinforce / supersede", "旧行软删并留 supersedes_id，decision 类永不过期"] },
+    { "dot": "emerald", "title": "读取", "items": ["候选 = 向量 ∪ 词项 top-max(20,k*4)，两路都过同一道栅门", "0.6 BM25 + 0.25 新近 + 0.15 强度，hash 嵌入时向量权重为 0", "MMR 后按 token 预算裁剪，放不下才投影，命中回写 reinforce"] },
+    { "dot": "rose", "title": "规模", "items": ["读扇出 private + shared + legacy，写只落一个分区", "80 req/s：search p50 10ms / p95 28ms、零丢弃", "10^5 行 384 维 search 外推约 0.68s"] }
+  ]
+}

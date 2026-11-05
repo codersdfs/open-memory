@@ -107,6 +107,29 @@ describe("api", () => {
     expect(j.summary).toBeTruthy();
   });
 
+  it("projects: init, list, rename and forget over one HTTP surface", async () => {
+    // The marker row makes the project visible before any real write lands.
+    const init = await post("/projects", { project: "web", note: "We decided to track web work in this store" });
+    expect(init.status).toBe(201);
+    const again = await post("/projects", { project: "web" });
+    expect(again.status).toBe(200);
+
+    const listed = (await (await fetch(`${base}/projects`)).json()) as { projects: { project: string | null; rows: number }[] };
+    expect(listed.projects.map((p) => p.project)).toContain("web");
+
+    const renamed = await post("/projects/web/rename", { to: "frontend" });
+    expect(renamed.status).toBe(200);
+    const after = (await (await fetch(`${base}/projects`)).json()) as { projects: { project: string | null }[] };
+    expect(after.projects.map((p) => p.project)).toContain("frontend");
+
+    const forgotten = await fetch(`${base}/projects/frontend`, { method: "DELETE" });
+    expect(forgotten.status).toBe(200);
+    expect(((await forgotten.json()) as { deleted: number }).deleted).toBe(1);
+    // A slug with no live rows is not a project the API will pretend to forget.
+    const unknown = await fetch(`${base}/projects/frontend`, { method: "DELETE" });
+    expect(unknown.status).toBe(404);
+  });
+
   it("serves the UI from the same origin", async () => {
     const res = await fetch(base + "/");
     expect(res.status).toBe(200);

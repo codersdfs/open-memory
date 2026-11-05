@@ -190,6 +190,58 @@ export interface SearchResult {
   /** Additive (ADR-0007): which agent asked and which partitions were actually searched. */
   agent?: string;
   scopes?: string[];
+  /**
+   * Why this search came back empty (ADR-0037).
+   *
+   * Populated **only when `memories.length === 0`** — the key is absent otherwise,
+   * not merely undefined. The happy path must not pay for it: a response's whole
+   * purpose is a token budget, and a caller that got an answer has nothing to
+   * explain.
+   */
+  diagnostics?: SearchDiagnostics;
+}
+
+/** How many live rows a searched partition actually holds (ADR-0037). */
+export interface SearchPartitionCount {
+  namespace: string;
+  /** Rows matching the search's own filters (type/status/project/kind), not the whole partition. */
+  total: number;
+}
+
+/** A candidate the relevance gate rejected, kept so an empty result can explain itself. */
+export interface SearchNearMiss {
+  text: string;
+  /** The number the gate compared against `threshold`. */
+  relevance: number;
+  bm25: number;
+  vector: number;
+  coverage: number;
+}
+
+/**
+ * Why a search came back empty (ADR-0037).
+ *
+ * Present only when `memories` is empty: the happy path must not pay for it, because
+ * a response's whole purpose is a token budget.
+ */
+export interface SearchDiagnostics {
+  /** The threshold that rejected the near misses. */
+  threshold: number;
+  /** One entry per partition actually searched, in the order searched. */
+  partitions: SearchPartitionCount[];
+  /** Rejected candidates, best first. Empty when nothing was even a candidate. */
+  nearMisses: SearchNearMiss[];
+  /**
+   * Partitions this read did not cover that the same user still holds rows in
+   * (ADR-0039). Same shape as `partitions` — a name and a count — because it is the
+   * same question asked about the other side of the boundary.
+   *
+   * Only rows the search's own filters would have admitted are counted, and only
+   * non-empty partitions are listed: "366 rows sit in default:default" is the fact
+   * that changes the caller's next move, and an empty partition outside the scope
+   * changes nothing. Absent on a store that cannot enumerate partitions.
+   */
+  outside?: SearchPartitionCount[];
 }
 
 /**

@@ -75,25 +75,37 @@ function pageTitle(rows: Memory[]): string {
 }
 
 /**
- * Every page in the given partitions. One list call, then a group in memory: a
- * vault is pages-times-sections rows, not millions, and the alternative is a query
- * per page.
+ * Every page in the given partitions.
+ *
+ * ADR-0030: this used to list each partition whole (`limit: 100_000`) and group in
+ * memory, on the reasoning that a vault is pages-times-sections rows and the
+ * alternative is a query per page. Both halves of that were wrong. The rows a page
+ * tree needs are exactly the rows with a `knowledge_id`, which the store can filter
+ * on and has an index for; on a partition of 21,000 rows where 20,000 were ordinary
+ * chat memories, listing it took 388 ms and all but 1,000 rows were thrown away
+ * immediately after being decoded. Filtering first is 12x faster and the cost now
+ * follows the size of the *vault* rather than the size of the partition it lives in.
+ *
+ * Edges are indexed by endpoint once instead of being filtered per page: the old
+ * loop did three full scans of the edge list per page, which is quadratic in pages.
  */
 export async function knowledgePages(
   store: VectorStore,
   opts: { namespaces: string[] }
 ): Promise<KnowledgePageView[]> {
-  const rows: Memory[] = [];
-  for (const namespace of opts.namespaces) {
-    const listed = await store.list({ namespace, limit: 100_000 });
-    rows.push(...listed.memories);
-  }
+  const rows = await knowledgeRows(store, opts.namespaces);
   const edges = store.knowledge ? await store.knowledge.links() : [];
+  const byFrom = new Map<string, KnowledgeEdge[]>();
+  const byTo = new Map<string, KnowledgeEdge[]>();
+  for (const edge of edges) {
+    append(byFrom, edge.from, edge);
+    if (edge.to !== null) append(byTo, edge.to, edge);
+  }
   const pages = groupByPage(rows);
   const out: KnowledgePageView[] = [];
   for (const [id, pageRows] of pages) {
     const title = pageTitle(pageRows);
-    const outgoing = edges.filter((e) => e.from === id);
+    const outgoing = byFrom.get(id) ?? [];
     out.push({
       id,
       title,
@@ -107,12 +119,37 @@ export async function knowledgePages(
           chars: row.text.length
         })),
       links: outgoing,
-      backlinks: edges.filter((e) => e.to === id),
+      backlinks: byTo.get(id) ?? [],
       dangling: outgoing.filter((e) => e.to === null)
     });
   }
   out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
+}
+
+function append(map: Map<string, KnowledgeEdge[]>, key: string, edge: KnowledgeEdge): void {
+  const held = map.get(key);
+  if (held) held.push(edge);
+  else map.set(key, [edge]);
+}
+
+/**
+ * The live knowledge rows of these partitions.
+ *
+ * Uses the store's page-tree query when it has one. The fallback lists the
+ * partitions whole — correct, but it decodes every ordinary memory in them, which
+ * is the cost this function exists to avoid.
+ */
+async function knowledgeRows(store: VectorStore, namespaces: string[]): Promise<Memory[]> {
+  if (store.knowledge?.listKnowledge) return store.knowledge.listKnowledge(namespaces);
+  const rows: Memory[] = [];
+  for (const namespace of namespaces) {
+    // `knowledge: null` asks for ordinary memories — the opposite of what this
+    // wants — so the fallback takes the partition whole and filters here.
+    const listed = await store.list({ namespace, withVectors: false });
+    rows.push(...listed.memories.filter((m) => m.knowledgeId !== null));
+  }
+  return rows;
 }
 
 /** The page index: just enough per page to render a list or a graph. */

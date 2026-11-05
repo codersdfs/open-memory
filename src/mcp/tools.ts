@@ -1,7 +1,9 @@
 import type { MemoryService } from "../core/memoryService.js";
 import type { Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import { stripEmbedding } from "../core/types.js";
-import { resolveAgent, resolveRequestScope, resolveWriteKey, type MemoryScope } from "../core/scope.js";
+import { renderEmptySearch } from "../core/retrieval/explain.js";
+import { CurationRejected, renderVerdict } from "../core/write/curation.js";
+import { resolveAgent, resolveReadScope, resolveRequestScope, resolveWriteKey, type MemoryScope } from "../core/scope.js";
 
 /**
  * The tool surface exposed over MCP.
@@ -159,6 +161,27 @@ export const MEMORY_TOOLS: McpTool[] = [
     }
   },
   {
+    name: "memory_project",
+    description:
+      "Manage projects: list which efforts this store already holds, initialize one so it is visible before its first write, rename one, or forget one. A project is the slug every write is filed under (defaults to the repository); the brief reads from it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        op: {
+          type: "string",
+          enum: ["list", "init", "rename", "forget"],
+          description:
+            "list (default): every project with row counts; init: make a project visible now; rename: move a project's rows to a new slug; forget: soft-delete a project's rows (restorable)."
+        },
+        project: { type: "string", description: "Project slug for init/rename/forget. init defaults to the repository this server runs in." },
+        note: { type: "string", description: "init only: a first decision to file as the project's marker instead of a generic one." },
+        to: { type: "string", description: "rename only: the new slug." },
+        merge: { type: "boolean", description: "rename only: allow moving onto a slug that already holds rows, folding the two together." },
+        detach: { type: "boolean", description: "forget only: unscope the rows (project = null) instead of soft-deleting them." }
+      }
+    }
+  },
+  {
     name: "memory_stats",
     description:
       "Counts per scope and type, including archived rows and rows that have never been retrieved, plus which embedding provider is in use.",
@@ -180,7 +203,9 @@ export interface McpToolResult {
 const asScope = (v: unknown): MemoryScope | undefined => (v === "shared" ? "shared" : v === "private" ? "private" : undefined);
 
 function renderSearch(r: SearchResult, budget: number): string {
-  if (r.memories.length === 0) return "no memories matched";
+  // ADR-0037: an empty result explains itself. `diagnostics` is absent on a daemon
+  // that predates it, and `renderEmptySearch` falls back to the old one-liner then.
+  if (r.memories.length === 0) return renderEmptySearch(r.diagnostics);
   const lines = r.memories.map((m) => {
     const flags = [m.type, m.kind, m.namespace, typeof m.score === "number" ? m.score.toFixed(3) : "-"].join("/");
     return `[${m.id}] (${flags}) ${m.text.replace(/\s+/g, " ").trim()}`;
@@ -266,16 +291,29 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
         if (!text) return { text: "memory_remember: text is required", structured: null, isError: true };
         const scope = asScope(args.scope) ?? ctx.defaultScope ?? "private";
         const namespace = resolveWriteKey({ agent: ctx.defaultAgent, scope });
-        const { memory, decision } = await ctx.service.saveDetailed({
-          namespace,
-          text,
-          type: (args.type as MemoryType | undefined) ?? "semantic",
-          kind: args.kind as MemoryKind | undefined,
-          project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
-          importance: args.importance === undefined ? undefined : Number(args.importance),
-          tags: Array.isArray(args.tags) ? (args.tags as string[]).map(String) : undefined,
-          source: args.source === undefined ? `mcp:${ctx.defaultAgent}` : String(args.source)
-        });
+        let saved: Awaited<ReturnType<MemoryService["saveDetailed"]>>;
+        try {
+          saved = await ctx.service.saveDetailed({
+            namespace,
+            text,
+            type: (args.type as MemoryType | undefined) ?? "semantic",
+            kind: args.kind as MemoryKind | undefined,
+            project: args.project === undefined ? undefined : args.project === null ? null : String(args.project),
+            importance: args.importance === undefined ? undefined : Number(args.importance),
+            tags: Array.isArray(args.tags) ? (args.tags as string[]).map(String) : undefined,
+            source: args.source === undefined ? `mcp:${ctx.defaultAgent}` : String(args.source)
+          });
+        } catch (e) {
+          // A curated rejection is a decision the model should read, not an error to
+          // retry: Mem0 answers "Hi" with no facts and that is the correct answer. The
+          // advice is the whole point — "store the fact itself" is an instruction the
+          // model can act on in its next call, which is why this is not isError.
+          if (e instanceof CurationRejected) {
+            return { text: renderVerdict(e.verdict), structured: { stored: false, curation: e.verdict } };
+          }
+          throw e;
+        }
+        const { memory, decision } = saved;
         // A supersede is the only outcome where an id the model may already have seen is
         // no longer current, so the response has to name it; the other two keep their old
         // wording because existing prompts and logs match on it.
@@ -370,11 +408,17 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
       }
 
       case "memory_stats": {
-        const { namespaces } = resolveRequestScope({
-          agent: ctx.defaultAgent,
-          scope: asScope(args.scope) ?? ctx.defaultScope,
-          all: args.all === true
-        });
+        // `all` is a question about the store (which partitions actually hold rows), so
+        // this goes through the async resolver rather than the pure one — the pure form
+        // answered with a fixed three-name list that skipped other agents' partitions.
+        const { namespaces } = await resolveReadScope(
+          {
+            agent: ctx.defaultAgent,
+            scope: asScope(args.scope) ?? ctx.defaultScope,
+            all: args.all === true
+          },
+          ctx.service.store
+        );
         // Archived rows are excluded from `total` (list() hides them by default) and from
         // every retrieval path, so without these two counters an operator cannot see the
         // gap between "rows in the store" and "rows an agent can actually be handed".
@@ -475,6 +519,61 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
               : index.pages.map((p) => `- [${p.id}] ${p.title} (${p.sections} sections, ${p.links}→ ${p.backlinks}←)`).join("\n") +
                 (index.dangling.length > 0 ? `\ndangling: ${index.dangling.map((e) => `${e.from}→${e.target}`).join(", ")}` : ""),
           structured: index
+        };
+      }
+
+      case "memory_project": {
+        const op = String(args.op ?? "list");
+        const project = args.project === undefined || args.project === null ? undefined : String(args.project);
+        if (op === "init") {
+          const out = await ctx.service.initProject({
+            project,
+            note: args.note === undefined ? undefined : String(args.note),
+            // The marker lands in this server's shared layer: a project is a
+            // cross-agent concern, which is also why there is no scope knob here.
+            agent: ctx.defaultAgent
+          });
+          return {
+            text: out.created ? `initialized ${out.project}` : `${out.project} already exists (${out.rows} row(s))`,
+            structured: out
+          };
+        }
+        if (op === "rename") {
+          const to = args.to === undefined ? undefined : String(args.to);
+          if (!project || !to) return { text: "memory_project rename: project and to are required", structured: null, isError: true };
+          const out = await ctx.service.renameProject(project, to, { merge: args.merge === true });
+          return {
+            text:
+              out.renamed === 0
+                ? `${project} is already ${out.project}`
+                : `renamed ${out.renamed} row(s): ${project} → ${out.project}`,
+            structured: out
+          };
+        }
+        if (op === "forget") {
+          if (!project) return { text: "memory_project forget: project is required", structured: null, isError: true };
+          const out = await ctx.service.forgetProject(project, { mode: args.detach === true ? "detach" : "delete" });
+          return {
+            text:
+              out.deleted > 0
+                ? `soft-deleted ${out.deleted} row(s) of ${out.project} (restorable)`
+                : `detached ${out.detached} row(s) of ${out.project} to unscoped`,
+            structured: out
+          };
+        }
+        const projects = await ctx.service.listProjects();
+        return {
+          text:
+            projects.length === 0
+              ? "no projects yet"
+              : projects
+                  .map((p) => {
+                    const kinds = Object.entries(p.byKind).map(([kind, n]) => `${kind} ${n}`).join(", ");
+                    const last = p.lastActivityAt > 0 ? new Date(p.lastActivityAt).toISOString().slice(0, 10) : "-";
+                    return `- ${p.project ?? "(unscoped)"}  ${p.rows} row(s)${kinds ? `  (${kinds})` : ""}  last ${last}`;
+                  })
+                  .join("\n"),
+          structured: { projects }
         };
       }
 

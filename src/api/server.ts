@@ -5,9 +5,9 @@ import { readFile, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
-import { MemoryService, type SaveInput } from "../core/memoryService.js";
+import { MemoryService, CurationRejected, type SaveInput } from "../core/memoryService.js";
 import { stripEmbedding, TYPES, STATUSES, KINDS, type MemoryType, type MemoryKind, type MemoryStatus } from "../core/types.js";
-import { isScope, resolveRequestScope, resolveWriteKey } from "../core/scope.js";
+import { isScope, resolveReadScope, resolveWriteKey } from "../core/scope.js";
 import { appVersion } from "../version.js";
 import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding, type EmbeddingProvider } from "../core/embedding/index.js";
 import { reembedAll, type ReembedResult } from "../core/embedding/reembed.js";
@@ -84,8 +84,17 @@ function createNamespace(body: Record<string, unknown>): string {
  * resolves it where the agent and user are actually known). Otherwise `agent`/`scope`/
  * `all` resolve here: a daemon that answers from its own default reports nothing found
  * for memories that are plainly there.
+ *
+ * Async because `all` is a question about the store, not about the request: it has to
+ * enumerate the partitions that actually hold rows. Resolving it as a fixed three-name
+ * list (`<agent>:<user>`, `shared:<user>`, legacy) answered `all` with a set that was
+ * missing the partitions of every other agent this user owns — measured on the real
+ * store it skipped the four rows in `coding-agent:frank`.
  */
-function searchScope(q: Record<string, unknown>): { namespace?: string; namespaces?: string[] } {
+async function searchScope(
+  q: Record<string, unknown>,
+  service: MemoryService
+): Promise<{ namespace?: string; namespaces?: string[] }> {
   const listed = str(q.namespaces, 2000, 1)?.split(",").map((s) => s.trim()).filter(Boolean);
   if (listed && listed.length > 0) return { namespaces: listed };
   const explicit = str(q.namespace, 200, 1);
@@ -93,7 +102,10 @@ function searchScope(q: Record<string, unknown>): { namespace?: string; namespac
   const agent = str(q.agent, 200, 1) ?? undefined;
   const scope = isScope(q.scope) ? q.scope : undefined;
   const all = boolish(q.all);
-  if (agent || scope || all) return { namespaces: resolveRequestScope({ agent, scope, all }).namespaces };
+  if (agent || scope || all) {
+    const { namespaces } = await resolveReadScope({ agent, scope, all }, service.store);
+    return { namespaces };
+  }
   return { namespace: "default:default" };
 }
 
@@ -129,14 +141,14 @@ function parseCreate(body: Record<string, unknown>) {  const text = str(body.tex
   };
 }
 
-function parseSearch(q: Record<string, unknown>) {
+async function parseSearch(q: Record<string, unknown>, service: MemoryService) {
   const query = str(q.query, 2000, 1);
   if (!query) return bad("query required");
   return {
     data: {
       query,
       // Overrides `namespace`, and resolves `agent`/`scope`/`all` when it is absent.
-      ...searchScope(q),
+      ...(await searchScope(q, service)),
       type: enumOf(q.type, TYPES),
       project: q.project === undefined ? undefined : q.project === null ? null : String(q.project),
       kind: enumOf(q.kind, KINDS) as MemoryKind | undefined,
@@ -473,7 +485,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   if (path === "/brief" && (method === "GET" || method === "POST")) {
     const body = method === "POST" ? await readJson(req) : {};
     const qq: Record<string, unknown> = { ...q, ...body };
-    const scope = searchScope(qq);
+    const scope = await searchScope(qq, service);
     const sinceDays = num(qq.sinceDays, 1, 3650);
     const brief = await service.brief({
       ...(scope.namespaces ? { namespaces: scope.namespaces } : { namespace: scope.namespace }),
@@ -482,6 +494,59 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       sinceMs: sinceDays === undefined ? undefined : sinceDays * 86_400_000
     });
     return send(res, 200, brief);
+  }
+
+  // Project management (ADR-0042). Reads are one GROUP BY over the dimension; the
+  // writes are bulk statements over the `project` column. Slugs travel URL-encoded,
+  // and every write normalizes through the same `normalizeProject` a memory write
+  // uses, so the CLI, the console and MCP cannot disagree about what a slug is.
+  if (path === "/projects" && method === "GET") {
+    return send(res, 200, { projects: await service.listProjects() });
+  }
+  if (path === "/projects" && method === "POST") {
+    const refused = notJsonProblem(req);
+    if (refused) return send(res, refused.status, { error: refused.error });
+    const body = await readJson(req);
+    // Omitted resolves like a write (env, then the git root); explicit null stays
+    // unaccepted here — initializing "unscoped" is not a project.
+    const project = body.project === undefined ? undefined : String(body.project);
+    const note = body.note === undefined ? undefined : String(body.note);
+    try {
+      const out = await service.initProject({
+        project,
+        note,
+        agent: str(body.agent, 200, 1) ?? undefined,
+        user: str(body.user, 200, 1) ?? undefined
+      });
+      return send(res, out.created ? 201 : 200, out);
+    } catch (e) {
+      return send(res, 400, { error: e instanceof Error ? e.message : "init failed" });
+    }
+  }
+  const projectRename = /^\/projects\/([^/]+)\/rename$/.exec(path);
+  if (projectRename && method === "POST") {
+    const refused = notJsonProblem(req);
+    if (refused) return send(res, refused.status, { error: refused.error });
+    const body = await readJson(req);
+    const to = str(body.to, 200, 1);
+    if (!to) return send(res, 400, { error: "to required (the new project slug)" });
+    try {
+      return send(res, 200, await service.renameProject(decodeURIComponent(projectRename[1]!), to, { merge: body.merge === true }));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "rename failed";
+      return send(res, /unknown project/.test(msg) ? 404 : 400, { error: msg });
+    }
+  }
+  const projectForget = /^\/projects\/([^/]+)$/.exec(path);
+  if (projectForget && method === "DELETE") {
+    // Default is the reversible direction, exactly like `DELETE /memories/:id`.
+    const mode = q.mode === "detach" ? "detach" : "delete";
+    try {
+      return send(res, 200, await service.forgetProject(decodeURIComponent(projectForget[1]!), { mode }));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "forget failed";
+      return send(res, /unknown project/.test(msg) ? 404 : 400, { error: msg });
+    }
   }
 
   // Knowledge index (ADR-0023). `sync` is the only writer: it re-reads the vault and
@@ -495,12 +560,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, report);
   }
   if (path === "/knowledge" && method === "GET") {
-    return send(res, 200, await service.knowledge(knowledgeScope(searchScope(q))));
+    return send(res, 200, await service.knowledge(knowledgeScope(await searchScope(q, service))));
   }
   const knowledgeDetail = path.match(/^\/knowledge\/([^/]+)(\/neighbors)?$/);
   if (knowledgeDetail && method === "GET") {
     const id = decodeURIComponent(knowledgeDetail[1]!);
-    const opts = knowledgeScope(searchScope(q));
+    const opts = knowledgeScope(await searchScope(q, service));
     if (knowledgeDetail[2]) {
       const depth = num(q.depth, 1, 3) ?? 1;
       return send(res, 200, await service.knowledgeNeighbors({ ...opts, id, depth }));
@@ -515,7 +580,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   // search" and answer 404 — which is exactly what `search` did whenever a
   // daemon was running, while the daemon-less path and `POST` kept working.
   if (/^\/memories\/search$/.test(path)) {
-    const p = parseSearch(method === "GET" ? q : await readJson(req));
+    const p = await parseSearch(method === "GET" ? q : await readJson(req), service);
     if ("status" in p) return send(res, p.status, p.body);
     const result = await service.search(p.data);
     return send(res, 200, wantsEmbedding(q) ? result : { ...result, memories: result.memories.map(stripEmbedding) });
@@ -585,7 +650,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     if (!id && method === "POST") {
       const p = parseCreate(await readJson(req));
       if ("status" in p) return send(res, p.status, p.body);
-      return send(res, 201, await service.save(p.data));
+      try {
+        return send(res, 201, await service.save(p.data));
+      } catch (e) {
+        // A curated rejection is a verdict, not a crash: 422 with the class and the
+        // one next move, so a client that sent a table row learns to send the fact.
+        if (e instanceof CurationRejected) return send(res, 422, { error: e.message, curation: e.verdict });
+        throw e;
+      }
     }
     if (!id && method === "GET") {
       const listed = await service.list({
@@ -609,8 +681,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     const body = await readJson(req);
     const text = str(body.text ?? body.turnText, 20000, 1);
     if (!text) return send(res, 400, { error: "text required" });
-    const memories = await service.extractAndSave(text, str(body.namespace, 200, 1) ?? "default:default");
-    return send(res, 200, { extracted: memories.length, memories });
+    const { memories, rejected } = await service.extractAndSave(text, str(body.namespace, 200, 1) ?? "default:default");
+    return send(res, 200, { extracted: memories.length, rejected, memories });
   }
 
   // pi's own session timeline. Read-only and unindexed: the files are the source of

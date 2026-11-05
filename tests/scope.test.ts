@@ -6,6 +6,7 @@ import {
   resolveScopeKeys,
   resolveWriteKey,
   resolveRequestScope,
+  resolveReadScope,
   scopeOfNamespace,
   agentOfNamespace,
   sanitizeSegment,
@@ -169,13 +170,28 @@ describe("request scope (query params / CLI flags / MCP args)", () => {
     expect(r.scopes).toEqual(["shared"]);
   });
 
-  it("all:true sweeps every partition the user owns, legacy included", () => {
-    const r = resolveRequestScope({ agent: "dsh", all: true });
-    // private + shared + the v0.2.0 legacy partition. Without the last one `--all`
-    // covered LESS than a plain request, which already fans out over the legacy family.
-    expect(r.namespaces).toHaveLength(3);
-    expect(r.namespaces).toContain(LEGACY_NAMESPACE);
+  it("all:true sweeps every partition the user owns, legacy included", async () => {
+    // `all` is answered from the store, not from the request: the partitions that exist
+    // are the only ones that can be swept, and a fixed three-name list silently missed
+    // the other agents' partitions this user owns.
+    const store = {
+      distinctNamespaces: async () => ["pi:alice", "coding-agent:alice", "shared:alice", "claude:bob"]
+    };
+    const r = await resolveReadScope({ agent: "pi", all: true }, store, "alice");
+    expect(r.namespaces).toEqual([
+      "coding-agent:alice",
+      LEGACY_NAMESPACE,
+      "pi:alice",
+      "shared:alice"
+    ]);
     expect(r.scopes).toEqual(["private", "shared"]);
+    expect(r.namespaces, "another person's partition is never in a sweep").not.toContain("claude:bob");
+  });
+
+  it("all:true with an explicit namespace still reads just that namespace", async () => {
+    const store = { distinctNamespaces: async () => ["pi:alice"] };
+    const r = await resolveReadScope({ namespace: "shared:alice", all: true }, store, "alice");
+    expect(r.namespaces).toEqual(["shared:alice"]);
   });
 
   it("a bare request without an agent stays in the legacy family, no layer fan-out", () => {

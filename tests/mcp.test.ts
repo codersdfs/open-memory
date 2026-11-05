@@ -81,14 +81,16 @@ describe("MCP tool listing", () => {
     const res = await call({ jsonrpc: "2.0", id: 3, method: "tools/list" });
     const tools = (res.result as { tools: typeof MEMORY_TOOLS }).tools;
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ["memory_brief", "memory_forget", "memory_get", "memory_knowledge", "memory_list", "memory_remember", "memory_search", "memory_stats"].sort()
+      ["memory_brief", "memory_forget", "memory_get", "memory_knowledge", "memory_list", "memory_project", "memory_remember", "memory_search", "memory_stats"].sort()
     );
     for (const t of tools) {
       expect(t.description.length).toBeGreaterThan(20);
       expect(t.inputSchema.type).toBe("object");
       // `memory_get` / `memory_forget` take only an id (a get is not layer-specific);
-      // every other tool must expose the private/shared decision to the model.
-      if (t.name !== "memory_get" && t.name !== "memory_forget") {
+      // `memory_project` is store-wide by design — a project spans every partition
+      // that wrote into it, so a layer knob would lie. Every other tool must expose
+      // the private/shared decision to the model.
+      if (t.name !== "memory_get" && t.name !== "memory_forget" && t.name !== "memory_project") {
         expect(t.inputSchema.properties).toHaveProperty("scope");
       }
     }
@@ -231,6 +233,19 @@ describe("MCP tools/call", () => {
     const stats = (res.result as Record<string, unknown>).structuredContent as { perScope: Record<string, { total: number }> };
     expect(stats.perScope["claude:mcpuser"]!.total).toBe(1);
     expect(stats.perScope["shared:mcpuser"]!.total).toBe(1);
+  });
+
+  it("memory_project initializes, lists and forgets a project", async () => {
+    const init = await call({ jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "memory_project", arguments: { op: "init", project: "gamma" } } });
+    expect((init.result as { isError?: boolean }).isError ?? false).toBe(false);
+
+    const listed = await call({ jsonrpc: "2.0", id: 21, method: "tools/call", params: { name: "memory_project", arguments: { op: "list" } } });
+    const structured = (listed.result as Record<string, unknown>).structuredContent as { projects: { project: string | null; rows: number }[] };
+    expect(structured.projects.map((p) => p.project)).toContain("gamma");
+
+    const forgotten = await call({ jsonrpc: "2.0", id: 22, method: "tools/call", params: { name: "memory_project", arguments: { op: "forget", project: "gamma" } } });
+    expect((forgotten.result as { isError?: boolean }).isError ?? false).toBe(false);
+    expect(String(((forgotten.result as Record<string, unknown>).content as { text: string }[])[0]!.text)).toMatch(/soft-deleted 1 row/);
   });
 });
 

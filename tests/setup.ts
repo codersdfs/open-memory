@@ -21,6 +21,8 @@ const FOREIGN = [
   "TYPESAFE_API_KEY",
   "MEMORY_JEV",
   "MEMORY_JEV_MIN",
+  "MEMORY_WRITE_GATE",
+  "MEMORY_WRITE_GATE_MIN",
   "MEMORY_RECONCILE",
   "MEMORY_RECONCILE_LEX",
   "MEMORY_RECONCILE_COS",
@@ -42,6 +44,15 @@ const FOREIGN = [
   "OPENAI_EMBED_MODEL",
   "NIM_EMBED_MODEL",
   "JEV_ENDPOINT",
+  // Retrieval kill switches. Each one silently changes what a search returns, so a
+  // shell that exported one (to reproduce a bench run, say) flipped the colour of
+  // the relevance tests without touching a line of code.
+  "MEMORY_Q8",
+  "MEMORY_ASSEMBLE",
+  "MEMORY_RECONCILE_NEIGHBOURS",
+  // The partition vector cache only changes speed, never an answer, but a shell that
+  // set it to a tiny budget or "off" would make the cache tests measure the scan.
+  "MEMORY_VECTOR_CACHE_MB",
 ] as const;
 
 for (const key of FOREIGN) delete process.env[key];

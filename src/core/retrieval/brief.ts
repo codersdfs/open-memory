@@ -118,6 +118,9 @@ export async function assembleBrief(store: VectorStore, input: BriefInput): Prom
         status: "active"
       });
       for (const memory of rows.memories) {
+        // The init marker (ADR-0042) makes an empty project visible to management;
+        // in a brief it would be a permanent "decision" spending budget on itself.
+        if (memory.tags?.includes("project:init")) continue;
         // `recent` is deliberately type-shaped: what happened is episodic, and a
         // decision written today already appears above. Re-listing it here would
         // spend the newest-section budget on a duplicate.

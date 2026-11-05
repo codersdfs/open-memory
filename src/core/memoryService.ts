@@ -1,7 +1,7 @@
 import "../config.js";
 import type { EmbeddingProvider } from "./embedding/provider.js";
 import { createEmbeddingProvider } from "./embedding/index.js";
-import type { VectorStore } from "./store/interface.js";
+import type { ProjectSummary, VectorStore } from "./store/interface.js";
 import { HybridRetriever } from "./retrieval/hybrid.js";
 import type { Memory, MemoryInput, SearchOptions, SearchResult } from "./types.js";
 import { Extractor } from "./extraction/extractor.js";
@@ -16,20 +16,34 @@ import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, t
 import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
 import type { BriefOptions, BriefResult } from "./types.js";
 import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
-import { jevEnabled, jevRelation, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
+import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, type CurationVerdict } from "./write/curation.js";
+import { jevEnabled, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
 
 export type SaveInput = Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope };
 
 export interface SaveResult {
   memory: Memory;
   decision: Decision;
+  /**
+   * Present only when curation demoted the write (ADR-0040) — the row carries its
+   * `curation:*` tag already, and a field on every result would make the common case
+   * carry the uncommon one, the same trade `SearchResult.diagnostics` makes.
+   */
+  curation?: CurationVerdict;
 }
+
+export { CurationRejected };
 
 /** A knob that is set but unreadable falls back to the default instead of NaN. */
 function envNumber(value: string | undefined, fallback: number): number {
   if (value === undefined || value.trim() === "") return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/** Rows the extractor's jev already priced carry the tag; the write gate never asks twice. */
+function alreadyJevJudged(input: SaveInput): boolean {
+  return (input.tags ?? []).includes("judged:jev");
 }
 
 export class MemoryService {
@@ -115,17 +129,69 @@ export class MemoryService {
       ? normalizeProject(input.project)
       : resolveProject().project;
     const kind = deriveKind(input.text, { explicit: input.kind, type: input.type });
-    const importance = input.importance ?? (input.kind ? KIND_IMPORTANCE[kind] : undefined);
+    let importance = input.importance ?? (input.kind ? KIND_IMPORTANCE[kind] : undefined);
+    // Curation (ADR-0040) runs before the embed: a rejected candidate must not cost a
+    // vector round trip, and a demoted one changes the very values the rest of this
+    // method would embed and store. An explicit kind or importance is the caller's
+    // own verdict, so demotion only applies to values the store derived.
+    const origin = input.source === "extractor" ? ("extracted" as const) : ("explicit" as const);
+    let effectiveKind = kind;
+    let curationTag: string | undefined;
+    let curation: CurationVerdict | undefined;
+    if ((env.MEMORY_CURATE ?? "").trim().toLowerCase() !== "off") {
+      const verdict = curate(input.text, { origin });
+      if (verdict.action === "reject") throw new CurationRejected(verdict);
+      if (verdict.action === "demote" && input.kind === undefined && input.importance === undefined) {
+        effectiveKind = DEMOTE_KIND;
+        importance = DEMOTE_IMPORTANCE;
+        curationTag = verdict.tag;
+        curation = verdict;
+      }
+    }
+    // The write gate (ADR-0041) is the judgement call no regex settles, asked once for
+    // every write no judge has seen. Rows the extractor's jev already priced carry
+    // `judged:jev` and skip this — one judgement per row, never two. A curation
+    // demotion also stands: the structural verdict outranks the model's optimism about
+    // the same sentence. Fail-open, like everything else on the judge wire — no key or
+    // a failed call stores the write unjudged rather than losing it.
+    if (!curation && !alreadyJevJudged(input) && writeGateEnabled() && input.text.trim().length >= 12) {
+      const verdict = await jevWriteGate(input.text);
+      if (verdict) {
+        const callerSetValues = input.kind === undefined && input.importance === undefined;
+        if (verdict.keep < WRITE_GATE_MIN() || verdict.scaffold >= 0.5) {
+          if (origin === "extracted") {
+            throw new CurationRejected({ action: "reject", junk: "low-value", advice: ADVICE["low-value"] });
+          }
+          if (callerSetValues) {
+            // An explicit write is the caller's ask: priced, not refused — the same
+            // bargain the weak curation classes strike with a named caller.
+            effectiveKind = DEMOTE_KIND;
+            importance = DEMOTE_IMPORTANCE;
+            curationTag = "curation:low-value";
+            curation = { action: "demote", junk: "low-value", advice: ADVICE["low-value"], tag: curationTag };
+          } else {
+            curationTag = "judged:write-gate";
+          }
+        } else if (callerSetValues) {
+          // Only derived values get priced: a caller who named an importance made
+          // their own judgement about this row, and the store does not second-guess it.
+          importance = importanceFor(verdict.keep);
+          curationTag = "judged:write-gate";
+        } else {
+          curationTag = "judged:write-gate";
+        }
+      }
+    }
     const target: MemoryInput = {
       namespace,
       project,
-      kind,
+      kind: effectiveKind,
       type: input.type,
       text: input.text,
       importance,
       strength: input.strength,
       source: input.source,
-      tags: input.tags,
+      tags: curationTag ? [...(input.tags ?? []), curationTag] : input.tags,
       supersedesId: input.supersedesId ?? null,
       visibility: input.visibility,
       status: input.status,
@@ -176,7 +242,10 @@ export class MemoryService {
       text: input.text,
       type: target.type,
       source: input.source,
-      callerTags: input.tags,
+      // The curation tag rides in the caller tags: reconcile builds the row's tags
+      // from these, so a demotion tag passed only via `target` would be dropped on
+      // the insert path and the row would sit at the bottom unexplained.
+      callerTags: curationTag ? [...(input.tags ?? []), curationTag] : input.tags,
       neighbours,
       embedderKind: this.embedder.name,
       relation: this.relationJudge(),
@@ -224,7 +293,8 @@ export class MemoryService {
       memory,
       // A decision that named an action this service could not carry out keeps its
       // reason: reporting "no-neighbour" after a vanished row hides what happened.
-      decision: decision.action === "insert" ? decision : { ...decision, action: "insert", oldId: undefined }
+      decision: decision.action === "insert" ? decision : { ...decision, action: "insert", oldId: undefined },
+      ...(curation ? { curation } : {})
     };
   }
 
@@ -260,7 +330,9 @@ export class MemoryService {
    * everything that matters. A bulk import is new material by definition — the
    * caller that is replaying something it already stored can turn reconcile back on
    * explicitly. Embeddings go through `embedBatch` where the provider offers one, so
-   * a remote embedder costs one round trip instead of one per row.
+   * a remote embedder costs one round trip instead of one per row. Curation is off
+   * here for the same reason: an import is a deliberate act, and a 5,000-row file
+   * that fails on row 3 because one line ends in a colon is a hostile gate.
    */
   async saveMany(
     inputs: SaveInput[],
@@ -347,6 +419,130 @@ export class MemoryService {
     return assembleBrief(this.store, { ...opts, project, namespaces });
   }
 
+  /**
+   * Project management (ADR-0042). The operations are bulk statements over the
+   * `project` column, resolved the same way writes are: an explicit slug wins,
+   * otherwise the repository this process runs in.
+   */
+
+  /**
+   * Every project the store holds, live rows only. Native stores answer with one
+   * GROUP BY; the fallback sweeps partitions and groups in memory, which is correct
+   * at any size and only slow — the trade `countNeverRetrieved` already accepts.
+   */
+  async listProjects(): Promise<ProjectSummary[]> {
+    if (this.store.listProjects) return this.store.listProjects();
+    const bySlug = new Map<string, ProjectSummary>();
+    const fold = (m: Memory) => {
+      const key = m.project ?? "\0unscoped";
+      let summary = bySlug.get(key);
+      if (!summary) {
+        summary = { project: m.project, rows: 0, byKind: {}, lastActivityAt: 0 };
+        bySlug.set(key, summary);
+      }
+      summary.rows++;
+      summary.byKind[m.kind] = (summary.byKind[m.kind] ?? 0) + 1;
+      if (m.createdAt > summary.lastActivityAt) summary.lastActivityAt = m.createdAt;
+    };
+    for (const ns of await this.store.distinctNamespaces()) {
+      for (let offset = 0; ; offset += 500) {
+        const page = await this.store.list({ namespace: ns, status: "active", limit: 500, offset, withVectors: false });
+        for (const m of page.memories) fold(m);
+        if (page.memories.length === 0 || offset + page.memories.length >= page.total) break;
+      }
+    }
+    return [...bySlug.values()].sort(
+      (a, b) => b.rows - a.rows || (a.project ?? "").localeCompare(b.project ?? "")
+    );
+  }
+
+  /**
+   * Make a project visible now, without waiting for its first real write.
+   *
+   * Idempotent: an initialized or already-written project is reported, not written
+   * again. The marker is one durable `decision` row tagged `project:init` in the
+   * shared layer — a project is a cross-agent concern — and the brief skips the tag,
+   * so visibility costs the brief nothing.
+   */
+  async initProject(opts: { project?: string | null; note?: string; namespace?: string; agent?: string; user?: string } = {}): Promise<{
+    project: string;
+    created: boolean;
+    rows: number;
+    memory: Memory | null;
+  }> {
+    const slug = opts.project !== undefined ? normalizeProject(opts.project) : resolveProject().project;
+    if (!slug) {
+      throw new Error(
+        "init: no project to initialize — pass a slug ([a-z0-9._-], max 40 chars) or run inside a git checkout"
+      );
+    }
+    const existing = (await this.listProjects()).find((s) => s.project === slug);
+    if (existing) return { project: slug, created: false, rows: existing.rows, memory: null };
+
+    const text = opts.note?.trim() || `Project ${slug} initialized.`;
+    const namespace = opts.namespace?.trim()
+      ? opts.namespace.trim()
+      : resolveWriteKey({ agent: opts.agent, user: opts.user, scope: "shared" });
+    // A direct store write, not save(): the marker is system-authored, and the
+    // curation gate (ADR-0040) would read "Project X initialized." as scaffold and
+    // demote it. Skipping reconcile is the other half of the same call — re-initializing
+    // after a forget must insert, never "reinforce" into a tombstone. `saveMany` and
+    // the knowledge sync bypass the gates the same way for deliberate writes.
+    const embedding = await this.embedder.embed(text, { inputType: "passage" });
+    const memory = await this.store.insert(
+      {
+        namespace,
+        project: slug,
+        kind: "decision",
+        type: "semantic",
+        text,
+        importance: KIND_IMPORTANCE.decision,
+        source: "project:init",
+        tags: ["project:init"]
+      },
+      embedding
+    );
+    return { project: slug, created: true, rows: 1, memory };
+  }
+
+  async renameProject(from: string, to: string, opts: { merge?: boolean } = {}): Promise<{ renamed: number; project: string }> {
+    const source = normalizeProject(from);
+    const target = normalizeProject(to);
+    if (!source || !target) {
+      throw new Error("rename: both slugs must normalize to a project slug ([a-z0-9._-], max 40 chars)");
+    }
+    if (!this.store.renameProject) throw new Error("this store does not support project management");
+    if (source === target) return { renamed: 0, project: target };
+    const summaries = await this.listProjects();
+    if (!summaries.some((s) => s.project === source)) {
+      throw new Error(`rename: unknown project "${source}"`);
+    }
+    // A rename onto an occupied slug is a merge of two efforts' history — legal, but
+    // never a side effect of a typo, so it is asked for explicitly.
+    const occupying = summaries.find((s) => s.project === target);
+    if (occupying && occupying.rows > 0 && !opts.merge) {
+      throw new Error(`rename: project "${target}" already holds ${occupying.rows} row(s) — pass merge to fold them together`);
+    }
+    const renamed = await this.store.renameProject(source, target);
+    return { renamed, project: target };
+  }
+
+  async forgetProject(slug: string, opts: { mode?: "detach" | "delete" } = {}): Promise<{ detached: number; deleted: number; project: string }> {
+    const target = normalizeProject(slug);
+    if (!target) {
+      throw new Error(`forget: "${slug}" does not normalize to a project slug ([a-z0-9._-], max 40 chars)`);
+    }
+    if (!this.store.forgetProject) throw new Error("this store does not support project management");
+    if (!(await this.listProjects()).some((s) => s.project === target)) {
+      throw new Error(`forget: unknown project "${target}"`);
+    }
+    // Soft delete by default: every row stays restorable, the same bargain a single
+    // `forget` strikes. Detaching is the explicit alternative for rows that outlive
+    // the project they were filed under.
+    const res = await this.store.forgetProject(target, { mode: opts.mode ?? "delete" });
+    return { ...res, project: target };
+  }
+
   async delete(id: string): Promise<void> {
     await this.store.deleteSoft(id);
   }
@@ -420,26 +616,41 @@ export class MemoryService {
    * Extract and store. `referenceDate` is the moment the turn was said, so a replayed
    * old turn stamps "yesterday" onto the right day instead of onto today; callers that
    * have no better answer omit it and get the wall clock.
+   *
+   * Curation rejections are the expected outcome here, not errors: an extractor that
+   * slices three candidates out of every turn and keeps none of them did its job
+   * (Mem0's `{"facts": []}` is a success). `rejected` says how many were refused and
+   * why-shaped, so a caller can tell "the turn held nothing durable" apart from
+   * "the extractor was off".
    */
-  async extractAndSave(turnText: string, namespace: string, referenceDate?: number): Promise<Memory[]> {
+  async extractAndSave(turnText: string, namespace: string, referenceDate?: number): Promise<{ memories: Memory[]; rejected: number }> {
     const extracted = await this.extractor.extract(turnText, referenceDate ?? Date.now());
     // A replayed turn carries the project of the repository being replayed, not of
     // whatever directory this process happens to sit in.
     const project = resolveProject().project;
     const saved: Memory[] = [];
+    let rejected = 0;
     for (const ex of extracted) {
-      const mem = await this.save({
-        namespace,
-        project,
-        type: ex.type,
-        kind: deriveKind(ex.text, { type: ex.type }),
-        text: ex.text,
-        importance: ex.importance,
-        tags: ex.tags,
-        source: "extractor"
-      });
-      saved.push(mem);
+      try {
+        const mem = await this.save({
+          namespace,
+          project,
+          type: ex.type,
+          kind: deriveKind(ex.text, { type: ex.type }),
+          text: ex.text,
+          importance: ex.importance,
+          tags: ex.tags,
+          source: "extractor"
+        });
+        saved.push(mem);
+      } catch (e) {
+        if (e instanceof CurationRejected) {
+          rejected += 1;
+          continue;
+        }
+        throw e;
+      }
     }
-    return saved;
+    return { memories: saved, rejected };
   }
 }

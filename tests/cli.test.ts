@@ -115,6 +115,34 @@ describe("ai-memory CLI", () => {
     expect(next.stdout).toContain("superseded");
   });
 
+  it("manages a project end to end: init, list, rename, forget", () => {
+    // The marker row is what makes the project visible before its first real write.
+    const init = run(["project", "init", "alpha", "--note", "We decided to track alpha in this store", "--json"], db);
+    expect(init.code).toBe(0);
+    expect(JSON.parse(init.stdout) as { created: boolean; project: string }).toMatchObject({ created: true, project: "alpha" });
+
+    // Idempotent: the second init reports the project instead of writing again.
+    const again = run(["project", "init", "alpha", "--json"], db);
+    expect(again.code).toBe(0);
+    expect((JSON.parse(again.stdout) as { created: boolean }).created).toBe(false);
+
+    const list = run(["project", "list"], db);
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("alpha");
+
+    const rename = run(["project", "rename", "alpha", "gamma"], db);
+    expect(rename.code).toBe(0);
+    expect(rename.stdout).toContain("gamma");
+
+    const forget = run(["project", "forget", "gamma"], db);
+    expect(forget.code).toBe(0);
+    expect(forget.stdout).toMatch(/soft-deleted 1 row/);
+
+    // The list answers for the whole store, so the forgotten slug is gone from it.
+    const after = run(["project", "list"], db);
+    expect(after.stdout).not.toContain("gamma");
+  });
+
   it("--all sweeps every partition this user owns", () => {
     run(["save", "the staging key rotates on Fridays", "--agent", "claude", "--json"], db);
     run(["save", "codex prefers short diffs", "--agent", "codex", "--json"], db);

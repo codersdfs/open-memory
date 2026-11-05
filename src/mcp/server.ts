@@ -2,6 +2,8 @@ import { createInterface } from "node:readline";
 import { MemoryService } from "../core/memoryService.js";
 import { MemoryClient, unwrapMemory } from "../cli/http.js";
 import { resolveAgent, type MemoryScope } from "../core/scope.js";
+import { renderEmptySearch } from "../core/retrieval/explain.js";
+import type { SearchDiagnostics } from "../core/types.js";
 import { callTool, MEMORY_TOOLS, type ToolContext } from "./tools.js";
 
 /**
@@ -194,7 +196,14 @@ async function callViaDaemon(
     case "memory_search": {
       const query = String(args.query ?? "").trim();
       if (!query) return { text: "memory_search: query is required", structured: null, isError: true };
-      const res = await client.get<{ memories: { id: string; type: string; namespace: string; text: string; score?: number }[]; tokensUsed: number; truncated: boolean }>(
+      // `diagnostics` is optional: this may be talking to a daemon built before
+      // ADR-0037, which answers without the key at all.
+      const res = await client.get<{
+        memories: { id: string; type: string; namespace: string; text: string; score?: number }[];
+        tokensUsed: number;
+        truncated: boolean;
+        diagnostics?: SearchDiagnostics;
+      }>(
         "/memories/search" +
           MemoryClient.query({
             query,
@@ -209,7 +218,7 @@ async function callViaDaemon(
       if (!res.ok) return { text: `memory_search failed: ${res.error}`, structured: null, isError: true };
       const text =
         res.data.memories.length === 0
-          ? "no memories matched"
+          ? renderEmptySearch(res.data.diagnostics)
           : res.data.memories
               .map((m) => `[${m.id}] (${m.type}/${m.namespace}, ${(m.score ?? 0).toFixed(3)}) ${m.text.replace(/\s+/g, " ").trim()}`)
               .join("\n") + `\ntokens: ${res.data.tokensUsed}`;

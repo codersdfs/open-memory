@@ -80,4 +80,33 @@ describe("relevance under hash embeddings", () => {
     expect(ids).toContain(hit.id);
     expect(ids, "no lexical overlap and no vector signal means not a candidate at all").not.toContain(noise.id);
   });
+
+  // The English cases above all passed while Chinese search was returning filler.
+  // A Chinese question expands into unigrams and straddle bigrams of its own
+  // function words, so nearly every row matched *something* and BM25's length
+  // normalization — the denominator ADR-0027 fixed — then ranked a row that only
+  // shared 「的」 above the row holding the marker. Bench numbers before the fix:
+  // CJK recall@5 0.648 with 37% of queries answering with unrelated rows.
+  it("ranks the row holding the marker above a row that only rhymes with the question", async () => {
+    const gold = await put(
+      "Convention in bench-project-0: the index for cli is zq1064, and it fails silently when the WAL is on a network drive.",
+      0.6
+    );
+    // Same grammar, same project word, same 「配置」 topic — a different marker.
+    const filler = await put("项目 bench-project-1 的约定：cli 的流程使用 zq1073，并且它 returns stale rows。", 0.6);
+    const r = await retriever.search({ query: "bench-project-0 里的 zq1064 是怎么配置的", namespace: NS, k: 5, threshold: 0.35 });
+    const ids = r.memories.map((m) => m.id);
+    expect(ids).toContain(gold.id);
+    expect(ids.indexOf(gold.id), "the marker outranks the grammar").toBeLessThan(ids.indexOf(filler.id));
+  });
+
+  it("still answers the same Chinese question with the partition's only useful row", async () => {
+    await put("项目 bench-project-1 的约定：cli 的流程使用 zq1073，并且它 returns stale rows。", 0.6);
+    const gold = await put(
+      "Convention in bench-project-0: the index for cli is zq1064, and it fails silently when the WAL is on a network drive.",
+      0.6
+    );
+    const r = await retriever.search({ query: "bench-project-0 里的 zq1064 是怎么配置的", namespace: NS, k: 5, threshold: 0.35 });
+    expect(r.memories.map((m) => m.id)).toContain(gold.id);
+  });
 });

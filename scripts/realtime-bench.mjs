@@ -48,6 +48,17 @@ const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), "..");
 const SCHEMA = "realtime-bench/1";
 
+// The bench measures the engine, and its contract is "no key, no network,
+// reproducible" (the hash embedder is chosen for the same reason). A judge key
+// in ~/.ai-memory/settings.json otherwise puts a model round trip inside every
+// write (measured: write p50 3 ms → 209 ms, and the run's saturation point
+// moved with an unrelated service), so model judgment is pinned off the same
+// way the embedder is. `MEMORY_JEV=false` is the master switch that stills the
+// write gate with it; a real environment value beats this default, so a run
+// that wants the judged write path can set MEMORY_JEV itself.
+process.env.MEMORY_JEV ??= "false";
+process.env.MEMORY_WRITE_GATE ??= "false";
+
 const DEFAULTS = {
   duration: 30,
   rate: 60,
@@ -72,6 +83,7 @@ const DEFAULTS = {
   minRecall5Bare: 0.98,
   minRecall5Noisy: 0.85,
   minRecall5Cjk: 0.6,
+  minRecall5Semantic: 0.75,
   keep: false
 };
 
@@ -102,7 +114,8 @@ function parseArgs(argv) {
   const numeric = new Set([
     "duration", "rate", "workers", "facts", "queries", "projects", "seed", "k",
     "budget", "threshold", "syncEvery", "syncPages", "vaultPages", "maxSearchP95",
-    "minRecall5", "minRecall5Bare", "minRecall5Noisy", "minRecall5Cjk"
+    "minRecall5", "minRecall5Bare", "minRecall5Noisy", "minRecall5Cjk",
+    "minRecall5Semantic"
   ]);
   const bool = new Set(["json", "assert", "keep"]);
   for (let i = 0; i < argv.length; i++) {
@@ -168,8 +181,14 @@ async function loadModules(opts) {
     embedder = embeddings.createEmbeddingProvider({ ...process.env, EMBEDDING_PROVIDER: "nim" });
   } else if (opts.embedder === "hash") {
     embedder = new hash.HashEmbeddingProvider();
+  } else if (opts.embedder === "synthetic") {
+    // Offline, deterministic, semantics-carrying. The only embedder that makes
+    // `weights.vector` non-zero without a network key, which is what the `semantic`
+    // recall gate needs: see the note on it in the gates block below.
+    const synthetic = await load("src/core/embedding/synthetic.ts");
+    embedder = new synthetic.SyntheticEmbeddingProvider();
   } else {
-    fail(`--embedder must be hash or nim (got ${opts.embedder})`);
+    fail(`--embedder must be hash, nim or synthetic (got ${opts.embedder})`);
   }
   return {
     MemoryService: svc.MemoryService,
@@ -483,16 +502,43 @@ async function main() {
     const RECALL_FLOORS = {
       bare: opts.minRecall5Bare,
       noisy: opts.minRecall5Noisy,
-      cjk: opts.minRecall5Cjk
+      cjk: opts.minRecall5Cjk,
+      // The semantic mode is the only question shape no marker can answer by lookup, so
+      // it is the only one that changes when the vector path degrades — the other three
+      // read 1.00 with a broken cosine because the term index still finds the marker.
+      // Measured on this bench: losing a third of the vector candidates drops semantic
+      // recall@5 from 0.98 to 0.63 while bare/cjk/noisy stay at 1.00.
+      //
+      // 0.75 sits between the healthy 0.95-0.98 (synthetic, 20-25 s runs) and that
+      // 0.63. Ordinary latency churn moves it by ~0.03; a real regression moves it by
+      // 0.3, so the floor separates them with room for both.
+      //
+      // It is NOT a proof that only a cosine can answer the question: a plain word
+      // overlap also reaches ~0.86 here, so this floor holds under `hash` too. The gate
+      // that stops a vector-less embedder from quietly passing is
+      // `semantic mode needs a vector path` below, keyed on weights.vector.
+      semantic: opts.minRecall5Semantic
     };
     const recallGates = Object.entries(summary.quality.byMode)
       .filter(([mode]) => RECALL_FLOORS[mode] !== undefined)
       .map(([mode, q]) => [`recall@5 ${mode} >= ${RECALL_FLOORS[mode]}`, q.recall5 >= RECALL_FLOORS[mode]]);
+    // The semantic gate is the point of this leg, so it must not silently disappear.
+    // Only bare/noisy/cjk ever appeared before this mode existed; if the corpus
+    // produced no semantic questions at all there is nothing to prove and no gate to
+    // fall back on, so require the mode to be present rather than skipped.
+    const semanticRan = summary.quality.byMode.semantic !== undefined;
+    // ...and it must be *measurable*. `hybrid.ts` zeroes `weights.vector` for the hash
+    // embedder, so a `hash` run has no cosine in its ranking at all: its semantic recall
+    // is answered by word overlap, and passing the floor would say nothing. Fail instead
+    // of reporting a green gate for a path that does not exist.
+    const vectorPathLive = (svc.retriever?.weights?.vector ?? 0) > 0;
     const gates = [
       ["errors", summary.errors === 0],
       ["dropped", summary.dropped === 0],
       [`search p95 <= ${opts.maxSearchP95}ms`, searchP95 <= opts.maxSearchP95],
       ...recallGates,
+      ["semantic mode exercised", semanticRan],
+      ["semantic mode needs a vector path", vectorPathLive],
       ["budget not overrun", summary.quality.budgetOverBudget === 0],
       ["no sync errors", syncError === null]
     ];
