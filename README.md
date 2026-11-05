@@ -56,6 +56,25 @@ ai-memory agent link --write   # register with every coding agent detected on th
 ai-memory agent doctor         # what it wrote, and whether it can work
 ```
 
+Don't feel like typing it? **Copy this whole block and paste it into your agent** — it will
+install, wire itself in, and prove it works:
+
+```text
+Set up Open Memory (local-first agent memory) on this machine for me:
+
+1. Install it globally: `npm i -g @franklinww/open-memory` (the command is `ai-memory`; needs Node 22+).
+2. Wire it into every coding agent it detects, then verify what it wrote:
+   - `ai-memory agent link --write`
+   - `ai-memory agent doctor`
+3. Prove it works end to end:
+   - `ai-memory save "user prefers dark mode" --type semantic`
+   - `ai-memory search "dark mode" --explain`
+
+It writes to a local SQLite file at ~/.ai-memory/memory.db — no Docker, and the default embedder
+needs no API key. If `ai-memory` is already on PATH, skip step 1. Finish by showing me the output
+of `ai-memory agent doctor` and the search.
+```
+
 Claude Code, Codex, DeepSeek Harness and pi are known by name. Any other MCP client is
 one command away with no code: `ai-memory agent add cursor --mcp-file ~/.cursor/mcp.json`.
 Full table, flags and the three mechanisms: [docs/integrations.md](docs/integrations.md).
