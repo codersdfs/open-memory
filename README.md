@@ -31,7 +31,7 @@ the packed tarball on a clean Ubuntu runner and exercises the CLI, the daemon an
 console there. **macOS is untested** — reports welcome.
 
 ```bash
-npm i -g open-memory    # the package; the command is still `ai-memory`
+npm i -g @franklinww/open-memory    # the package; the command is still `ai-memory`
 ai-memory db info       # where the store lives, and why
 ai-memory save "user prefers dark mode" --type semantic
 ai-memory search "dark mode" --explain
@@ -76,7 +76,7 @@ Installed from npm there is no clone to `npm start` in; the server is the same e
 run directly:
 
 ```bash
-node node_modules/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB_PATH
+node node_modules/@franklinww/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB_PATH
 ```
 
 `PORT` is read by the server **and** by the CLI's daemon probe, so a process that answers
@@ -161,7 +161,7 @@ Wiring an agent that already exists is a CLI command, not this snippet — see
 [docs/integrations.md](docs/integrations.md). This section is for an agent you are writing.
 
 ```ts
-import { MemoryService, createMemoryTool, autoInject } from "open-memory";
+import { MemoryService, createMemoryTool, autoInject } from "@franklinww/open-memory";
 
 const svc = new MemoryService();
 await svc.init();

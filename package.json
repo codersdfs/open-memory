@@ -1,8 +1,11 @@
 {
-  "name": "open-memory",
+  "name": "@franklinww/open-memory",
   "version": "0.4.0-beta.2",
   "description": "Local-first memory for pi agents: SQLite + hybrid retrieval + hard token budget. One process, no UI framework.",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "stupidcoderathere <franklinwong207@gmail.com>",
   "repository": {
     "type": "git",

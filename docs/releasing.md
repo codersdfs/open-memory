@@ -22,7 +22,7 @@ nothing to leak, rotate or revoke.
 
    ```bash
    npm login
-   npm publish --tag beta
+   npm publish --tag beta    # scoped @franklinww/open-memory; publishConfig.access="public" in package.json makes it public without --access
    ```
 
 2. On [npmjs.com](https://www.npmjs.com) open the package → **Settings** → **Trusted
@@ -52,7 +52,7 @@ git tag -a v0.4.0-beta.2 -m "open-memory 0.4.0-beta.2"
 git push origin master --follow-tags            # this starts publish.yml
 ```
 
-A version with a prerelease goes out as `beta` (`npm i open-memory@beta`), a plain version
+A version with a prerelease goes out as `beta` (`npm i @franklinww/open-memory@beta`), a plain version
 as `latest`. The workflow refuses to publish when the tag and `package.json` disagree.
 
 ## When it fails
@@ -61,4 +61,5 @@ as `latest`. The workflow refuses to publish when the tag and `package.json` dis
 |---|---|
 | `ENEEDAUTH`, "Unable to authenticate" | filename, repository or owner does not match the npmjs.com config, or `id-token: write` is missing |
 | `npm error 404` on publish | the package does not exist yet — publish the first version by hand |
+| `npm error 403 "Package name too similar"` | the bare name is taken/too close (npm blocks `open-memory` vs `openmemory`) — publish the scoped `@franklinww/open-memory` |
 | the tarball installs without the console | `npm --prefix ui run build` did not run before `npm run build` |

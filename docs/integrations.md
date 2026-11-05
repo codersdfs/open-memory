@@ -135,10 +135,10 @@ set to the agent id — that variable is what puts a write in the right partitio
     -d '{"query":"where does the user live?","namespaces":"default:default","k":5,"budgetTokens":800}'
   ```
 
-- **TypeScript** — `npm i open-memory`:
+- **TypeScript** — `npm i @franklinww/open-memory`:
 
   ```ts
-  import { MemoryService, createMemoryTool, autoInject } from "open-memory";
+  import { MemoryService, createMemoryTool, autoInject } from "@franklinww/open-memory";
 
   const svc = new MemoryService();
   await svc.init();

@@ -1,6 +1,7 @@
 # Changelog
 
-Notable changes. The package is `open-memory`; the command stays `ai-memory`.
+Notable changes. The package is `@franklinww/open-memory` (the bare `open-memory` name was
+rejected by npm as too similar to the existing `openmemory`); the command stays `ai-memory`.
 
 Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
 on-disk format is the part that does not.
@@ -140,7 +141,7 @@ rows, embeddings and namespaces are kept; new columns are backfilled in place.
   registers the agents it finds, instead of printing a reminder that it did not.
 - **The package is importable.** `exports` and `types` point at `dist/src/index.js`, which
   re-exports `MemoryService`, `createMemoryTool`, `autoInject` and the adapter registry —
-  so an agent written in TypeScript can `import { MemoryService } from "open-memory"`
+  so an agent written in TypeScript can `import { MemoryService } from "@franklinww/open-memory"`
   instead of reaching into `dist/src/`. The README snippet that told you to import
   `./src/core/memoryService.js` was a path no installed user has.
 - [docs/integrations.md](docs/integrations.md) — the four ways in (MCP, CLI, hook, library),

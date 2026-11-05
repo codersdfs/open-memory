@@ -47,8 +47,8 @@ jobs:
             exit 1
           fi
           case "$version" in
-            *-*) tag=beta ;; # 0.3.0-beta.1 -> npm i open-memory@beta
+            *-*) tag=beta ;; # 0.3.0-beta.1 -> npm i @franklinww/open-memory@beta
             *)   tag=latest ;;
           esac
           echo "publishing $version with dist-tag $tag"
-          npm publish --tag "$tag"
+          npm publish --tag "$tag" --access public
