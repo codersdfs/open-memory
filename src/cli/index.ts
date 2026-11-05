@@ -11,9 +11,12 @@ import { runtimeEnv } from "../core/settings.js";
 import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
 import type { BriefResult, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
+import type { ProjectSummary } from "../core/store/interface.js";
 import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/view.js";
 import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
 import { isKind, KINDS, stripEmbedding } from "../core/types.js";
+import { renderEmptySearch } from "../core/retrieval/explain.js";
+import { CurationRejected, renderVerdict } from "../core/write/curation.js";
 
 /**
  * `ai-memory` — the one command every agent uses (ADR-0007).
@@ -49,6 +52,9 @@ Memory
   reembed                rewrite every stored vector with the current embedder
   knowledge              ls | show <id> | neighbors <id> | sync | link <from> <to>
                          markdown pages as linked knowledge: --dir <vault> --depth 1 --dry-run
+  project list | init | rename | forget
+                         manage projects: init [slug] [--note "..."], rename <from> <to> [--merge],
+                         forget <slug> [--detach] (default forget soft-deletes, restorable)
 
 Setup & introspection
   setup                  create the memory home dir; --copy-db migrates the old store; --link registers agents
@@ -132,7 +138,9 @@ class Runner {
 
 function renderMemories(result: SearchResult, ctx: Ctx): void {
   if (result.memories.length === 0) {
-    ctx.out("no memories matched");
+    // ADR-0037: the reason rides on the empty result, so the CLI prints it instead of
+    // the bare one-liner that taught the caller to reword and retry.
+    ctx.out(renderEmptySearch(result.diagnostics));
     return;
   }
   for (const m of result.memories) {
@@ -197,16 +205,27 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   }
 
   const svc = await r.service();
-  const mem = await svc.save({
-    text,
-    type,
-    kind: kindFlag as MemoryKind | undefined,
-    project: projectFlag,
-    namespace: payload.namespace ?? resolveWriteKey({ agent, scope: payload.scope }),
-    importance: payload.importance,
-    tags: payload.tags,
-    source: payload.source
-  });
+  let mem: Memory;
+  try {
+    mem = await svc.save({
+      text,
+      type,
+      kind: kindFlag as MemoryKind | undefined,
+      project: projectFlag,
+      namespace: payload.namespace ?? resolveWriteKey({ agent, scope: payload.scope }),
+      importance: payload.importance,
+      tags: payload.tags,
+      source: payload.source
+    });
+  } catch (e) {
+    // The advice is the output: "not stored (table-row): store the fact the row
+    // states, in a sentence" is a usable answer, "Error: ..." is not.
+    if (e instanceof CurationRejected) {
+      ctx.err(`save: ${renderVerdict(e.verdict)}`);
+      return 1;
+    }
+    throw e;
+  }
   ctx.out(ctx.json ? JSON.stringify(mem, null, 2) : `saved ${mem.id} → ${mem.namespace}`);
   return 0;
 }
@@ -227,11 +246,13 @@ async function resolveNamespaces(
     const namespaces = await allPartitions((await r.service()).store, flagString(a, "user"));
     return { namespaces, scopes: [...new Set(namespaces.map(scopeOfNamespace))] };
   }
+  // `--all` was already expanded above, where the store is reachable; the pure resolver
+  // no longer takes it, because "every partition this user owns" is a fact about the
+  // store and not about the request (see `resolveReadScope` in core/scope.ts).
   return resolveRequestScope({
     namespace,
     agent: flagString(a, "agent"),
-    scope: flagString(a, "scope") as MemoryScope | undefined,
-    all: flagBool(a, "all")
+    scope: flagString(a, "scope") as MemoryScope | undefined
   });
 }
 
@@ -636,17 +657,19 @@ async function cmdExtract(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>):
   const agent = flagString(a, "agent");
   const namespace = flagString(a, "namespace") ?? resolveWriteKey({ agent, scope: flagString(a, "scope") as MemoryScope | undefined });
   if (await r.useDaemon()) {
-    const res = await r.client().post<{ extracted: number; memories: Memory[] }>("/extract", { text, namespace });
+    const res = await r.client().post<{ extracted: number; rejected: number; memories: Memory[] }>("/extract", { text, namespace });
     if (!res.ok) {
       ctx.err(`extract: ${res.error}`);
       return 1;
     }
-    ctx.out(ctx.json ? JSON.stringify(res.data, null, 2) : `extracted ${res.data.extracted}`);
+    const rejected = res.data.rejected ?? 0;
+    ctx.out(ctx.json ? JSON.stringify(res.data, null, 2) : `extracted ${res.data.extracted}${rejected ? `, rejected ${rejected}` : ""}`);
     return 0;
   }
   const svc = await r.service();
-  const memories = await svc.extractAndSave(text, namespace);
-  ctx.out(ctx.json ? JSON.stringify({ extracted: memories.length, memories }, null, 2) : `extracted ${memories.length}`);
+  const { memories, rejected } = await svc.extractAndSave(text, namespace);
+  const out = { extracted: memories.length, rejected, memories };
+  ctx.out(ctx.json ? JSON.stringify(out, null, 2) : `extracted ${memories.length}${rejected ? `, rejected ${rejected}` : ""}`);
   return 0;
 }
 
@@ -829,6 +852,161 @@ function printNeighbors(ctx: Ctx, id: string, neighbors: KnowledgePageView[]): n
   return 0;
 }
 
+/**
+ * `ai-memory project` — explicit management for the dimension ADR-0020 added.
+ *
+ * A project comes into existence on its first write and dies when its rows do;
+ * these subcommands only make that lifecycle visible and reversible. Cross-partition
+ * by nature (a project spans every agent that wrote into it), so unlike the row
+ * commands there is no `--all` question here: the answer is always the whole store.
+ */
+async function cmdProject(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const sub = a.positionals[0] ?? "list";
+  const onDaemon = await r.useDaemon();
+  // A daemon older than these routes answers 404 "not found"; the version gate above
+  // already sends a stale daemon to the in-process path, so reaching a 404 here means
+  // the daemon answered for a build that had the route gap — falling through to the
+  // same code in-process is what `knowledge sync` does, for the same reason.
+  const daemonMiss = (error: string): boolean => /not found/i.test(error);
+
+  if (sub === "list" || sub === "ls") {
+    if (onDaemon) {
+      const res = await r.client().get<{ projects: ProjectSummary[] }>("/projects");
+      if (res.ok) return printProjects(ctx, res.data.projects);
+      if (!daemonMiss(res.error)) {
+        ctx.err(`project list: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    return printProjects(ctx, await svc.listProjects());
+  }
+
+  if (sub === "init" || sub === "create") {
+    const slug = a.positionals[1] ?? flagString(a, "project");
+    const note = flagString(a, "note");
+    if (onDaemon) {
+      const res = await r.client().post<{ project: string; created: boolean; rows: number }>("/projects", {
+        project: slug,
+        note,
+        agent: flagString(a, "agent"),
+        user: flagString(a, "user")
+      });
+      if (res.ok) return printInit(ctx, res.data);
+      if (!daemonMiss(res.error)) {
+        ctx.err(`project init: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    const out = await svc.initProject({ project: slug, note, agent: flagString(a, "agent"), user: flagString(a, "user") });
+    return printInit(ctx, out);
+  }
+
+  if (sub === "rename" || sub === "mv") {
+    const from = a.positionals[1] ?? flagString(a, "from");
+    const to = a.positionals[2] ?? flagString(a, "to");
+    if (!from || !to) {
+      ctx.err("rename: usage ai-memory project rename <from> <to> [--merge]");
+      return 2;
+    }
+    const merge = flagBool(a, "merge");
+    if (onDaemon) {
+      const res = await r.client().post<{ renamed: number; project: string }>(
+        `/projects/${encodeURIComponent(from)}/rename`,
+        { to, merge }
+      );
+      if (res.ok) return printRename(ctx, res.data, from);
+      if (!daemonMiss(res.error)) {
+        ctx.err(`project rename: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    const out = await svc.renameProject(from, to, { merge });
+    return printRename(ctx, out, from);
+  }
+
+  if (sub === "forget" || sub === "rm" || sub === "drop") {
+    const slug = a.positionals[1] ?? flagString(a, "project");
+    if (!slug) {
+      ctx.err("forget: usage ai-memory project forget <slug> [--detach]");
+      return 2;
+    }
+    const mode = flagBool(a, "detach") ? "detach" : "delete";
+    if (onDaemon) {
+      const res = await r.client().del<{ detached: number; deleted: number; project: string }>(
+        `/projects/${encodeURIComponent(slug)}?mode=${mode}`
+      );
+      if (res.ok) return printForget(ctx, res.data, mode);
+      if (!daemonMiss(res.error)) {
+        ctx.err(`project forget: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    const out = await svc.forgetProject(slug, { mode });
+    return printForget(ctx, out, mode);
+  }
+
+  ctx.err(`project: unknown subcommand "${sub}" (expected: list | init | rename | forget)`);
+  return 2;
+}
+
+function printProjects(ctx: Ctx, projects: ProjectSummary[]): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify({ projects }, null, 2));
+    return 0;
+  }
+  if (projects.length === 0) {
+    ctx.out("no projects yet — run: ai-memory project init");
+    return 0;
+  }
+  for (const p of projects) {
+    const kinds = Object.entries(p.byKind)
+      .map(([kind, n]) => `${kind} ${n}`)
+      .join(", ");
+    const last = p.lastActivityAt > 0 ? new Date(p.lastActivityAt).toISOString().slice(0, 10) : "-";
+    ctx.out(`- ${p.project ?? "(unscoped)"}  ${p.rows} row(s)${kinds ? `  (${kinds})` : ""}  last ${last}`);
+  }
+  return 0;
+}
+
+function printInit(ctx: Ctx, out: { project: string; created: boolean; rows: number }): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(out, null, 2));
+    return 0;
+  }
+  ctx.out(
+    out.created
+      ? `initialized ${out.project} (marker row in the shared layer)`
+      : `${out.project} already exists (${out.rows} row(s))`
+  );
+  return 0;
+}
+
+function printRename(ctx: Ctx, out: { renamed: number; project: string }, from: string): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify({ ...out, from }, null, 2));
+    return 0;
+  }
+  ctx.out(out.renamed === 0 ? `nothing to rename: ${from} = ${out.project}` : `renamed ${out.renamed} row(s): ${from} → ${out.project}`);
+  return 0;
+}
+
+function printForget(ctx: Ctx, out: { detached: number; deleted: number }, mode: "detach" | "delete"): number {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(out, null, 2));
+    return 0;
+  }
+  if (mode === "detach") {
+    ctx.out(`detached ${out.detached} row(s) to unscoped`);
+  } else {
+    ctx.out(`soft-deleted ${out.deleted} row(s) (restorable with: ai-memory restore <id>)`);
+  }
+  return 0;
+}
+
 async function cmdDb(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   const which = a.positionals[0] ?? "info";
   if (which === "compact") {
@@ -945,6 +1123,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdBrief(runner, ctx, a);
       case "knowledge":
         return await cmdKnowledge(runner, ctx, a);
+      case "project":
+      case "projects":
+        return await cmdProject(runner, ctx, a);
       case "stats":
         return await cmdStats(runner, ctx, a);
       case "decay":

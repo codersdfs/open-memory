@@ -1,9 +1,9 @@
 import { randomUUID } from "crypto";
 import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
-import type { KnowledgeCapability, VectorStore } from "./interface.js";
+import type { KnowledgeCapability, ProjectSummary, VectorStore } from "./interface.js";
 import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CAP } from "./interface.js";
 import { cosineSimilarity } from "../embedding/provider.js";
-import { tokenize } from "../retrieval/bm25.js";
+import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { deriveKind } from "../write/kind.js";
 import { median } from "../stats.js";
 
@@ -111,6 +111,57 @@ export class InMemoryVectorStore implements VectorStore {
     return [...new Set(held)].sort();
   }
 
+  /** Cross-partition on purpose (ADR-0042): a project spans every partition that wrote into it. */
+  async listProjects(): Promise<ProjectSummary[]> {
+    const bySlug = new Map<string, ProjectSummary>();
+    for (const m of this.map.values()) {
+      if (m.isDeleted !== 0 || m.status !== "active") continue;
+      const key = m.project ?? "\0unscoped";
+      let summary = bySlug.get(key);
+      if (!summary) {
+        summary = { project: m.project, rows: 0, byKind: {}, lastActivityAt: 0 };
+        bySlug.set(key, summary);
+      }
+      summary.rows++;
+      summary.byKind[m.kind] = (summary.byKind[m.kind] ?? 0) + 1;
+      if (m.createdAt > summary.lastActivityAt) summary.lastActivityAt = m.createdAt;
+    }
+    return [...bySlug.values()].sort(
+      (a, b) => b.rows - a.rows || (a.project ?? "").localeCompare(b.project ?? "")
+    );
+  }
+
+  async renameProject(from: string, to: string): Promise<number> {
+    let moved = 0;
+    for (const m of this.map.values()) {
+      if (m.project === from) {
+        // Identity metadata, not content: `updated_at` keeps its old value, the
+        // same rule the SQL store's single UPDATE follows.
+        m.project = to;
+        moved++;
+      }
+    }
+    return moved;
+  }
+
+  async forgetProject(slug: string, opts: { mode: "detach" | "delete" }): Promise<{ detached: number; deleted: number }> {
+    let detached = 0;
+    let deleted = 0;
+    const now = Date.now();
+    for (const m of this.map.values()) {
+      if (m.project !== slug) continue;
+      if (opts.mode === "detach") {
+        m.project = null;
+        detached++;
+      } else if (m.isDeleted === 0) {
+        m.isDeleted = 1;
+        m.updatedAt = now;
+        deleted++;
+      }
+    }
+    return { detached, deleted };
+  }
+
   async storedDim(): Promise<number | null> {
     for (const memory of this.map.values()) return memory.embedding.length;
     return null;
@@ -149,7 +200,11 @@ export class InMemoryVectorStore implements VectorStore {
     }
     if (opts.query) arr = arr.filter((m) => m.text.toLowerCase().includes(opts.query!.toLowerCase()));
     const total = arr.length;
-    arr.sort((a, b) => (b.pin - a.pin) || (b.createdAt - a.createdAt));
+    // Same key the SQL store uses (`ORDER BY pin DESC, created_at DESC, id ASC`), id as a
+    // final tie-break so a page is deterministic when rows share a created_at millisecond —
+    // Windows clock granularity (~15.6 ms) makes exact ties routine on a bulk insert, and
+    // an arbitrary tie order here would let a page drop a row a cross-layer merge expected.
+    arr.sort((a, b) => (b.pin - a.pin) || (b.createdAt - a.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const limit = opts.limit ?? 100;
     const offset = opts.offset ?? 0;
     return { memories: arr.slice(offset, offset + limit), total };
@@ -228,13 +283,13 @@ export class InMemoryVectorStore implements VectorStore {
     kind?: string;
     knowledge?: string | null;
   }): Promise<{ memory: Memory; lexicalScore: number }[]> {
-    const queryTokens = [...new Set(tokenize(opts.query))].slice(0, LEXICAL_TOKEN_LIMIT);
+    const queryTokens = queryTerms(opts.query).slice(0, LEXICAL_TOKEN_LIMIT);
     if (queryTokens.length === 0) return [];
     const all = [...this.map.values()];
     const total = all.filter((m) => m.isDeleted === 0).length;
     const df = new Map<string, number>();
     for (const m of all) {
-      for (const token of new Set(tokenize(m.text))) {
+      for (const token of new Set(indexTerms(m.text))) {
         if (queryTokens.includes(token)) df.set(token, (df.get(token) ?? 0) + 1);
       }
     }
@@ -249,7 +304,7 @@ export class InMemoryVectorStore implements VectorStore {
     if (useful.length === 0) return [];
     const scored = this.candidates(opts).flatMap((memory) => {
       const counts = new Map<string, number>();
-      for (const token of tokenize(memory.text)) counts.set(token, (counts.get(token) ?? 0) + 1);
+      for (const token of indexTerms(memory.text)) counts.set(token, (counts.get(token) ?? 0) + 1);
       let lexicalScore = 0;
       for (const token of useful) {
         const tf = counts.get(token) ?? 0;
@@ -260,6 +315,24 @@ export class InMemoryVectorStore implements VectorStore {
     });
     scored.sort((a, b) => b.lexicalScore - a.lexicalScore || a.memory.id.localeCompare(b.memory.id));
     return scored.slice(0, opts.limit);
+  }
+
+  /**
+   * df over the whole live map, the same population `lexicalCandidates` scores
+   * against — one convention per backend, so a test's weighting on this store
+   * means the same thing as prod's. Absent tokens are absent from the map.
+   */
+  async termDf(tokens: string[]): Promise<Map<string, number>> {
+    const want = new Set(tokens);
+    const df = new Map<string, number>();
+    if (want.size === 0) return df;
+    for (const m of this.map.values()) {
+      if (m.isDeleted) continue;
+      for (const token of new Set(indexTerms(m.text))) {
+        if (want.has(token)) df.set(token, (df.get(token) ?? 0) + 1);
+      }
+    }
+    return df;
   }
 
   /** R2. Mirror of the SQL: +0.02, capped, and the use clock reset. */  async reinforce(ids: string[]): Promise<number> {
@@ -313,6 +386,21 @@ export class InMemoryVectorStore implements VectorStore {
             .map((m) => m.knowledgeId as string)
         )
       ].sort(),
+      listKnowledge: async (namespaces) =>
+        [...this.map.values()]
+          .filter(
+            (m) =>
+              m.knowledgeId !== null &&
+              m.isDeleted === 0 &&
+              namespaces.includes(m.namespace) &&
+              m.status !== "archived" &&
+              m.status !== "draft"
+          )
+          .sort(
+            (a, b) =>
+              (a.knowledgeId as string).localeCompare(b.knowledgeId as string) ||
+              (a.knowledgeSection ?? "").localeCompare(b.knowledgeSection ?? "")
+          ),
       replaceLinks: async (from, edges) => {
         this.linksByFrom.set(from, edges.map((e) => ({ ...e })));
       },

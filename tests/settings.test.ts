@@ -119,7 +119,7 @@ describe("writeSettings", () => {
   it("names every variable it accepts, and no key-shaped one is among them", () => {
     // The non-secret list holds knobs only; every credential lives in SECRET_KEYS.
     for (const key of SETTING_KEYS) {
-      expect(key).toMatch(/^(EMBEDDING_|NIM_|OPENAI_(EMBED_MODEL|BASE_URL)|JEV_|MEMORY_JEV|ENABLE_EXTRACTOR|EXTRACTOR_MODEL)/);
+      expect(key).toMatch(/^(EMBEDDING_|NIM_|OPENAI_(EMBED_MODEL|BASE_URL)|JEV_|MEMORY_(JEV|WRITE_GATE)|ENABLE_EXTRACTOR|EXTRACTOR_MODEL)/);
     }
     expect(SETTING_KEYS.some((k) => /API_KEY|_KEY|TOKEN|SECRET/i.test(k))).toBe(false);
   });
@@ -219,7 +219,7 @@ describe("two whitelists", () => {
   });
 
   it("lists the judge and extractor knobs", () => {
-    for (const k of ["JEV_ENDPOINT", "JEV_MODEL", "MEMORY_JEV", "MEMORY_JEV_MIN", "ENABLE_EXTRACTOR", "EXTRACTOR_MODEL"]) {
+    for (const k of ["JEV_ENDPOINT", "JEV_MODEL", "MEMORY_JEV", "MEMORY_JEV_MIN", "MEMORY_WRITE_GATE", "MEMORY_WRITE_GATE_MIN", "ENABLE_EXTRACTOR", "EXTRACTOR_MODEL"]) {
       expect(SETTING_KEYS).toContain(k);
     }
   });

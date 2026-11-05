@@ -1,6 +1,6 @@
 # Plugging open-memory into a coding agent
 
-One store, one CLI, four ways in. Pick the lowest number your agent supports.
+One store, one CLI, three ways in (plus the library). Pick the lowest number your agent supports.
 
 | Way in | Needs from the agent | Effort |
 |---|---|---|
@@ -8,6 +8,10 @@ One store, one CLI, four ways in. Pick the lowest number your agent supports.
 | 2. `ai-memory` CLI | a shell | one command |
 | 3. `inject` hook | a hook on prompt submit | one command |
 | 4. Library / HTTP | you are writing the agent | a `curl` or an import |
+
+Three shapes of client are covered without you writing anything: sixteen agents are
+known by name, any other MCP client is one `agent add` away, and an agent with neither
+MCP nor hooks still gets the CLI and a managed instructions block.
 
 ## 1. One command
 
@@ -20,18 +24,51 @@ ai-memory agent doctor         # what it wrote, and whether it can work
 `unlink` removes exactly what `link` added — never another tool's entry — and the
 first write to a file leaves a `.ai-memory.bak` beside it.
 
-## 2. The agent is not on the list
+## 2. The agent is on the list
+
+`ai-memory agent list` knows sixteen clients without any declaration. Four are
+built in (`claude`, `codex`, `dsh`, `pi`); the other twelve are a table of paths, so
+`agent link --agent <id> --write` works on a fresh install with nothing to configure.
+
+| Id | Config file | Format |
+|---|---|---|
+| `cursor` | `~/.cursor/mcp.json` | JSON |
+| `windsurf` | `~/.codeium/windsurf/mcp_config.json` | JSON |
+| `cline` | `~/.cline/data/cline_mcp_settings.json` | JSON |
+| `zed` | `%APPDATA%\Zed\settings.json` → `context_servers` | JSONC |
+| `continue` | `~/.continue/mcpServers/ai-memory.json` | JSON |
+| `vscode` | `%APPDATA%\Code\User\mcp.json` → `servers` (`~/Library/Application Support/Code/User/mcp.json`, `~/.config/Code/User/mcp.json`) | JSONC |
+| `gemini` | `~/.gemini/settings.json` | JSON |
+| `opencode` | `$XDG_CONFIG_HOME/opencode/opencode.json`, else `~/.config/opencode/opencode.json`, else legacy | JSON |
+| `qwen` | `~/.qwen/settings.json` | JSON |
+| `crush` | `~/.config/crush/crush.json` | JSON |
+| `amp` | `~/.config/amp/settings.json` | JSON |
+| `aider` | `~/.aider/mcp.json` | JSON |
+
+Two of these files are **JSONC** — they ship with comments (Zed's `settings.json`
+opens with `// Zed settings`). Those are edited by splicing text in and out, never by
+round-tripping through `JSON.parse`, so `link` then `unlink` gives back a
+byte-identical file and your comments survive both.
+
+`installed` / `not found` in `agent list` is a directory probe, not a guess: it looks
+for the client's own folder under your home. A client that is not found is still
+listed, because "absent from the list" reads as "unsupported", and only a bare
+`agent link --write` filters to what is installed — the twelve known clients are
+listed with `--agent`.
+
+## 3. The agent is not on the list
 
 Any MCP client is one declaration away. No code, no rebuild — the config lives in
 `~/.ai-memory/agents.json`, and `agent add` writes it for you:
 
 ```bash
-ai-memory agent add cursor --mcp-file ~/.cursor/mcp.json
-ai-memory agent add cursor --mcp-file ~/.cursor/mcp.json --write
+ai-memory agent add myeditor --mcp-file ~/.myeditor/mcp.json
+ai-memory agent add myeditor --mcp-file ~/.myeditor/mcp.json --write
 ```
 
-Then `ai-memory agent status --agent cursor` and `ai-memory agent unlink --agent cursor --write`
-work like any built-in.
+Then `ai-memory agent status --agent myeditor` and `ai-memory agent unlink --agent
+myeditor --write` work like any built-in. `--format jsonc` is there for a file with
+comments; `--json-path` when the server map is not `mcpServers`.
 
 Flags:
 
@@ -39,7 +76,7 @@ Flags:
 |---|---|
 | `--mcp-file <path>` | the client's config file (required). `~` is expanded |
 | `--json-path <key>` | where the server map lives. Default `mcpServers` (`mcp_servers` for `--format toml`). Dotted paths work: `mcp.servers` |
-| `--format json\|toml` | the file's format. TOML is edited section-wise, like Codex does |
+| `--format json\|jsonc\|toml` | the file's format. TOML is edited section-wise, like Codex does; JSONC preserves comments |
 | `--env K=V[,K=V]` | extra env for the spawned server, on top of `AI_MEMORY_AGENT=<id>` |
 | `--instructions <path>` | a rules/instructions file that also gets the managed memory block |
 
@@ -48,20 +85,22 @@ The declaration, hand-written, is the same thing:
 ```json
 {
   "agents": {
-    "cursor": { "mcpFile": "~/.cursor/mcp.json" },
-    "windsurf": { "mcpFile": "~/.codeium/windsurf/mcp_config.json", "env": { "AI_MEMORY_USER": "frank" } }
+    "myeditor": { "mcpFile": "~/.myeditor/mcp.json" },
+    "windsurf-fork": { "mcpFile": "~/.codeium/windsurf/mcp_config.json", "env": { "AI_MEMORY_USER": "frank" } }
   }
 }
 ```
 
-An id that is also built in (`claude`, `codex`, `dsh`, `pi`) is **refused**. Those
-adapters write more than an MCP entry — Claude Code's hooks, Codex's TOML section and
-managed block — so a declaration would drop that work silently. Link them as they are,
-`ai-memory agent link --agent claude --write`, and pick another id if you really want a
-second entry. `agent specs` marks a hand-written collision, `agent doctor` fails on one,
-and `ai-memory agent remove <id>` clears it.
+An id that is already known is **refused**, for two different reasons. The four
+built-ins (`claude`, `codex`, `dsh`, `pi`) write more than an MCP entry — Claude
+Code's hooks, Codex's TOML section and managed block — so a declaration would drop
+that work silently. The twelve known clients are already linked directly from their
+own path, so a declaration pointing somewhere else is almost always a mistake; if the
+config genuinely lives elsewhere, use a different id. `agent specs` marks a
+hand-written collision, `agent doctor` fails on one, and `ai-memory agent remove <id>`
+clears it.
 
-## 3. What gets written
+## 4. What gets written
 
 | Agent | MCP entry | Instructions |
 |---|---|---|
@@ -69,11 +108,12 @@ and `ai-memory agent remove <id>` clears it.
 | Codex CLI | `~/.codex/config.toml` → `[mcp_servers.ai-memory]` | managed block in `~/.codex/AGENTS.md` |
 | DeepSeek Harness | `$DSH_HOME/mcp.json` → `mcpServers.ai-memory` | — |
 | pi | `~/.pi/agent/mcp-adapter.json` → `mcpServers.ai-memory` | — |
+| the twelve in §2 | `mcpServers.ai-memory` (Zed: `context_servers`, VS Code: `servers`) | — |
 
 Every entry spawns the same process: `<node> <cli> mcp`, with `AI_MEMORY_AGENT`
 set to the agent id — that variable is what puts a write in the right partition.
 
-## 4. The three mechanisms
+## 5. The three mechanisms
 
 - **Managed instructions block** — a `<!-- ai-memory:begin -->` … `<!-- ai-memory:end -->`
   block telling the agent the tools exist and to search before guessing. Text only:
@@ -85,7 +125,7 @@ set to the agent id — that variable is what puts a write in the right partitio
   `memory_forget`, `memory_stats`. Every tool takes an explicit `scope`, so the agent
   decides private vs shared per call. This is the one to prefer.
 
-## 5. You are writing the agent
+## 6. You are writing the agent
 
 - **HTTP** — any language:
 
@@ -109,7 +149,7 @@ set to the agent id — that variable is what puts a write in the right partitio
 
 - **CLI** — anything that can spawn a process: `ai-memory save "…"`, `ai-memory search "…" --json`.
 
-## 6. When it does not work
+## 7. When it does not work
 
 ```bash
 ai-memory agent doctor      # runtime, cli build, store, identity, per-agent state
@@ -118,4 +158,11 @@ ai-memory db info           # which store, and why that one
 
 `doctor` fails only on things that cannot work; a detected-but-unlinked agent is
 advice, not breakage. If a config file is not valid JSON, `link` refuses to touch it
-and says so, rather than writing over it.
+and says so, rather than writing over it. A JSONC file that fails to parse gets the
+same refusal — the splicer re-parses its own output and compares the target path
+before it writes, so a bug in the splice shows up as an error, not as a mangled
+editor config.
+
+If `agent list` says `not found` for something you have installed, the probe looked for
+the wrong folder: the exact paths are the table in §2, and `agent status --agent <id>`
+prints the one it used.

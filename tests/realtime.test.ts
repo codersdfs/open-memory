@@ -1,14 +1,20 @@
 import { describe, it, expect } from "vitest";
 import {
   BENCH_OPS,
+  QUERY_MODES,
   SEARCH_BUDGET,
   bucketSeries,
   buildCorpus,
   buildQueries,
+  paraphrasePhrase,
+  paraphrasePhraseZh,
   percentile,
   rankOf,
   rng,
+  sigPhrase,
   summarizeRun,
+  type BenchFact,
+  type BenchQuery,
   type OpSample
 } from "../src/bench/realtime.js";
 
@@ -18,6 +24,31 @@ import {
  * bucketing, the recall/stall/token accounting, and a corpus whose gold label cannot
  * be lost (the marker is in the text, so a miss is a retrieval miss).
  */
+
+/**
+ * The pre-`semantic` query generator, verbatim, so the test can prove the three
+ * original shapes are unchanged rather than assuming it. If `buildQueries` ever
+ * drifts for `bare`/`noisy`/`cjk`, this comparison is what fails.
+ */
+function buildQueriesWithoutSemantic(corpus: BenchFact[], queries: number, seed: number): BenchQuery[] {
+  const random = rng(seed);
+  const shapeRandom = rng(seed ^ 0x5eed);
+  const NOISE = ["how", "do", "we", "configure", "the", "pipeline", "for", "this", "project", "today"];
+  const out: BenchQuery[] = [];
+  for (let i = 0; i < queries; i++) {
+    const fact = corpus[Math.floor(random() * corpus.length)]!;
+    const mode: BenchQuery["mode"] = i % 3 === 0 ? "bare" : i % 3 === 1 ? "noisy" : "cjk";
+    const noise = [0, 1, 2, 3, 4, 5].map(() => NOISE[Math.floor(shapeRandom() * NOISE.length)]!).join(" ");
+    const query =
+      mode === "bare"
+        ? fact.token
+        : mode === "noisy"
+          ? `${noise} ${fact.token} ${fact.project}`
+          : `${fact.project} 里的 ${fact.token} 是怎么配置的`;
+    out.push({ query, token: fact.token, mode });
+  }
+  return out;
+}
 
 const sample = (over: Partial<OpSample>): OpSample => ({
   op: "search",
@@ -155,15 +186,128 @@ describe("corpus and queries", () => {
 
   it("asks about a real fact in three shapes, all carrying the marker", () => {
     const corpus = buildCorpus({ facts: 30, projects: 3, seed: 7 });
-    const queries = buildQueries(corpus, { queries: 9, seed: 11 });
+    // Three queries is exactly one bare/noisy/cjk rotation, so the semantic shape
+    // (every fourth) does not appear and this test keeps measuring what it always did.
+    const queries = buildQueries(corpus, { queries: 3, seed: 11 });
     const tokens = new Set(corpus.map((f) => f.token));
-    expect(queries).toHaveLength(9);
+    expect(queries).toHaveLength(3);
     expect(new Set(queries.map((q) => q.mode))).toEqual(new Set(["bare", "noisy", "cjk"]));
     for (const q of queries) {
       expect(tokens.has(q.token)).toBe(true);
       expect(q.query).toContain(q.token);
     }
-    expect(queries).toEqual(buildQueries(corpus, { queries: 9, seed: 11 }));
+    expect(queries).toEqual(buildQueries(corpus, { queries: 3, seed: 11 }));
+  });
+
+  it("adds a marker-free semantic shape without touching the other three", () => {
+    const corpus = buildCorpus({ facts: 40, projects: 4, seed: 7 });
+    const mix = buildQueries(corpus, { queries: 40, seed: 11 });
+    expect(new Set(mix.map((q) => q.mode))).toEqual(new Set(QUERY_MODES));
+
+    const tokens = new Set(corpus.map((f) => f.token));
+    const semantic = mix.filter((q) => q.mode === "semantic");
+    expect(semantic.length).toBe(10);
+    for (const q of semantic) {
+      // The whole point: nothing the term index can look up.
+      expect(tokens.has(q.token)).toBe(true);
+      expect(q.query.includes(q.token)).toBe(false);
+      expect(q.query).not.toMatch(/zq\d+/);
+    }
+
+    // Every fourth slot is semantic, and it draws nothing from the generator the first
+    // three slots use. On the same index the non-semantic queries come out identical,
+    // so bare/noisy/cjk stay comparable to every reading taken before this mode existed.
+    const before = buildQueriesWithoutSemantic(corpus, 40, 11);
+    const shape = (i: number) => (i % 4 === 3 ? "semantic" : i % 3 === 0 ? "bare" : i % 3 === 1 ? "noisy" : "cjk");
+    const nonSemantic = mix.filter((q) => q.mode !== "semantic");
+    const runnable = before.filter((_, i) => shape(i) !== "semantic");
+    expect(nonSemantic).toEqual(runnable);
+  });
+
+  it("makes the semantic gold row identifiable by its own signature phrase", () => {
+    const corpus = buildCorpus({ facts: 400, projects: 4, seed: 7 });
+    const byToken = new Map(corpus.map((f) => [f.token, f]));
+    const semantic = buildQueries(corpus, { queries: 80, seed: 11, projects: 4 }).filter((q) => q.mode === "semantic");
+
+    // Spans both scripts, so project ids are compared after stripping Chinese
+    // particles: `bench-project-2 的` must still read as `bench-project-2`.
+    const terms = (s: string) => [...new Set(s.toLowerCase().replace(/[的（）；，。]/g, " ").split(/\s+/).filter(Boolean))];
+
+    for (const q of semantic) {
+      const gold = byToken.get(q.token)!;
+      const inChinese = gold.text.startsWith("项目");
+      const zh = inChinese ? paraphrasePhraseZh(gold) : paraphrasePhrase(gold);
+      const en = paraphrasePhrase(gold);
+
+      // 1. The corpus holds the full phrase, the question holds the paraphrase of it —
+      //    near enough for a cosine, far enough that no exact match answers it.
+      const full = sigPhrase(gold);
+      expect(gold.text).toContain(full);
+      expect(q.query).not.toContain(full);
+      expect(q.query).toContain(inChinese ? zh : en);
+      // Both signature words are in the question either way, which is what a cosine
+      // needs to pull the row to the top of its phrase group. Chinese inherits the
+      // English word beside a Chinese measure word ("的 late"), hence the
+      // substring test there.
+      for (const word of gold.sig) {
+        expect(inChinese ? q.query.replace(/[的（）]/g, " ") : q.query).toContain(word);
+      }
+      // 2. The full phrase is one row's own: matched with the corpus's framing
+      //    (`a … case` / （…）), because `fanout partitions i` is a substring of `iii`.
+      const framed = new RegExp(`(?:a ${full} case|（${full}）)`);
+      expect(corpus.filter((f) => framed.test(f.text)).map((f) => f.token)).toEqual([gold.token]);
+      // 3. The phrase minus its `#n` ordinal still names a whole clause group — 12-17
+      //    rows for a convention, ~90 for a gotcha — so even the phrase's subject is
+      //    not one row's own, and a question that only paraphrased it would be ambiguous.
+      const words = full.split(" ");
+      const subject = inChinese ? `${words[0]} ${words[1]}` : words.slice(0, 2).join(" ");
+      expect(corpus.filter((f) => f.text.includes(subject)).length).toBeGreaterThan(8);
+      // The ordinal is what makes the gold row alone. Matched as written, digits and all,
+      // and anchored at a space so `#22` does not match the `#222` of another row: the
+      // ordinal is the row's *own*, but it is also a numeric prefix of later ordinals.
+      //    `（` is U+FF08 and NOT whitespace in a JS regex, so the leading anchor accepts
+      //    an ASCII space (English framing) or that bracket (Chinese framing).
+      const anchored = new RegExp(`(?: |\uFF08)${full.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!#?\\d)`);
+      expect(corpus.filter((f) => anchored.test(f.text)).map((f) => f.token)).toEqual([gold.token]);
+      // 4. The question names the gold's own project and, when the corpus has one to
+      //    spare, another — so matching on "some project" is not enough.
+      const queryWords = terms(q.query);
+      expect(queryWords).toContain(gold.project);
+      const others = queryWords.filter((w) => w.startsWith("bench-project-") && w !== gold.project);
+      expect(new Set(others).size).toBe(inChinese ? 2 : 2);
+    }
+  });
+
+  it("names each row's subject without naming its marker", () => {
+    const corpus = buildCorpus({ facts: 400, projects: 4, seed: 7 });
+    const byToken = new Map(corpus.map((f) => [f.token, f]));
+    const semantic = buildQueries(corpus, { queries: 80, seed: 11, projects: 4 }).filter((q) => q.mode === "semantic");
+    for (const q of semantic) {
+      const gold = byToken.get(q.token)!;
+      // The question says what the row is about: project, noun and area. Measured, this
+      // is what lifts the gold out of its phrase group — without the noun a Chinese
+      // query ranked 16th of 400.
+      expect(gold.text).toContain(gold.noun === "brief" ? "brief" : gold.noun);
+      expect(gold.text).toContain(gold.area);
+      expect(q.query).toContain(gold.project);
+      expect(q.query).toContain(gold.area);
+      expect(q.query).toContain(gold.noun);
+      // The marker is what makes it a *semantic* question: absent from the query,
+      // present in the text, so `rankOf` can score it.
+      expect(q.query).not.toMatch(/zq\d+/);
+      expect(gold.text).toContain(q.token);
+    }
+  });
+
+  it("keeps the three original shapes byte-identical to the pre-existing generator", () => {
+    const corpus = buildCorpus({ facts: 400, projects: 4, seed: 7 });
+    const mix = buildQueries(corpus, { queries: 40, seed: 11, projects: 4 });
+    const before = buildQueriesWithoutSemantic(corpus, 40, 11);
+    const shape = (i: number) => (i % 4 === 3 ? "semantic" : i % 3 === 0 ? "bare" : i % 3 === 1 ? "noisy" : "cjk");
+    const runnable = before.filter((_, i) => shape(i) !== "semantic");
+    expect(mix.filter((q) => q.mode !== "semantic")).toEqual(runnable);
+    // ...which is the whole reason the old gates on bare/noisy/cjk stay comparable.
+    for (const q of mix.filter((x) => x.mode !== "semantic")) expect(q.query).toContain(q.token);
   });
 
   it("ranks by the marker, so a reconciled id cannot fake a hit", () => {

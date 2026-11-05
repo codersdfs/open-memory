@@ -5,6 +5,43 @@ Notable changes. The package is `open-memory`; the command stays `ai-memory`.
 Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
 on-disk format is the part that does not.
 
+## 0.4.0-beta.2 — 2026-11-05
+
+A real-time retrieval pass plus a correctness fix, and the first build whose committed tree
+actually matches the 0.4.x work the beta.1 notes already described (the storage cache, curation,
+project memory, knowledge dimension and explainable-recall code landed here rather than at the
+beta.1 tag).
+
+### Changed
+
+- **Coverage is now idf-weighted for ranking** ([ADR-0028](docs/adr/0028-idf-weighted-coverage-and-prf.md)).
+  ADR-0027 made plain `coverage` the sort/gate/budget key, but on a single-conversation corpus a question
+  that names the protagonist ("What is Caroline's identity?") scores half the store identically to the row
+  that answers it, because the name sits in every chunk. The *sort*, MMR and budget now weight each asked
+  word by its document frequency (`term_df`), while the relevance *gate* still reads the unweighted share —
+  so admission semantics are unchanged, only ordering. Measured on a new model-free evidence ruler
+  (`bench/evhit.mjs`, LoCoMo conv-26, 152 questions, NIM embeddings): evidence-any 68 → 76%,
+  evidence-all 57 → 66%.
+- **A pseudo-relevance second pass was built, measured net-negative, and shipped off** (ADR-0028). It
+  reaches rows that hold a multi-hop answer's second half without the question's vocabulary, but the merged
+  rows crowd a fixed token budget single-hop rows need (evidence-any 76 → 72%), so `MEMORY_PRF` is `off`
+  by default; `MEMORY_PRF=on` opts in — the same disposition the int8 shortlist got.
+- **`realtime-bench` no longer calls a model on every write.** A judge key in `settings.json` was silently
+  putting an LLM round-trip inside each `save` (write p50 3 → 209 ms), moving the run's saturation point with
+  an unrelated service. The bench pins `MEMORY_JEV=off` before starting (a real env value still wins).
+
+### Fixed
+
+- **`memory_list` now merges the scope fan-out into one recent-first page** (issue #1). It used to call
+  `list({limit})` per resolved namespace and concatenate the pages, so it returned up to `limit × layers`
+  rows and put every private row ahead of every shared one regardless of age — the opposite of "list the
+  most recent memories in the resolved scope(s)." It now fetches each layer at `limit`, sorts the merged set
+  `pin DESC, created_at DESC, id ASC`, and slices to `limit` once (`total` stays the per-layer sum). The `id`
+  tie-break is pushed into both stores' `ORDER BY` so a page is deterministic when rows share a millisecond
+  (Windows clock granularity makes exact ties routine on bulk import), which is what makes the per-layer-top-
+  `limit` subset claim hold literally. `limit` is clamped to 1..1000 like the HTTP route; a non-finite limit
+  is refused rather than failing open differently per backend.
+
 ## 0.4.0-beta.1 — 2026-10-20
 
 Five passes in one release: recall, scale, project memory, the knowledge dimension, and a
@@ -194,7 +231,55 @@ rows, embeddings and namespaces are kept; new columns are backfilled in place.
   `search p95`, per-mode recall, budget overruns and sync errors. 13 unit tests on the pure part
   (`src/bench/realtime.ts`). [ADR-0024](docs/adr/0024-realtime-benchmark.md)
 
+- **An opt-in int8 shortlist for wide vectors, because 2048-d retrieval was 3× over budget.**
+  `memory_vectors` gains a per-dimension signed byte and a `maxAbs` scale per row; with
+  `MEMORY_Q8=on` a search ranks the whole candidate set on those bytes and re-scores only the
+  shortlist against the float32 blob, which returns the exact ordering for the rows it keeps.
+  Measured at 10,000 rows / 2048d: p50 181.6 → 125.5 ms (1.45×), at the cost of +25% disk
+  (14,112 → 17,702 bytes/row). **Off by default**: a 1.45× that lands at ~1.09 s at 10^5 rows is
+  still over the 700 ms budget, and the phase split shows why it cannot be pushed further — reading
+  four times fewer bytes per row saved 26 ms of 116 ms, because the rest is per-row object
+  construction and the JOIN, which only shrink if fewer *rows* are read.
+  [ADR-0025](docs/adr/0025-int8-shortlist.md) · [ADR-0026](docs/adr/0026-int8-off-by-default.md)
+
 ### Fixed
+
+- **Twelve more MCP clients, and the paths they were pointed at were not theirs.** "Use it
+  from any agent" used to mean four built-ins plus a hand-written declaration per client.
+  `agent list` now knows sixteen: the four built-ins and a table of paths for Cursor,
+  Windsurf, Cline, Zed, Continue, VS Code, Gemini CLI, opencode, Qwen, Crush, Amp and Aider,
+  so `agent link --agent cursor --write` works on a fresh install. The list is a function of
+  the table, not of what this machine has installed — a client missing from `agent list` reads
+  as "unsupported" — and `installed` / `not found` is a directory probe, not a guess.
+  Two of those configs are JSONC (Zed and VS Code ship comments in theirs), so they are edited
+  by splicing text rather than by a `JSON.parse` round-trip: `link` then `unlink` gives back a
+  byte-identical file, and the splicer re-parses its own output and compares the target path
+  before writing, so a splice bug surfaces as an error instead of a mangled editor config.
+
+- **Every known-client path pointed into the memory store.** `resolveHome()` names the store
+  (`~/.ai-memory`), not the user's home, and the detection code used it, so `agent doctor`
+  printed `~/.ai-memory/.cursor/mcp.json` — a file no editor reads — and detection then found
+  the store's own directories and reported every client as installed. The two are now separate:
+  known clients resolve against `homedir()`, the store against `resolveHome()`.
+
+- **`GenericAdapter.detect()` returned `true` for known clients too.** It was written for
+  declarations, where naming an agent is itself the claim that it is installed. Known clients
+  go through the same class, so a bare `agent link --write` would have written into all twelve
+  configs, present or not. A known client now probes its own directory; a declaration still
+  answers `true`.
+
+- **`makeRegistry` kept the last adapter for a duplicated id and `all()` returned duplicates.**
+  Callers append in priority order, so the intended meaning is first-wins: built-ins shadow
+  known clients, and known clients shadow declarations.
+
+- **The int8 shortlist returned nothing useful for any query.** `quantizeVector` stored negatives
+  as unsigned bytes (`-126` as `130`) and returned a `Buffer`, while rows came back as `Int8Array`
+  through `unpackQ8`; `cosineQ8` then multiplied `+130` by `-126` on the same dimension and the dot
+  product changed sign. An exact self-query scored `-0.55` and ranked 2000 of 2000 rows, so recall@k
+  was 0 — with a green suite, because no test compared the two paths. `quantizeVector` now returns
+  `Int8Array` and writes the rounded value straight into it. `tests/q8-shortlist.test.ts` pins the
+  two paths to the same ids, the same order and a self-query above 0.99 in both modes.
+  [ADR-0025](docs/adr/0025-int8-shortlist.md).
 
 - **`agent unlink` orphaned a TOML subsection.** Removing `[mcp_servers.ai-memory]` left
   its own child table `[mcp_servers.ai-memory.env]` behind with the `AI_MEMORY_AGENT` line

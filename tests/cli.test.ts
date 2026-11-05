@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { spawnSync } from "node:child_process";
+import { describe, it, expect, afterAll } from "vitest";
+import { spawnSyncChild, closeAllChildren } from "./helpers/child.js";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,7 +18,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(root, "src", "cli", "index.ts");
 
 function run(args: string[], dbPath: string, env: Record<string, string> = {}) {
-  const res = spawnSync(process.execPath, [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), CLI, ...args], {
+  const res = spawnSyncChild(process.execPath, [path.join(root, "node_modules", "tsx", "dist", "cli.mjs"), CLI, ...args], {
     cwd: root,
     encoding: "utf8",
     env: {
@@ -39,6 +39,14 @@ function run(args: string[], dbPath: string, env: Record<string, string> = {}) {
 
 const tmp = mkdtempSync(path.join(os.tmpdir(), "ai-memory-cli-"));
 const db = path.join(tmp, "memory.db");
+
+// Every child this file starts is gone before the file ends. Without this the
+// suite leaves a few hundred idle node.exe behind, and the run that inherits
+// them takes 2.5x as long and fails a test that passes on its own.
+afterAll(async () => {
+  await closeAllChildren();
+  rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+});
 
 describe("ai-memory CLI", () => {
   it("prints usage with no arguments", () => {
@@ -105,6 +113,34 @@ describe("ai-memory CLI", () => {
     const next = run(["supersede", oldId, "The API base URL is api-v2.example.com."], db);
     expect(next.code).toBe(0);
     expect(next.stdout).toContain("superseded");
+  });
+
+  it("manages a project end to end: init, list, rename, forget", () => {
+    // The marker row is what makes the project visible before its first real write.
+    const init = run(["project", "init", "alpha", "--note", "We decided to track alpha in this store", "--json"], db);
+    expect(init.code).toBe(0);
+    expect(JSON.parse(init.stdout) as { created: boolean; project: string }).toMatchObject({ created: true, project: "alpha" });
+
+    // Idempotent: the second init reports the project instead of writing again.
+    const again = run(["project", "init", "alpha", "--json"], db);
+    expect(again.code).toBe(0);
+    expect((JSON.parse(again.stdout) as { created: boolean }).created).toBe(false);
+
+    const list = run(["project", "list"], db);
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("alpha");
+
+    const rename = run(["project", "rename", "alpha", "gamma"], db);
+    expect(rename.code).toBe(0);
+    expect(rename.stdout).toContain("gamma");
+
+    const forget = run(["project", "forget", "gamma"], db);
+    expect(forget.code).toBe(0);
+    expect(forget.stdout).toMatch(/soft-deleted 1 row/);
+
+    // The list answers for the whole store, so the forgotten slug is gone from it.
+    const after = run(["project", "list"], db);
+    expect(after.stdout).not.toContain("gamma");
   });
 
   it("--all sweeps every partition this user owns", () => {
@@ -188,7 +224,6 @@ describe("cli entrypoint file", () => {
     // must at least resolve to a real file in a built checkout.
     const candidates = [path.join(root, "dist", "cli", "index.js"), CLI];
     expect(candidates.some((c) => existsSync(c))).toBe(true);
-    rmSync(tmp, { recursive: true, force: true });
   });
 });
 

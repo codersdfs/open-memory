@@ -273,6 +273,64 @@ export function importanceFor(keep: number): number {
   return Number((0.4 + 0.5 * keep).toFixed(2));
 }
 
+/**
+ * The second gate (ADR-0041): the same protocol, asked on the write path.
+ *
+ * Curation (ADR-0040) answers "is this structurally a memory" with regexes; what no
+ * regex settles is the borderline the extractor's own comments name — "run the tests
+ * before commit" is scaffolding in one repo and a durable routine in another. The
+ * write gate asks the model that question for every write no judge has seen: LLM-extract
+ * candidates, tool writes, and explicit saves. Extractor output already carries a jev
+ * verdict (`judged:jev`), so it skips this — one judgement per row, never two.
+ *
+ * Two questions, one request (the protocol prices N questions at one round trip):
+ * `keep` is the extractor's own durability question; `scaffold` is the semantic
+ * complement of curation's structural rules — a config dump or a prompt template has
+ * no table pipes to catch it, so shape cannot be the only tell.
+ *
+ * `MEMORY_JEV=false` remains the master switch for all model judgment (it already
+ * gates `jevRelation`); `MEMORY_WRITE_GATE=false` turns off this gate alone, and
+ * `MEMORY_WRITE_GATE_MIN` (default 0.5) is its floor. Fail-open like everything else
+ * on this wire: no answer stores the write unjudged.
+ */
+
+const SCAFFOLD_QUESTION: NoulQuestion = {
+  instructions:
+    "Is this the agent's own instruction scaffolding, a configuration dump, or a narration of what just happened — rather than knowledge about the world or the project?",
+  criteria: {
+    true:
+      "Tool lists, prompts addressed to an agent, file or config fragments, or a progress report about this session.",
+    false:
+      "A statement whose subject is the project, the user, or the world — something that stays true after the session ends.",
+  },
+};
+
+const WRITE_GATE_QUESTIONS: Record<string, NoulQuestion> = {
+  keep: KEEP_QUESTION,
+  scaffold: SCAFFOLD_QUESTION,
+};
+
+export interface WriteGateVerdict {
+  keep: number;
+  scaffold: number;
+  model?: string;
+}
+
+/** Below this the write is junk the model saw and the regexes could not. */
+export const WRITE_GATE_MIN = (): number => Number(runtimeEnv().MEMORY_WRITE_GATE_MIN ?? 0.5);
+
+export function writeGateEnabled(): boolean {
+  const env = runtimeEnv();
+  return isJevEnabled(env) && env.MEMORY_WRITE_GATE !== "false";
+}
+
+export async function jevWriteGate(text: string, opts: JudgeOptions = {}): Promise<WriteGateVerdict | null> {
+  if (!writeGateEnabled()) return null;
+  const r = await systemOneCall(text, WRITE_GATE_QUESTIONS, ["keep", "scaffold"], opts);
+  if (!r) return null;
+  return { keep: r.answers.keep, scaffold: r.answers.scaffold, model: r.model };
+}
+
 export interface ValidateJevKeyOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;

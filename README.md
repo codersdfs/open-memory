@@ -1,7 +1,7 @@
 # Open Memory — local-first memory for pi agents
 
-> **Status: `0.3.0-beta.1`** — first published build. The storage format is settled; the
-> HTTP and MCP surfaces can still move between prereleases.
+> **Status: `0.4.0-beta.2`** — pre-release. The storage format is settled; the HTTP and MCP surfaces
+> can still move between prereleases.
 
 ![the console: a query, the floor preset that made seven hits appear, the token budget,
 and the score decomposition behind every hit](docs/images/console-recall-dark.png)
@@ -13,7 +13,7 @@ A **local-first, namespace-partitioned memory substrate** that stores *Episodic 
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
 - **Explainable recall** (R1): `?explain=1` (or `--explain`) returns where each score came from — `bm25 +0.37 · recency +0.24 · strength +0.12 = 0.737`. Off by default, because four extra numbers per hit is real payload on a response whose point is a token budget. Everyone returns results; this returns *why*.
 - **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95) and its clock resets, so decay reads age as time-since-last-use. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
-- **Project memory** (ADR-0020/0021/0022): every write carries a `project` (resolved from the git root, or `MEMORY_PROJECT`) and a `kind` — `decision`, `convention`, `gotcha` are *durable* and decay never archives them, `task` lives a week, `note` a month. `memory_brief` / `ai-memory brief` prints the whole project's standing memory in a fixed order (conventions → decisions → gotchas → open → recent) inside 600 tokens, without a query and without an LLM call.
+- **Project memory** (ADR-0020/0021/0022): every write carries a `project` (resolved from the git root, or `MEMORY_PROJECT`) and a `kind` — `decision`, `convention`, `gotcha` are *durable* and decay never archives them, `task` lives a week, `note` a month. `memory_brief` / `ai-memory brief` prints the whole project's standing memory in a fixed order (conventions → decisions → gotchas → open → recent) inside 600 tokens, without a query and without an LLM call. Projects are managed on the same dimension — `ai-memory project list | init | rename | forget` ([ADR-0042](docs/adr/0042-project-management-rides-the-dimension.md)).
 - **Knowledge pages** (ADR-0023): markdown in `vault/` is indexed section by section — the file stays the truth, one row per heading (`knowledge sync` is idempotent: unchanged files write and embed nothing), and `[[links]]` are stored beside the rows as `knowledge_links` with dangling targets kept as null. `memory_knowledge`, `/knowledge` and `ai-memory knowledge` read the index; `neighbors` walks links explicitly, never implicitly.
 - **Console** (`ui/`, built to `dist/src/ui-next`, served at `/`): the one browser UI over the API below — Recall, Memories, Sessions, Graph, Stats — in two themes (dark default, warm-white light). The old inspector is gone.
 - **Vault graph** (`/graph.html`): Obsidian-style node graph over `vault/` — any markdown you point `VAULT_DIR` at. Edges come from `[[wikilinks]]` in the body plus the frontmatter `links:` that ingest writes — nothing is inferred, so the graph never lies about intent. Click a node for the local graph (depth 1-3), filter with `tag:x` / `path:x` / substring, colour by folder, drag nodes; positions persist to `vault/.positions.json`. Dangling and ambiguous links render as hollow nodes — hiding them would hide the maintenance debt.
@@ -136,8 +136,12 @@ says which page and which part of it answered.
 | `GET` | `/memories/:id` | |
 | `DELETE` | `/memories/:id` | soft-delete |
 | `POST` | `/memories/:id/supersede` | `{namespace,type,text,...}` creates new + soft-deletes old via `supersedesId` |
-| `POST` | `/memories/search` | `{query, namespace, namespaces?, k?, budgetTokens?, threshold?, type?, kind?, project?, explain?}` — `namespaces` is comma-separated and overrides `namespace`; it is how the CLI reads its own partition plus the legacy one |
+| `POST` | `/memories/search` | `{query, namespace, namespaces?, k?, budgetTokens?, threshold?, type?, kind?, project?, explain?}` — `namespaces` is comma-separated and overrides `namespace`; it is how the CLI reads its own partition plus the legacy one. An empty result carries `diagnostics` (`{threshold, partitions:[{namespace,total}], nearMisses, outside?}`) — the key is **absent** when there are matches, so a non-empty response costs no tokens. `outside` lists the same user's partitions this read did not cover but which still hold matching rows, so a miss can say "the answer is one layer over" instead of "nothing was stored" ([ADR-0037](docs/adr/0037-explain-an-empty-search.md), [ADR-0039](docs/adr/0039-an-empty-result-reports-the-partitions-it-did-not-read.md)) |
 | `GET`/`POST` | `/brief` | `{project?, namespaces?, budgetTokens?, sinceDays?}` → `{project, text, tokensUsed, budgetTokens, truncated, sections, counts}` — the project's standing memory with no query (ADR-0022) |
+| `GET` | `/projects` | `{projects: [{project, rows, byKind, lastActivityAt}]}` — every project, live rows only (`(unscoped)` rides along as `project: null`) |
+| `POST` | `/projects` | `{project?, note?}` → 201 `{project, created, rows, memory}` / 200 when it already exists — writes one durable marker row tagged `project:init`, skipped by the brief (ADR-0042) |
+| `POST` | `/projects/:slug/rename` | `{to, merge?}` — moves every row (tombstones included) to the new slug; an occupied target is refused until `merge: true` |
+| `DELETE` | `/projects/:slug?mode=` | `mode=delete` (default) soft-deletes the project's live rows, restorable; `mode=detach` sets `project = null`; unknown slug → 404 |
 | `POST` | `/extract` | `{text, namespace, referenceDate?}` — heuristic (no LLM) or LLM if `ENABLE_EXTRACTOR=true` + `OPENAI_API_KEY`; the shape gate drops tables, bullets, headings, prompt XML and terminator-less slices |
 | `POST` | `/decay` | `{archived, pruned, affected}` — archive-first: never-retrieved rows older than 30d with `importance < 0.6` become `archived`. Deleting only happens in the opt-in hard pass |
 | `POST` | `/compact` | `{bytesBefore, bytesAfter}` — VACUUM and report the file footprint (db + WAL + shm); `501` when the store has no file to rewrite |
@@ -186,7 +190,7 @@ Two defaults, on purpose:
 | Caller | Floor | Why |
 |---|---|---|
 | HTTP / UI (this server) | **0.72** | The ADR-0002 value, unchanged. Cleared by BM25/vector relevance, or by the total for a fresh, important, partially-matching memory. Zero shared terms never qualifies, so context pollution stays out. |
-| pi `memory_search` (auto-memory extension) | **0.35** English / **0.2** Chinese | Measured against this corpus, 0.72 discarded real memories: an exact hit scores ~0.96, a reworded one ~0.33. A Chinese query scores structurally low because the hash embedder returns ~0 cosine for CJK and the vector term carries 0.6 weight. |
+| pi `memory_search` (auto-memory extension) | **0.35** English / **0.2** Chinese | Measured against this corpus, 0.72 discarded real memories: an exact hit scores ~0.96, a reworded one ~0.33. The Chinese floor started below the English one because a Chinese query scored structurally low; since [ADR-0027](docs/adr/0027-cjk-relevance-by-coverage.md) it does not, and the two floors are kept apart only until the corpus has enough real Chinese memories to test the pair. |
 
 This is a deliberate divergence, not drift. The agent is answering questions it was asked; the UI is you deciding what to inject into a prompt. Revisit when the corpus has enough real memories to judge `0.35` on its own.
 
@@ -283,6 +287,14 @@ Score = `0.6*bm25 + 0.25*recency + 0.15*strength` (`vector` weight 0 by default 
 
 **`MEMORY_VECTOR_WEIGHT`** defaults to `0.6` once a real embedder is configured and `0` for hash: the hash provider returns ~0.9 cosine to everything, so the vector term would be noise, and with it lexical overlap is the only relevance signal that exists. Set the variable to override either way.
 
+**Relevance is ordered by coverage.** The score above decides *whether* a row is relevant; it cannot always decide *which* of two relevant rows was asked for. In Chinese the filler shares the question's subject matter rather than its function words — nine rows in a partition say 「项目 <project> 的约定」, so those words look important to BM25 and the row holding the marker scores 0.008 above the noise. So each candidate also gets a `coverage` — the share of the query's own words it holds, counting a matched two-character word once — and that value leads the sort, feeds the relevance gate (a row holding three quarters of the words is relevant whatever its score), and is the relevance term MMR and the token budget see ([ADR-0027](docs/adr/0027-cjk-relevance-by-coverage.md)). On the real-time bench this took Chinese recall@5 from 0.65 to 1.00 with the English shapes unchanged.
+
+**Coverage counts matched words, but weights them by rarity (ADR-0028).** For a corpus that is one ongoing conversation, coverage-as-a-count is backwards the other way: "What is Caroline's identity?" asks `{caroline, identity}`, and `caroline` sits in almost every chunk while the row that answers it says "transgender woman" — so half the store scores the same coverage as the answer and the ordering falls back on age and use. So the *sort* uses a df-weighted coverage (each asked word worth `log(1 + maxDf/df)` from `term_df`), while the *gate* still reads the unweighted share — a row holding one rare word would reach a weighted 1.0, and three-quarters-of-what-was-asked is the meaning the gate must keep. A second pass that expands on the top hits' shared terms (pseudo-relevance feedback) was built for the multi-hop remainder and **measured net-negative** — the merged rows crowd a fixed 800-token budget single-hop rows need (evidence-any 76 → 72%) — so it ships behind `MEMORY_PRF=on`, off by default, like the int8 shortlist. Measured on the model-free evidence ruler over all 152 LoCoMo questions, the weighted ranking plus a 1000-char chunk took evidence-all 57 → 66% and the honest current-tree LoCoMo accuracy 50.7 → 69.1% (same pinned reader).
+
+**An empty result explains itself.** "No memories matched" was one sentence for three different situations — the partition is empty, the caller is looking at the wrong partition, and the rows are there but the wording missed the gate — and the only move it teaches an agent is to reword and retry, which cannot work for the first two. One measured session spent 14 tool calls on a single question and the first 6 were reworded retries. An empty `SearchResult` now carries `diagnostics`: the threshold, the row count per searched partition, and the nearest misses that were rejected. The rendering lives in one place (`renderEmptySearch`), so the CLI, the MCP server (both the in-process and the daemon path) and the pi extension print the same explanation, and the last line is the one that ends the loop — `nothing was stored for this scope`, `rows exist but none shared a term with this query: different words, not a lower threshold`, or `rows exist but none matched: retry with threshold 0.52`. Three tails because there are three different next moves; the middle one exists because a query sharing no term with any of 363 rows still used to be told to lower a threshold that never ran. The first line stays `no memories matched` so callers that grep for it keep working, and a daemon built before this change still answers without the key, in which case every renderer falls back to the old one-liner ([ADR-0037](docs/adr/0037-explain-an-empty-search.md)).
+
+**An empty result also says what it did not read.** A read covers the caller's own agent layer, the shared layer and `default:default` — and nothing else, which is the point of per-agent layers. The cost of that isolation is a sentence like "nothing was stored for this scope" being true and misleading at once: on this store `pi:frank` held 0 rows while `coding-agent:frank` held 4, one of them `The user lives in Tokyo.`, and a `pi` session asking for Tokyo got an empty result with no hint that the fact existed one layer over. `diagnostics.outside` now lists the same user's partitions the read did not cover and which still hold rows matching the same filters, so the message reads `outside this scope: coding-agent:frank (1 rows)` and the tail becomes `nothing was stored in this scope, but 2 rows exist outside it: widen the scope to include them`. That tail outranks the other three, because "never recorded" is the wrong conclusion and the one a caller acts on. Nothing becomes readable that was not readable before — `outside` names the door, `scope:"all"` or `agent:"..."` is still what opens it ([ADR-0039](docs/adr/0039-an-empty-result-reports-the-partitions-it-did-not-read.md)).
+
 ## Benchmarks
 
 ![LoCoMo conv-26: accuracy, context fed per question, retrieval latency, reader and judge input
@@ -299,8 +311,8 @@ carries retrieval latency and reader tokens as well; each bar has its own axis a
 The ordering is not an artifact of the LLM judge: a model-free string-hit audit agrees with it
 (19.7% / 10.5% / 3.3%), every row has non-empty retrieved context, and the paired comparisons are
 significant (open-memory vs OpenViking 37/20, p=0.033; vs mem0 62/7, p<0.001). A re-run of the
-open-memory arm alone after the v0.4 changes reaches **59.2%** — see
-[v0.4 re-run](#v04-re-run--same-harness-only-open-memory-changed).
+open-memory arm alone on the current tree reaches **69.1%** on the same pinned reader — see
+[v0.5 re-run](#v05-re-run--the-current-tree-measured-honestly).
 
 Read it with the caveats, which matter more than the bars:
 
@@ -312,29 +324,49 @@ Read it with the caveats, which matter more than the bars:
   inside the table, never against their READMEs.
 - The per-question rows and the harness that produced them are not published yet.
 
-### v0.4 re-run — same harness, only open-memory changed
+### v0.5 re-run — the current tree measured honestly
 
-Re-ran the open-memory arm alone on 2026-10-19 against the same 152 questions, the same pinned
-reader and judge, and a fresh NIM-embedded store (`bench/results/om-v04.json`):
+The v0.4 figure this section replaces was **59.2%**, and an audit found it cannot stand as a
+measurement of v0.4: it posted to a long-lived daemon started *before* the v0.4 retrieval work landed —
+its store (`bench/om-v04.db`) still carried the old JSON-vector schema with no `memory_vectors` table
+and a leftover smoke-test row. So no honest number for the current tree existed until now. The reader
+was never the problem (50.7%, 59.2% and 69.1% all used the same pinned `vyceai/deepseek-v4.1`); the
+measured *binary* was.
 
-| | v0.3 | v0.4 | Δ |
+Re-ran the open-memory arm alone on 2026-11-04 against the same 152 questions, the same pinned reader
+and judge, a **fresh store built by the current tree** with NIM 2048-d embeddings and the ~1000-char
+chunk [ADR-0028](docs/adr/0028-idf-weighted-coverage-and-prf.md) measured (the evidence ruler finds 800–1000
+statistically tied and clearly ahead of 600 and 1200; `bench/results/om-v05.json`):
+
+| | v0.3 | v0.5 | Δ |
 |---|---|---|---|
-| Accuracy (LLM judge) | 50.7% (77/152) | **59.2% (90/152)** | +8.5 pp |
-| multi-hop (n=32) | 38% | 43.8% | +5.8 pp |
-| temporal (n=37) | 35% | 45.9% | +10.9 pp |
-| open-domain (n=13) | 46% | 61.5% | +15.5 pp |
-| single-hop (n=70) | 66% | 72.9% | +6.9 pp |
-| Model-free string hit | 19.7% | 22.4% | +2.7 pp |
-| Context per question | 2,588 chars | 3,081 chars | +19% |
-| Memory tokens per question | 648 | 772 (of 800) | +19% |
-| Retrieval p50 / p95 | 585 / 847 ms | 580 / 728 ms | — |
+| Accuracy (LLM judge) | 50.7% (77/152) | **69.1% (105/152)** | +18.4 pp |
+| multi-hop (n=32) | 38% | 34% | −3.1 pp |
+| temporal (n=37) | 35% | **81%** | +46 pp |
+| open-domain (n=13) | 46% | 46% | — |
+| single-hop (n=70) | 66% | **83%** | +17 pp |
+| Model-free string hit | 20.0% | **35.3%** | +15.3 pp |
+| Context per question | 2,526 chars | 3,102 chars | +23% |
+| Memory tokens per question | 648 | 777 (of 800) | +20% |
+| Ingest | 15.1 s | 33.4 s (85 chunks) | — |
+| Retrieval mean | 585 ms | 822 ms | +237 ms |
 
-Per question, 30 answers became correct and 17 became wrong, so the gain is not a shift in the
-judge's mood; the judge-free string hit moves the same way. The context grew because the
-retriever now returns what `k` and the budget always said it would (2.68 → 3.89 blocks) instead
-of stopping at 2-3, and spends leftover budget on projected lines ([ADR-0013](docs/adr/0013-honest-k-budget-and-decay.md), [ADR-0014](docs/adr/0014-project-into-leftover-budget.md)).
-The 60% target for this pass was missed by 0.8 pp; the remaining misses are still dominated by
-retrieval, not by the reader, and the temporal and multi-hop categories remain the weak ones.
+Per question, 43 answers became correct and 15 became wrong (McNemar **p=0.0003**), so this is not a
+shift in the judge's mood: the **judge-free string hit moves the same way** (20.0 → 35.3%), and the two
+categories the change targets — temporal (a smaller, header-bearing chunk keeps the date near the top)
+and single-hop (whole rows that fit the budget) — jump, exactly as [ADR-0028](docs/adr/0028-idf-weighted-coverage-and-prf.md)'s
+model-free evidence ruler predicted (evidence-all 57 → 66%, evidence-any 68 → 76%).
+
+Two categories did not move and are reported as-is, not smoothed: **multi-hop is still the frontier**
+(34%; its evidence reaches the context only 13% of the time, and the PRF second pass that was built to
+close it measured net-negative on a fixed budget and ships off by default), and open-domain is flat at
+46%. Retrieval mean rose 585 → 822 ms because the second lexical arm and the weighted coverage now run
+per query; it is still under the 700 ms-class budget for the store this is sized for and the real-time
+gate holds at recall@5 1.00 ([docs/realtime-bench.md](docs/realtime-bench.md)).
+
+On one harness, same reader, same embeddings: open-memory **69.1%** vs OpenViking **39.5%** vs mem0
+OSS **14.5%** — the gap is no longer a single contested re-run but a judge-independent, significance-
+tested current-tree number.
 
 ### Real-time — what it does while it is being used
 
@@ -355,9 +387,10 @@ One core, hash/384d, 800 seeded facts + 12 vault pages, knowledge sync every 5 s
 The knee is between 80 and 100 req/s: up to 80 the worst stall is 338 ms with zero errors and zero
 drops; at 100 the offer exceeds capacity, writes degrade first (p50 3 → 52 ms) and searches pay in
 queue time. Recall on the *original* facts stays flat while 1,000+ rows are inserted underneath,
-i.e. the candidate union absorbs churn instead of displacing old answers. The one surface that grows
-with the partition is the knowledge index (`knowledge` p50 62 ms at 1,905 rows) — a known limit in
-[ADR-0023](docs/adr/0023-knowledge-dimension.md), not a surprise.
+i.e. the candidate union absorbs churn instead of displacing old answers. The knowledge index no
+longer grows with the partition: it reads the page rows rather than listing the partition
+([ADR-0030](docs/adr/0030-knowledge-index-reads-pages-not-partitions.md)), which took `knowledge`
+p50 from 388 ms to 8.5 ms on a partition of 21,000 rows holding a 200-page vault.
 
 Recall is reported per query shape because pooling hides the script: bare markers 100%, English
 wording 97%, Chinese wording **71%** — the default hash embedder tokenises Latin only, which is why
@@ -385,6 +418,12 @@ keep 1.0 -> importance 0.90      keep 0.5 -> importance 0.65      keep 0.0 -> im
 ```
 
 `importanceFor()` is deliberately monotonic in confidence: decay then keeps what the judge was sure about and lets the shaky ones sink. Memories that went through it are tagged `judged:jev`.
+
+**4. Curation** (`src/core/write/curation.ts`, [ADR-0040](docs/adr/0040-writes-are-curated.md)) — the verdict every write passes through in `saveDetailed`, before the embed: does this deserve to exist at all? The shape gate polices only the extractor's slices; the audited store's junk came in through every other door — the un-gated LLM extract pass, and explicit saves. Curation closes all of them with nine named classes, bilingual, zero model calls: **secrets** (vendor key shapes, `Bearer`/JWT, keyword assignments — refused on every path; the one class where a false kill is preferred), **table rows**, **colon headers** (a heading whose content went to the next line), **phatic filler** (Mem0 answers `Hi.` with no facts; so does the lexicon), **conversational repairs** (`我没说过我在 pi-desktop` — a correction without a replacement fact is conversation management), **code lines**, **prompt fragments** (`Task: TOOLBOX: your real tools are…`), and two weak classes — **progress narration** (`我刚做的:`, `Plan 已更新`) and **self-narration** (`I can only work with local files`) — which a caller may still store, demoted to `note` 0.35 with a `curation:*` tag.
+
+A rejection is a verdict with one next move, never a bare no: the API answers `422 {error, curation}`, `memory_remember` returns `not stored (conversational): a correction without a replacement fact … — store the fact itself`, the CLI prints the advice and exits 1. `MEMORY_CURATE=off` restores the un-gated store per process. Measured by replaying all 515 rows of the audited store through the verdict: **68 rejected (13.2%), zero kills on the clean fixture set** ([ADR-0040](docs/adr/0040-writes-are-curated.md)).
+
+**5. Write gate** (`jevWriteGate`, [ADR-0041](docs/adr/0041-the-write-gates-judgement-call-goes-to-the-model.md)) — the second LLM gate: the judgement call no regex settles, asked of the model for every write that survives curation. Curation's structural rules pass a config dump with no pipes and no colons; this gate asks two questions in one request — `keep` (the extractor's own durability question, now aimed at writes the extractor never saw) and `scaffold` (is this the agent's own instruction scaffolding or a session narration rather than knowledge about the world?). Below the floor (`MEMORY_WRITE_GATE_MIN`, default 0.5) an extractor-sourced write is refused as `low-value`; an explicit write is demoted, never refused — unless the caller named a kind or an importance, in which case the row stores as asked with a `judged:write-gate` tag, because the caller's own judgement wins. A clean verdict prices the derived importance (`importanceFor(keep)`, the extractor judge's mapping). Same endpoint and key as the jev judge, `MEMORY_WRITE_GATE=false` turns it off alone, and fail-open holds: no answer stores the write unjudged. Rows the extractor's jev already priced (`judged:jev`) never ask twice.
 
 Below `MEMORY_JEV_MIN` (default 0.5) the sentence is dropped. **Fail-open**: no key, a 401, or the API being down means the memory is stored *unjudged* rather than lost. A store that silently stops recording because a judge API is down is worse than one that occasionally keeps a mediocre fact.
 
@@ -429,7 +468,11 @@ A repository outlives the sessions that work on it. The namespace answers *who* 
 ai-memory save "We chose float32 blobs over JSON text because parsing was the cost" --kind decision
 ai-memory save "Always run npm run lint before committing" --kind convention
 ai-memory brief                    # what this repository already knows, ≤600 tokens
+ai-memory project list             # every project this store holds, live rows per kind
+ai-memory project init             # make this repository's project visible now (--note for a first decision)
 ```
+
+Managing a project does not build a second thing to keep in sync — there is no `projects` table, and a project exists because rows carry its slug ([ADR-0042](docs/adr/0042-project-management-rides-the-dimension.md)). `project init` writes one durable marker row (tagged `project:init`, in the shared layer, skipped by the brief) so the project is visible before its first real write; `project rename <from> <to>` moves every row — tombstones included — and refuses an occupied target unless `--merge`; `project forget <slug>` soft-deletes the rows (restorable) and `--detach` unscopes them instead. MCP exposes the same four operations as one tool, `memory_project` (`op: list | init | rename | forget`); the daemon exposes `GET|POST /projects`, `POST /projects/:slug/rename` and `DELETE /projects/:slug?mode=`.
 
 `memory_brief` (MCP), `GET|POST /brief` and `ai-memory brief` print one **deterministic** block — same store and same clock give byte-identical text, so it can be diffed and cached ([ADR-0022](docs/adr/0022-brief-assembly.md)). Sections are fixed: **conventions → decisions → gotchas → open → recent** (shares 0.25 / 0.30 / 0.20 / 0.15 / 0.10, unused shares pass down). A search ranks against a question; a brief guarantees coverage, which is what a session that starts with no question actually needs. The auto-injection hook uses the brief when the turn has no query and falls back to a search when it does.
 
@@ -450,26 +493,43 @@ Single partition, 1100-char rows, real `insert`/`save` path, this machine, end-t
 | rows / dim | `vectorSearch` p50 | `search` p50 (before → after) | file | note |
 |---|---|---|---|---|
 | 2,000 / 384 | 10.4 ms | 30.2 → **15.3 ms** | 14.5 MB | harness, ADR-0019 |
-| 10,000 / 384 | 52.4 ms | 163.2 → **64.6 ms** | 70.9 MB | |
-| 20,000 / 384 | — | 341.4 → **148.9 ms** | 141.7 MB | linearity check |
+| 4,000 / 384 | 1.0 ms | 28.6 → **4.7 ms** | 26.3 MB | + ADR-0029, ADR-0033, ADR-0035 |
+| 10,000 / 384 | 2.3 ms | 64.6 → **7.7 ms** | 65.3 MB | |
+| 20,000 / 384 | 4.4 ms | 148.9 → **11.9 ms** | 136.2 MB | linearity check |
 | 4,000 / 2048 | 62.3 ms | 122.2 → **83.7 ms** | 54.3 MB | NIM-width vectors |
 
 (The "before" column is the same harness on the tree that already had ADR-0017/0018 but not ADR-0019; the ADR-0017 section above carries the older JSON-vector `vectorSearch` numbers.)
 
-Extrapolated to 10^5 rows: ~~2.8 s~~ → **~0.68 s / 0.69 GB** at 384 dims (inside the 700 ms budget), ~~6.0 s~~ → **~2.07 s / 1.31 GB** at 2048 dims. The 2048-dim case needs an index — a quantised shortlist plus exact rescore, or IVF — which is the named open half of [ADR-0019](docs/adr/0019-term-df-and-rarity-gate.md), not a layout problem. The full harness, its limits and the phase breakdown are in [docs/scale-bench.md](docs/scale-bench.md) (`node scripts/scale-bench.mjs --rows 10000 --dim 384 --ns 1`).
+Extrapolated to 10^5 rows: ~~2.8 s~~ → **~0.25 s / 0.63 GB** at 384 dims (0.3× the 700 ms budget), ~~6.0 s~~ → **~2.07 s / 1.31 GB** at 2048 dims. Those are linear extrapolations and should now be read as upper bounds — see the last paragraph of this section. The full harness, its limits and the phase breakdown are in [docs/scale-bench.md](docs/scale-bench.md) (`node scripts/scale-bench.mjs --rows 10000 --dim 384 --ns 1`).
+
+**A vector index was built, measured, and reverted; the scan was fixed instead.** Binning rows along the principal axis — the only structure available with zero dependencies — kept the exact scan's top-1 79% of the time and its recall@5 only **43.8%** on clustered embeddings, so it was dropped. What the profiling found underneath is more useful: `SELECT ... JOIN memory_vectors` was 11.7 ms of an 18.6 ms search, and it is the *page load of the blob column*, not the bytes (`SELECT id` 1.3 ms, a 4-byte literal blob 2.5 ms, four bytes of the real column 8.1 ms). So the work went into not reading it twice: a candidate set is decoded once into one flat `Float32Array`, keyed by the resolved `WHERE` clause, LRU-bounded by `MEMORY_VECTOR_CACHE_MB` (default 64, `off` to disable), and invalidated per row on write. 4,000 rows × 384d: `vectorSearch` 22.4 → **1.4 ms**, `search` p50 28.6 → **10.3 ms**, and the 10^5 projection 706 → **254 ms**. The arithmetic is identical, so recall is untouched — with the vector phase that cheap, `lexicalCandidates` is once again the largest piece of a search. [ADR-0029](docs/adr/0029-partition-vector-cache.md)
+
+**Then the lexical query was asking for the wrong plan.** `lexicalCandidates` was 14.6 ms of a 22.5 ms search at 10,000 rows, and not because its index was slow — `SELECT token, n FROM term_df WHERE token IN (...)` is 0.002 ms. `EXPLAIN QUERY PLAN` showed SQLite walking the partition index and probing `memory_terms` **once per row**, because the document-frequency list was written as a `UNION ALL` subquery and became the driving side of the join. A lookup that should read one posting record was doing 10,000 primary-key probes. `CROSS JOIN` forbids the reorder, so the plan becomes `SEARCH t (token=?) → SEARCH m (id=?)` — but pinning trades one partition walk for one `memories` probe *per posting*, which stops paying once the chosen words are held by thousands of rows (at df 2,500 the planner is 1.36× faster). The store therefore picks per call on the chosen words' total df, cutover at 2,000. Same rows, same scores, different access order: `lexicalCandidates` 14.6 → **2.0 ms** and `search` p50 22.5 → **7.4 ms** at 10,000 rows (4,000 rows: 10.4 → **5.0 ms**). [ADR-0033](docs/adr/0033-pin-the-lexical-join-order.md)
+
+Search is no longer linear in partition size, which makes the 10^5 extrapolations above upper bounds rather than predictions: the vector arm still reads the whole partition (0.63 GB projection), while the lexical arm is now bounded by how many rows hold the query's words. The harness reports the two arms separately (`projection.vectorP50MsLinear`, `projection.lexicalP50MsAtThisSize`) so the distinction survives into the JSON.
+
+**The write path was not slow — the cache was being thrown away.** `save` was said to cost a full partition scan because it reconciles against its 5 nearest neighbours, and it did: 123.1 ms at 20,000 rows. Instrumenting the call showed where that actually went. The neighbour search itself was **0.26 ms**; the same call inside `saveDetailed` was **113 ms**. `writeVectorSync` bumped a store-wide `vectorVersion` on every vector write, so inserting a row expired *every* cached partition, and the next save re-decoded 20,000 rows (31.8 MB) before its insert. The per-row `dropRow` that already existed was precise — the blanket version bump next to it was not. A plain insert now invalidates nothing (it changes no decoded row), a rewrite still invalidates exactly the partitions that held it, and a stale hit is charged as a miss so the stats can no longer report a healthy hit rate over a partition being rebuilt every save. `save` p50 27.5 → **4.25 ms** and `search` p50 10.4 → **5.5 ms** at 4,000 rows; `save` p50 **4.96 ms** at 10,000. [ADR-0034](docs/adr/0034-writes-expire-only-changed-partitions.md)
+
+**Not invalidating turned out to be a correctness bug, and fixing it made the cache cheaper still.** "An insert touches no decoded row" is true and useless: an entry is a snapshot of *which rows matched*, so a row inserted after the decode was not in it and could not be returned — a row whose vector equalled the query scored **1.0** through the exact scan and was **invisible** through the cache. `updateMeta` had the same hole from the other side (it never touched the cache, and `status`/`is_deleted` are part of the candidate `WHERE`), and `prune` flipped 40 rows to deleted while the cached search still returned five of them. The fix is a log of changed row ids (the last 4,096, ids only) plus a `seq` on each entry: on a hit the store replays what changed since the decode, asks the database — with the same `WHERE` that built the entry — which of those ids belong here, and **appends them in place**. An insert now costs a memcpy instead of a decode. [ADR-0035](docs/adr/0035-a-partition-catches-up-instead-of-being-rebuilt.md)
+
+**Then rewrites were the expensive shape.** `reembed` rewrites every row of a partition in turn through `updateEmbedding`, which marked the partition stale, so each rewrite paid a whole-partition decode: at 20,000 rows, one rewrite plus one search was **109.8 ms**, and forty rewrites produced forty-one misses — O(rows²) for a full re-embed. A rewrite is the one change the writer can describe completely: the row keeps its id and its membership, only the numbers move, and the new vector is in hand. `patchRow` overwrites it at the slot the entry already keeps for it — `dim` floats, no allocation, no invalidation — and nothing goes in the log. Rewrite-plus-search **109.8 → 5.06 ms** (21.7×) with **zero** misses over forty rewrites. [ADR-0036](docs/adr/0036-a-rewrite-patches-the-snapshot-in-place.md)
+
+**The 2048-dim column was attacked and the attack was documented as a miss.** An int8 shortlist (one signed byte per dimension plus a `maxAbs` scale, ranked on those bytes, with the shortlist re-scored exactly against the float32 blob) buys **1.45×** — 181.6 → 125.5 ms at 10,000 rows — for **+25% disk**, and lands at ~1.09 s at 10^5 rows. It is therefore **off by default** (`MEMORY_Q8=on` opts in). The phase split says why it stops there: reading four times fewer bytes per row saved 26 ms of 116 ms, and the rest is per-row object construction and the JOIN — costs that only fall if fewer *rows* are read. That reading also settles the int8 question: four times fewer bytes saved 26 ms of 116 ms, because the cost is touching the column at all, so a narrower blob could never get there — [ADR-0029](docs/adr/0029-partition-vector-cache.md) explains how the same measurement led to caching decodes instead. [ADR-0025](docs/adr/0025-int8-shortlist.md) · [ADR-0026](docs/adr/0026-int8-off-by-default.md)
+
+**The lexical index was moved to FTS5, measured, and moved back.** With the vector phase down to ~1.4 ms, `lexicalCandidates` became the largest line item in a warm search, and SQLite ships FTS5 — Node's bundled build has it compiled in. An FTS5 table over the same token stream was built to be *exactly* equivalent to the hand-rolled postings (same ids, same scores, same filters, enforced by a test, including a repeated-word row to catch tf read as 1 and a `snake_case_ident` row to catch tokenizer drift), and it was **9.3× slower** on the query shape this retriever actually issues: 8.0 ms through the postings against 74.9 ms through FTS5 at 20,000 rows. The reason is structural rather than a tuning miss — `MATCH` has to scan for phrase matches to discover which rows hold a token, while an inverted index answers the same question with an equality lookup on a primary key, and doing the former once per token per row multiplies it. So the postings stay, and the negative result is written down: [ADR-0031](docs/adr/0031-no-fts5-lexical-index.md)
 
 ## Project layout
 
 ```
 CONTEXT.md              # ubiquitous language (Memory, Token Burning, etc.)
-docs/adr/               # decision records 0001-0023
+docs/adr/               # decision records 0001-0038
 docs/DESIGN-node-graph.md
 src/core/
   types.ts              # Memory, Namespace, SearchResult, Brief, KnowledgeEdge
   project.ts            # resolveProject: explicit / env / git root -> slug
   write/                # reconciler, kind, facets, text
-  store/                # interface, sqlite (node:sqlite), memory (in-memory)
-  retrieval/            # hybrid, bm25, mmr, tokens/budget, assemble, brief
+  store/                # interface, sqlite (node:sqlite), partitionCache, memory (in-memory)
+  retrieval/            # hybrid, bm25, terms (index/query terms + coverage), mmr, tokens/budget, assemble, brief
   knowledge/            # sections, view (pages/links/neighbours), sync
   extraction/           # heuristic + optional LLM extractor
   lifecycle/ decay.ts
@@ -489,7 +549,7 @@ memory.db               # created on first run, gitignored
 ## Tests
 
 ```bash
-npm test            # vitest — 42 files, 520 tests (7 skipped by design)
+npm test            # vitest — 50 files, 632 tests (7 skipped by design)
 npm run lint        # tsc -p tsconfig.lint.json
 ```
 
@@ -525,3 +585,18 @@ See `CONTEXT.md`. Canonical terms: **Memory**, **Episodic/Semantic/Procedural/Wo
 - `0022-brief-assembly`
 - `0023-knowledge-dimension`
 - `0024-realtime-benchmark`
+- `0025-int8-shortlist`
+- `0026-int8-off-by-default`
+- `0027-cjk-relevance-by-coverage`
+- `0028-idf-weighted-coverage-and-prf`
+- `0029-partition-vector-cache`
+- `0030-knowledge-index-reads-pages-not-partitions`
+- `0031-no-fts5-lexical-index`
+- `0032-bench-measures-the-vector-path`
+- `0033-pin-the-lexical-join-order`
+- `0034-writes-expire-only-changed-partitions`
+- `0035-a-partition-catches-up-instead-of-being-rebuilt`
+- `0036-a-rewrite-patches-the-snapshot-in-place`
+- `0037-explain-an-empty-search`
+- `0038-all-is-a-question-about-the-store`
+- `0039-an-empty-result-reports-the-partitions-it-did-not-read`

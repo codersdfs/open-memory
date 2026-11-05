@@ -1,6 +1,7 @@
 import type { MemoryType } from "../types.js";
 import { jevKeep, importanceFor, JEV_MIN_KEEP } from "../judgment/judge.js";
 import { runtimeEnv } from "../settings.js";
+import { curateExtracted } from "../write/curation.js";
 
 export interface ExtractedMemory {
   text: string;
@@ -210,8 +211,12 @@ export class Extractor {
     const candidates: ExtractedMemory[] = [];
     // Keep the terminator: the "is this a question?" gate below reads it, and
     // splitting on [.!?] silently strips exactly the punctuation it needs.
+    // CJK terminators split with no whitespace after them — Chinese never puts a
+    // space at a sentence end, and audited rows like "在。它就是那个 MCP 服务里的第三个
+    // 项目……" slid past this split whole, confirmation token and fact welded together.
+    // The ASCII branch keeps its \s+ so "3.14" and "e.g." stay whole.
     const sentences = text
-      .split(/(?<=[.!?])\s+|\n+/)
+      .split(/(?<=[。！？])|(?<=[.!?])\s+|\n+/)
       .map((s) => s.trim())
       .filter((s) => s.length > 12);
     // Every JEV_MIN_KEEP() is a synchronous settings.json read, so the threshold is
@@ -353,7 +358,14 @@ export class Extractor {
     if (!res.ok) throw new Error(`LLM extract ${res.status}`);
     const json = (await res.json()) as { choices: { message: { content: string } }[] };
     const parsed = JSON.parse(json.choices[0].message.content) as { memories: ExtractedMemory[] };
-    return (parsed.memories ?? []).slice(0, this.maxPerTurn).map((m) => {
+    // The LLM path shipped with no gate at all, which is where the audited table rows
+    // came from: a model asked for "durable facts" will happily return a markdown
+    // table row it just read out of the turn. The heuristic path's gate applies here
+    // too — a model's judgement of what is durable is a candidate, not a verdict.
+    const gated = (parsed.memories ?? [])
+      .filter((m) => Extractor.isWorthKeeping(String(m.text)))
+      .filter((m) => curateExtracted(String(m.text)).action !== "reject");
+    return gated.slice(0, this.maxPerTurn).map((m) => {
       // The LLM is asked for durable facts, not for date arithmetic, so the same
       // relative-date resolution runs on its output.
       const stamped = stampRelativeDate(String(m.text), referenceDate);

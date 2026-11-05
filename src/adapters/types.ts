@@ -31,11 +31,18 @@ export interface AdapterRegistry {
   ids(): string[];
 }
 
+/**
+ * `Map` keeps the *first* value for a duplicated key, so callers can concatenate
+ * tiers in priority order: a built-in class or a known client listed before the
+ * declarations shadows a declared agent of the same id. That is what makes a
+ * hand-edited `agents.json` unable to quietly replace Claude Code's hooks.
+ */
 export function makeRegistry(adapters: Adapter[]): AdapterRegistry {
-  const byId = new Map(adapters.map((a) => [a.id, a]));
+  const byId = new Map<string, Adapter>();
+  for (const adapter of adapters) if (!byId.has(adapter.id)) byId.set(adapter.id, adapter);
   return {
     get: (id) => byId.get(id),
-    all: () => [...adapters],
+    all: () => [...byId.values()],
     ids: () => [...byId.keys()]
   };
 }

@@ -207,7 +207,6 @@ export function resolveRequestScope(q: {
   namespace?: string | null;
   agent?: string | null;
   scope?: string | null;
-  all?: boolean;
 }): { namespaces: string[]; agent: string; scopes: MemoryScope[] } {
   const agent = resolveAgent(q.agent ?? undefined);
   const explicit = q.namespace?.trim();
@@ -215,15 +214,6 @@ export function resolveRequestScope(q: {
   let namespaces: string[];
   if (explicit) {
     namespaces = [explicit];
-  } else if (q.all) {
-    const user = resolveUser();
-    // `all` has to mean every partition this user owns, the legacy one included:
-    // without it an `--all` sweep read LESS than a plain request, which already fans out
-    // over the legacy family. `resolveAllNamespaces` counts it for the same reason.
-    namespaces = withLegacy([
-      namespaceKey({ agentId: agent, userId: user }),
-      namespaceKey({ agentId: SHARED_AGENT, userId: user })
-    ]);
   } else if (isScope(q.scope)) {
     namespaces = resolveScopeKeys({ agent, scope: q.scope });
   } else {
@@ -232,4 +222,32 @@ export function resolveRequestScope(q: {
 
   const scopes = [...new Set(namespaces.map(scopeOfNamespace))];
   return { namespaces, agent, scopes };
+}
+
+/**
+ * The same resolution, for a caller that has a store — which is the only kind of caller
+ * that can answer `all`.
+ *
+ * "Every partition this user owns" is a fact about the store, not about the request, so
+ * it cannot live in the pure resolver. It used to be approximated there as
+ * `[<agent>:<user>, shared:<user>, legacy]`, and that approximation is what `all` meant
+ * from the daemon: measured against the real store it resolved to
+ * `default:frank, shared:frank, default:default` and skipped the four rows sitting in
+ * `coding-agent:frank`. A sweep that covers less than the plain layered read is worse
+ * than not offering one, because its name says otherwise.
+ *
+ * An explicit `namespace` still wins, and `all` still cannot reach another person's
+ * partition: `allPartitions` filters by the resolved user.
+ */
+export async function resolveReadScope(
+  q: { namespace?: string | null; agent?: string | null; scope?: string | null; all?: boolean },
+  store: { distinctNamespaces(): Promise<string[]> },
+  user?: string
+): Promise<{ namespaces: string[]; agent: string; scopes: MemoryScope[] }> {
+  const agent = resolveAgent(q.agent ?? undefined);
+  if (q.all === true && !q.namespace?.trim()) {
+    const namespaces = await allPartitions(store, user);
+    return { namespaces, agent, scopes: [...new Set(namespaces.map(scopeOfNamespace))] };
+  }
+  return resolveRequestScope(q);
 }

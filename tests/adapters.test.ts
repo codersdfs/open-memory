@@ -222,8 +222,37 @@ describe("pi and dsh adapters", () => {
     }
   });
 
-  it("registry exposes every agent from ADR-0007", () => {
-    expect(createRegistry().ids().sort()).toEqual(["claude", "codex", "dsh", "pi"]);
+  it("registry exposes every agent from ADR-0007, detected or not", () => {
+    // The catalogue is a function of the known-clients table, not of what this machine
+    // has installed: an editor missing from `agent list` reads as unsupported.
+    const ids = createRegistry().ids();
+    expect(ids.slice(0, 4)).toEqual(["claude", "codex", "dsh", "pi"]);
+    for (const id of ["cursor", "windsurf", "cline", "zed", "vscode", "continue", "gemini", "opencode", "qwen", "crush", "amp", "aider"]) {
+      expect(ids).toContain(id);
+    }
+    expect(ids).toHaveLength(4 + 12);
+  });
+
+  it("points known clients at the user's home, not the memory store's home", async () => {
+    // Regression: `resolveHome()` means `~/.ai-memory` (where memory.db lives). Using it
+    // here sent every editor to `<store>/.cursor/mcp.json` — a file nothing reads — and
+    // detection then "found" the store directory itself, so `agent list` reported every
+    // client as installed on a machine that had none of them.
+    const savedHome = process.env.AI_MEMORY_HOME;
+    mkdirSync(path.join(home, ".ai-memory", ".cursor"), { recursive: true });
+    process.env.AI_MEMORY_HOME = path.join(home, ".ai-memory");
+    try {
+      const registry = createRegistry();
+      const cursor = await registry.get("cursor")!.status();
+      // The path must be under the user home, never under the store home.
+      expect(cursor.detail).toContain(path.join(home, ".cursor", "mcp.json"));
+      expect(cursor.detail).not.toContain(path.join(home, ".ai-memory"));
+      // And the store's own `.cursor` directory it just created is not an install.
+      expect(registry.get("cursor")!.detect()).toBe(false);
+    } finally {
+      if (savedHome === undefined) delete process.env.AI_MEMORY_HOME;
+      else process.env.AI_MEMORY_HOME = savedHome;
+    }
   });
 
   it("cliEntryPath points at a real build output, not a stale dist/cli path", () => {
@@ -252,8 +281,13 @@ describe("agent CLI", () => {
 
   it("reports an unknown --agent instead of guessing", async () => {
     const c = ctx();
-    expect(await runAgentCommand(["link"], { agent: "vscode" }, c)).toBe(2);
+    expect(await runAgentCommand(["link"], { agent: "notaclient" }, c)).toBe(2);
     expect(c.errs.join("\n")).toMatch(/unknown agent/);
+    // A known-but-not-installed client is accepted by name: installing it after setup
+    // must not require reinstalling ai-memory.
+    const c2 = ctx();
+    expect(await runAgentCommand(["link"], { agent: "windsurf" }, c2)).toBe(0);
+    expect(c2.errs.join("\n")).toBe("");
   });
 
   it("link --agent claude --write links only claude", async () => {
@@ -300,7 +334,7 @@ describe("agent CLI", () => {
  * client's config file survives link/unlink byte for byte apart from our entry.
  */
 describe("declared agents (agents.json)", () => {
-  const clientFile = () => path.join(home, ".cursor", "mcp.json");
+  const clientFile = () => path.join(home, ".myeditor", "mcp.json");
   // The memory home is `~/.ai-memory`, so the declaration file sits one level in.
   const specsFile = () => path.join(home, ".ai-memory", "agents.json");
 
@@ -320,47 +354,47 @@ describe("declared agents (agents.json)", () => {
     const file = clientFile();
 
     // dry run: no declaration, no entry
-    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": file }, ctx())).toBe(0);
+    expect(await runAgentCommand(["add", "myeditor"], { "mcp-file": file }, ctx())).toBe(0);
     expect(existsSync(specsFile())).toBe(false);
     expect(JSON.parse(readFileSync(file, "utf8")).mcpServers["ai-memory"]).toBeUndefined();
 
-    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": file, write: true }, ctx())).toBe(0);
+    expect(await runAgentCommand(["add", "myeditor"], { "mcp-file": file, write: true }, ctx())).toBe(0);
     const cfg = JSON.parse(readFileSync(file, "utf8"));
     expect(cfg.mcpServers.other).toEqual({ command: "x" });
     expect(cfg.theme).toBe("dark");
     expect(cfg.mcpServers["ai-memory"].type).toBe("stdio");
-    expect(cfg.mcpServers["ai-memory"].env.AI_MEMORY_AGENT).toBe("cursor");
+    expect(cfg.mcpServers["ai-memory"].env.AI_MEMORY_AGENT).toBe("myeditor");
     expect(cfg.mcpServers["ai-memory"].args).toEqual([process.env.AI_MEMORY_CLI, "mcp"]);
-    expect(JSON.parse(readFileSync(specsFile(), "utf8")).agents.cursor.mcpFile).toBe(file);
+    expect(JSON.parse(readFileSync(specsFile(), "utf8")).agents.myeditor.mcpFile).toBe(file);
 
     // the registry serves it, and says it is linked
-    expect(createRegistry().ids()).toContain("cursor");
+    expect(createRegistry().ids()).toContain("myeditor");
     const s = { ...ctx(), json: true };
-    expect(await runAgentCommand(["status"], { agent: "cursor" }, s)).toBe(0);
+    expect(await runAgentCommand(["status"], { agent: "myeditor" }, s)).toBe(0);
     const rows = JSON.parse(s.lines.join("")) as { id: string; linked: boolean }[];
-    expect(rows.find((r) => r.id === "cursor")).toMatchObject({ linked: true });
+    expect(rows.find((r) => r.id === "myeditor")).toMatchObject({ linked: true });
 
     // idempotent
     const before = readFileSync(file, "utf8");
-    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": file, write: true }, ctx())).toBe(0);
+    expect(await runAgentCommand(["add", "myeditor"], { "mcp-file": file, write: true }, ctx())).toBe(0);
     expect(readFileSync(file, "utf8")).toBe(before);
 
     // unlink removes our entry and nothing else
-    expect(await runAgentCommand(["unlink"], { agent: "cursor", write: true }, ctx())).toBe(0);
+    expect(await runAgentCommand(["unlink"], { agent: "myeditor", write: true }, ctx())).toBe(0);
     const after = JSON.parse(readFileSync(file, "utf8"));
     expect(after.mcpServers.other).toEqual({ command: "x" });
     expect(after.mcpServers["ai-memory"]).toBeUndefined();
     expect(after.theme).toBe("dark");
 
     // remove drops the declaration; the registry forgets it
-    expect(await runAgentCommand(["remove", "cursor"], { write: true }, ctx())).toBe(0);
-    expect(createRegistry().ids()).not.toContain("cursor");
+    expect(await runAgentCommand(["remove", "myeditor"], { write: true }, ctx())).toBe(0);
+    expect(createRegistry().ids()).not.toContain("myeditor");
     expect(JSON.parse(readFileSync(specsFile(), "utf8")).agents).toEqual({});
   });
 
   it("rejects a declaration with no config file", async () => {
     const c = ctx();
-    expect(await runAgentCommand(["add", "cursor"], {}, c)).toBe(2);
+    expect(await runAgentCommand(["add", "myeditor"], {}, c)).toBe(2);
     expect(c.errs.join("\n")).toMatch(/--mcp-file/);
     expect(existsSync(specsFile())).toBe(false);
   });
@@ -379,7 +413,7 @@ describe("declared agents (agents.json)", () => {
     writeFileSync(process.env.AI_MEMORY_CLI!, "// stub\n");
     seedSpecs(JSON.stringify({ agents: { claude: { mcpFile: clientFile() } } }));
     expect(createRegistry().get("claude")).toBeInstanceOf(ClaudeAdapter);
-    expect(createRegistry().ids().sort()).toEqual(["claude", "codex", "dsh", "pi"]);
+    expect(createRegistry().ids().slice(0, 4)).toEqual(["claude", "codex", "dsh", "pi"]);
 
     const d = ctx();
     expect(await runAgentCommand(["doctor"], {}, d)).toBe(1);
@@ -394,21 +428,29 @@ describe("declared agents (agents.json)", () => {
     seedClient();
     const rules = path.join(home, "RULES.md");
     writeFileSync(rules, "# House rules\n\nBe terse.\n");
-    seedSpecs(JSON.stringify({ agents: { zed: { mcpFile: clientFile(), instructions: rules } } }));
+    seedSpecs(JSON.stringify({ agents: { myeditor: { mcpFile: clientFile(), instructions: rules } } }));
 
-    expect(createRegistry().get("zed")).toBeTruthy();
-    expect(await runAgentCommand(["link"], { agent: "zed", write: true }, ctx())).toBe(0);
+    expect(createRegistry().get("myeditor")).toBeTruthy();
+    expect(await runAgentCommand(["link"], { agent: "myeditor", write: true }, ctx())).toBe(0);
 
     const cfg = JSON.parse(readFileSync(clientFile(), "utf8"));
-    expect(cfg.mcpServers["ai-memory"].env.AI_MEMORY_AGENT).toBe("zed");
+    expect(cfg.mcpServers["ai-memory"].env.AI_MEMORY_AGENT).toBe("myeditor");
     const written = readFileSync(rules, "utf8");
     expect(written).toContain("Be terse.");
     expect(written).toContain("ai-memory:begin");
 
-    expect(await runAgentCommand(["unlink"], { agent: "zed", write: true }, ctx())).toBe(0);
+    expect(await runAgentCommand(["unlink"], { agent: "myeditor", write: true }, ctx())).toBe(0);
     const stripped = readFileSync(rules, "utf8");
     expect(stripped).toContain("Be terse.");
     expect(stripped).not.toContain("ai-memory:begin");
+  });
+
+  it("warns instead of silently ignoring a declaration that claims a known client id", () => {
+    // The declaration cannot win — the known client is registered first — but a
+    // hand-edited file pointing `zed` somewhere else must not fail quietly.
+    seedSpecs(JSON.stringify({ agents: { zed: { mcpFile: clientFile() } } }));
+    expect(createRegistry().get("zed")?.label).toBe("Zed");
+    expect(createRegistry().ids().filter((id) => id === "zed")).toHaveLength(1);
   });
 
   it("edits a TOML client section-wise", async () => {
@@ -433,12 +475,30 @@ describe("declared agents (agents.json)", () => {
     const c = ctx();
     expect(await runAgentCommand(["list"], {}, c)).toBe(0);
     expect(c.lines.join("\n")).toContain("claude");
-    expect(createRegistry().ids()).toEqual(["claude", "codex", "dsh", "pi"]);
+    expect(createRegistry().ids()).toEqual([
+      "claude",
+      "codex",
+      "dsh",
+      "pi",
+      "cursor",
+      "windsurf",
+      "cline",
+      "zed",
+      "continue",
+      "vscode",
+      "gemini",
+      "opencode",
+      "qwen",
+      "crush",
+      "amp",
+      "aider"
+    ]);
 
     // and refuses to write over it
     const c2 = ctx();
-    expect(await runAgentCommand(["add", "cursor"], { "mcp-file": clientFile(), write: true }, c2)).toBe(1);
+    expect(await runAgentCommand(["add", "myeditor"], { "mcp-file": clientFile(), write: true }, c2)).toBe(1);
     expect(c2.errs.join("\n")).toMatch(/refusing to rewrite/);
     expect(readFileSync(specsFile(), "utf8")).toBe("{ oops");
   });
 });
+

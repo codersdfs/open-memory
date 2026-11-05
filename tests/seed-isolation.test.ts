@@ -1,5 +1,5 @@
 import { afterAll, describe, it, expect } from "vitest";
-import { spawnSync } from "node:child_process";
+import { spawnSyncChild, closeAllChildren } from "./helpers/child.js";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -22,8 +22,15 @@ const TSX = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
 const REAL_DB = path.join(root, "memory.db");
 
 const tempDirs: string[] = [];
-afterAll(() => {
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+afterAll(async () => {
+  await closeAllChildren();
+  for (const dir of tempDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // A leaked temp dir beats a red suite on Windows file locking.
+    }
+  }
 });
 
 function runSeed(explicitDbPath?: string) {
@@ -35,7 +42,7 @@ function runSeed(explicitDbPath?: string) {
   delete env.AI_MEMORY_DB;
   delete env.NAMESPACE;
   if (explicitDbPath) env.MEMORY_DB_PATH = explicitDbPath;
-  const res = spawnSync(process.execPath, [TSX, SEED], { cwd: root, encoding: "utf8", env, timeout: 120_000 });
+  const res = spawnSyncChild(process.execPath, [TSX, SEED], { cwd: root, encoding: "utf8", env, timeout: 120_000 });
   return { code: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 }
 

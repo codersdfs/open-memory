@@ -668,14 +668,30 @@ async function main(mods) {
     const bytesPerRow = Math.round(storage.dbBytes / totalRows);
 
     // --- projection ------------------------------------------------------
-    // Search is a linear scan of one partition, and --ns kept the number of
-    // rows per partition proportional to rows, so one factor covers it.
+    // The vector arm is still a scan of one partition, and --ns keeps the number
+    // of rows per partition proportional to rows, so that factor covers it.
+    //
+    // The lexical arm is NOT linear any more (ADR-0033): a rare query token is
+    // answered from the posting list, so its cost tracks how many rows hold the
+    // token, not how large the partition is. Extrapolating the whole search
+    // linearly therefore overstates the projection once the lexical arm stops
+    // dominating, and *understates* nothing — which is why the two arms are
+    // projected separately instead of multiplying the total. `linear` is kept so
+    // the number stays comparable with every earlier published run; `components`
+    // says which way each arm moves.
     const scale = 100000 / totalRows;
+    const vectorMs = search.store?.vectorSearchP50Ms ?? null;
+    const lexicalMs = search.store?.lexicalCandidatesP50Ms ?? null;
     const projection = {
       rows: 100000,
       sameNamespaces: nsCount,
       searchP50Ms: round(search.p50Ms * scale),
       searchP95Ms: round(search.p95Ms * scale),
+      // Per-arm projection. The vector arm scales with partition rows; the lexical
+      // arm is bounded by df, which this corpus keeps at ~1/64 of the partition, so
+      // the honest label for it is "unchanged by row count, grows with postings".
+      vectorP50MsLinear: vectorMs === null ? null : round(vectorMs * scale),
+      lexicalP50MsAtThisSize: lexicalMs === null ? null : round(lexicalMs),
       dbBytes: Math.round(bytesPerRow * 100000),
       dbGB: gib(bytesPerRow * 100000)
     };

@@ -142,7 +142,9 @@ export async function syncKnowledge(
 
   // One read of the partition, grouped by page: the sync needs every existing
   // knowledge row anyway, and per-page queries would make it O(pages) round trips.
-  const listed = await store.list({ namespace, limit: 100_000 });
+  // Vectors are skipped — this pass only reads ids, section keys and tags, and
+  // attaching embeddings here was pure copying (ADR-0030).
+  const listed = await store.list({ namespace, limit: 100_000, withVectors: false });
   const existingByPage = new Map<string, Memory[]>();
   const ordinary: Memory[] = [];
   for (const row of listed.memories) {

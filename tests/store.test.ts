@@ -29,6 +29,41 @@ describe("store", () => {
     }
   });
 
+  // ADR-0042: the management statements run over the `project` column in both
+  // stores, so this is the SQL half of the contract the project-memory suite pins
+  // on the in-memory one.
+  it("sqlite: listProjects, renameProject and forgetProject ride the project column", async () => {
+    const sqlite = new MemoryService({ dbPath: ":memory:" });
+    await sqlite.init();
+    try {
+      await sqlite.save({ namespace: "a:1", type: "semantic", text: "alpha convention row", kind: "convention", project: "alpha" });
+      await sqlite.save({ namespace: "a:1", type: "semantic", text: "alpha decision row", kind: "decision", project: "alpha" });
+      await sqlite.save({ namespace: "b:2", type: "semantic", text: "beta row in another partition", project: "beta" });
+      const tomb = await sqlite.save({ namespace: "a:1", type: "semantic", text: "alpha row later forgotten", project: "alpha" });
+      await sqlite.delete(tomb.id);
+
+      const alpha = (await sqlite.listProjects()).find((p) => p.project === "alpha")!;
+      expect(alpha.rows).toBe(2);
+      expect(alpha.byKind).toEqual({ convention: 1, decision: 1 });
+
+      // The rename moves tombstones too — three rows, though only two are live.
+      expect((await sqlite.renameProject("alpha", "gamma")).renamed).toBe(3);
+      expect((await sqlite.get(tomb.id))!.project).toBe("gamma");
+      expect((await sqlite.listProjects()).find((p) => p.project === "gamma")!.rows).toBe(2);
+
+      const forgotten = await sqlite.forgetProject("gamma", { mode: "delete" });
+      expect(forgotten).toEqual({ detached: 0, deleted: 2, project: "gamma" });
+      const kept = (await sqlite.list({ namespace: "a:1", includeDeleted: true, limit: 10 })).memories;
+      expect(kept.every((m) => m.project !== "gamma" || m.isDeleted === 1)).toBe(true);
+
+      const detached = await sqlite.forgetProject("beta", { mode: "detach" });
+      expect(detached).toEqual({ detached: 1, deleted: 0, project: "beta" });
+      expect((await sqlite.list({ namespace: "b:2", project: null, limit: 10 })).total).toBe(1);
+    } finally {
+      try { sqlite.close(); } catch {}
+    }
+  });
+
   it("saves and retrieves by namespace", async () => {
     await svc.save({ namespace: "a:1", type: "semantic", text: "user lives in Berlin" });
     await svc.save({ namespace: "a:1", type: "semantic", text: "user likes TypeScript" });

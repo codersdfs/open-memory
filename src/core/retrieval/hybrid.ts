@@ -1,11 +1,21 @@
 import type { EmbeddingProvider } from "../embedding/provider.js";
 import type { VectorStore } from "../store/interface.js";
-import type { Memory, ScoreBreakdown, SearchOptions, SearchResult, SearchResultItem } from "../types.js";
+import type {
+  Memory,
+  ScoreBreakdown,
+  SearchDiagnostics,
+  SearchNearMiss,
+  SearchOptions,
+  SearchPartitionCount,
+  SearchResult,
+  SearchResultItem
+} from "../types.js";
 import { bm25Score, tokenize, type Bm25CorpusStats } from "./bm25.js";
+import { coverage, coverageWeighted, indexTerms, queryTerms } from "./terms.js";
 import { assembleFragment } from "./assemble.js";
 import { mmr } from "./mmr.js";
 import { budgetEnforce } from "./tokens.js";
-import { LEGACY_NAMESPACE } from "../scope.js";
+import { allPartitions, LEGACY_NAMESPACE } from "../scope.js";
 
 /**
  * Minimum cosine to count as a vector signal. With MEMORY_VECTOR_WEIGHT=0 the
@@ -14,6 +24,45 @@ import { LEGACY_NAMESPACE } from "../scope.js";
  * because that is the only signal it has ever had.
  */
 const VECTOR_FLOOR = 0.95;
+/**
+ * How much of the query a row must hold to count, whatever BM25 says. See the gate
+ * in `searchOne`: three quarters of the words asked for is where the bench's gold
+ * rows sat while filler that only rhymed with the question's grammar stayed at 0.50.
+ */
+const COVERAGE_FLOOR = 0.75;
+/**
+ * How many rejected candidates an empty result explains itself with (ADR-0037).
+ * Enough to show that the wording was close; small enough that the explanation
+ * never costs more than the answer would have.
+ */
+const NEAR_MISS_LIMIT = 5;
+/** Characters of a rejected candidate's stored text kept in a near miss (ADR-0037). */
+const NEAR_MISS_TEXT_CHARS = 200;
+
+/**
+ * Pseudo-relevance feedback (ADR-0028): the second hop a multi-hop question
+ * needs. The first pass answers "what matches the question's words"; the terms
+ * those matches share name the topic, and a second lexical pass on those terms
+ * reaches the rows that hold the rest of the answer but none of the question's
+ * vocabulary — "What books has Melanie read?" does not say `Nothing is
+ * Impossible`, but the row the first pass finds about Melanie's reading does.
+ * Bounded on every axis: two seed rows, five terms, each held by the partition
+ * but not by more than a third of it (the DF_CAP_RATIO rule), and the merged
+ * rows are still ordered by coverage against the *original* question, so an
+ * expansion hit can never outrank a row that answered the question itself.
+ *
+ * **Off by default, and the measurement is why.** On the LoCoMo evidence audit
+ * (conv-26, 152 questions, NIM embeddings) the second pass reached rows the
+ * first pass had missed — and cost more than it reached: the merged rows
+ * crowded a fixed 800-token budget that whole first-pass rows needed, and the
+ * any-evidence share fell 76% → 72% with PRF on. Built, measured, kept behind
+ * `MEMORY_PRF=on` — the same path the int8 shortlist took (ADR-0026). The
+ * shape it loses on is a partition of long, topically-similar rows; the shape
+ * it wins on is short rows where the second hop's terms are rare.
+ */
+const PRF_SEED_DOCS = 2;
+const PRF_MAX_TERMS = 5;
+const PRF_MIN_DF = 2;
 
 export interface RetrievalConfig {
   weights?: { vector: number; bm25: number; recency: number; strength: number };
@@ -26,10 +75,46 @@ type Scored = {
   memory: Memory;
   vectorScore: number;
   bm25Score: number;
+  /** Share of the query's own words this row holds (see `coverage`). Gates. */
+  coverageScore: number;
+  /**
+   * The same share with each asked word weighted by its df (ADR-0028). Orders —
+   * the sort, MMR and the budget — but never gates: a partition that knows only
+   * one of the question's five words would score a row holding that one word at
+   * 1.0 weighted, and the gate is the one place a single-word overlap must not
+   * count as three quarters of an answer.
+   */
+  coverageWeightedScore: number;
   recencyScore: number;
   score: number;
   breakdown: ScoreBreakdown;
 };
+
+/**
+ * A row the gate threw away, with the number it was judged on (ADR-0037).
+ *
+ * The relevance is captured where it is computed rather than recomputed downstream:
+ * the explanation has to report the number the gate actually compared, and a second
+ * copy of `Math.max(bm25, vectorWeight > 0 ? vector : 0)` is how the two would drift.
+ */
+interface RejectedCandidate {
+  scored: Scored;
+  relevance: number;
+}
+
+/**
+ * What one partition's gate decided (ADR-0037).
+ *
+ * `rejected` exists so an empty result can explain itself: it is the same rows the
+ * gate threw away, with the same numbers it compared, and it is computed on every
+ * path because the gate already had them in hand — carrying them costs a push, not
+ * a second query. Only `search` decides whether they are ever serialized.
+ */
+interface SearchOneResult {
+  kept: Scored[];
+  rejected: RejectedCandidate[];
+  threshold: number;
+}
 
 export class HybridRetriever {
   private weights: { vector: number; bm25: number; recency: number; strength: number };
@@ -39,6 +124,8 @@ export class HybridRetriever {
   private semanticMargin: number;
   /** Read-time projection of long memories onto their matching lines (ADR-0014). */
   private assembleEnabled: boolean;
+  /** Second lexical pass on the seeds' shared terms (ADR-0028). */
+  private prfEnabled: boolean;
   constructor(
     private store: VectorStore,
     private embedder: EmbeddingProvider,
@@ -72,6 +159,9 @@ export class HybridRetriever {
     // Rollback for the read-time projection, same shape as MEMORY_RECONCILE=off:
     // `off` returns whole memories exactly as v0.3 did. It is also the A/B arm.
     this.assembleEnabled = process.env.MEMORY_ASSEMBLE !== "off";
+    // Opt-in (ADR-0028): measured net-negative on the LoCoMo audit — merged rows
+    // crowd a fixed budget — so the second pass runs only when asked for.
+    this.prfEnabled = process.env.MEMORY_PRF === "on";
   }
 
   /**
@@ -79,18 +169,26 @@ export class HybridRetriever {
    * scoring, then the relevance gate (ADR-0002). Partition-local on purpose: BM25
    * and cosine are only comparable inside one corpus, so they are combined with
    * the other signals *before* cross-partition merging (`search` below).
+   *
+   * `hints.lexicalOnly` (the PRF second pass) skips the vector arm and the
+   * cosine spread: the second pass exists to widen the *lexical* reach, the
+   * first pass's vector hits are already in the pool, and skipping them keeps
+   * the extra pass at the cost of two posting-list reads.
    */
   private async searchOne(
     namespace: string,
     opts: SearchOptions,
-    queryEmbedding: number[]
-  ): Promise<Scored[]> {
+    queryEmbedding: number[],
+    hints?: { lexicalOnly?: boolean }
+  ): Promise<SearchOneResult> {
     const k = opts.k ?? 5;
     const threshold = opts.threshold ?? 0.72;
 
     // over-fetch to allow rerank; governance-lite: archived/draft excluded unless asked
     const overFetch = Math.max(20, k * 4);
-    const vectorHits = await this.store.vectorSearch({
+    const vectorHits = hints?.lexicalOnly
+      ? []
+      : await this.store.vectorSearch({
       namespace,
       queryEmbedding,
       type: opts.type,
@@ -146,11 +244,16 @@ export class HybridRetriever {
     // tokens) the length penalty divided every term by ~14 and BM25 collapsed to
     // ~0.01 on rows holding the query verbatim — which is how exact-match
     // evidence failed the relevance gate. df likewise makes a rare term decisive.
-    const queryTokens = new Set(tokenize(opts.query));
+    // Terms come from `terms.ts`, not from raw `tokenize`, so the scorer measures
+    // the same vocabulary the inverted index stored (ADR-0027). Both sides apply
+    // the same function-word filter; `indexTerms(text) ⊆ queryTerms(text)` keeps
+    // every indexed term reachable from a query. `bm25Score` re-tokenizes
+    // internally and is unaffected: it only sees terms this loop already counted.
+    const queryTokens = new Set(queryTerms(opts.query));
     let totalDocLen = 0;
     const df = new Map<string, number>();
     for (const { memory } of candidates.values()) {
-      const terms = tokenize(memory.text);
+      const terms = indexTerms(memory.text);
       totalDocLen += terms.length;
       for (const term of new Set(terms)) {
         if (queryTokens.has(term)) df.set(term, (df.get(term) ?? 0) + 1);
@@ -159,8 +262,27 @@ export class HybridRetriever {
     const stats: Bm25CorpusStats = {
       avgLen: candidates.size > 0 ? totalDocLen / candidates.size : 20,
       docs: candidates.size,
-      df
+      df,
+      // The question as asked (post-filter, pre-expansion is not a thing here:
+      // `queryTerms` already dropped the function words) — the scale a score is
+      // normalized against, see `Bm25CorpusStats.queryTerms`.
+      queryTerms: [...queryTokens]
     };
+
+    // ADR-0028: coverage is weighted by the partition's own df when the store can
+    // answer for it, falling back to the candidate-set df the BM25 loop just
+    // built. The candidate set is rows sharing at least one query word, so its
+    // df overestimates rarity — which only softens the weighting, never inverts
+    // it. A df read that fails costs nothing: coverage is a weighting, not a gate.
+    let coverageDf = df;
+    if (queryTokens.size > 0 && typeof this.store.termDf === "function") {
+      try {
+        const storeDf = await this.store.termDf([...queryTokens]);
+        if (storeDf.size > 0) coverageDf = storeDf;
+      } catch {
+        // keep the candidate-set estimate
+      }
+    }
 
     // enrich with BM25 + recency + importance + pin boost (ADR-0006)
     const now = Date.now();
@@ -182,6 +304,8 @@ export class HybridRetriever {
         memory,
         vectorScore,
         bm25Score: b,
+        coverageScore: coverage(memory.text, opts.query),
+        coverageWeightedScore: coverageWeighted(memory.text, opts.query, coverageDf),
         recencyScore,
         score,
         breakdown: { vector: vectorScore, bm25: b, recency: recencyScore, strength: strengthScore, pinBoost, weighted, final: score }
@@ -246,15 +370,40 @@ export class HybridRetriever {
     // does user live?" reaching "user lives in Berlin" is one term of four, and it
     // is the case the smart-search test exists to protect. Zero shared terms never
     // gets this far: the `relevant` filter above is the hard floor.
+    //
+    // `coverage` is what makes that last sentence true for a language whose words
+    // BM25 has to cut up. A Chinese question asks for four words and indexes eight
+    // terms; a row holding three of the four words has bm25 0.41 and a row holding
+    // one of them plus a straddle bigram has 0.52 — BM25 cannot tell which match
+    // was asked for, because its length normalization stops mattering once every
+    // candidate is the same length. Coverage can: 0.75 for the row that holds the
+    // marker, 0.50 for the one that only rhymes with the question's grammar.
+    // Measured on the real-time bench (hash embeddings, threshold 0.35): CJK
+    // recall@5 0.648 → 0.95, noisy 1.0 unchanged. An explicit `threshold` is the
+    // caller's number; the coverage gate is a separate, additional way in, so a
+    // caller tightening the number cannot accidentally re-admit filler.
     const relevanceOf = (s: Scored) =>
       Math.max(s.bm25Score, this.weights.vector > 0 ? s.vectorScore : 0);
-    return relevant.filter(
-      (s) =>
-        relevanceOf(s) >= threshold ||
-        s.score >= threshold ||
-        s.memory.id === semanticTopId ||
-        s.memory.pin === 1
-    );
+    // ADR-0037: the gate now reports both sides. The predicate is unchanged — the
+    // same expression decides which rows pass — but a rejected row is kept instead
+    // of discarded, because "nothing matched your words" and "your words matched
+    // nothing above the bar" are different answers and only one of them means the
+    // caller should stop rewording the question.
+    const passes = (s: Scored) =>
+      relevanceOf(s) >= threshold ||
+      s.coverageScore >= COVERAGE_FLOOR ||
+      s.score >= threshold ||
+      s.memory.id === semanticTopId ||
+      s.memory.pin === 1;
+    const kept: Scored[] = [];
+    const rejected: RejectedCandidate[] = [];
+    for (const s of relevant) {
+      if (passes(s)) kept.push(s);
+      // Captured here, at the gate, so the explanation reports the number the gate
+      // used rather than a recomputation of it.
+      else rejected.push({ scored: s, relevance: relevanceOf(s) });
+    }
+    return { kept, rejected, threshold };
   }
 
   /**
@@ -293,21 +442,49 @@ export class HybridRetriever {
     // Merge. Duplicate ids can only appear if a caller passes the same partition
     // twice (deduped above) or an id was written to two layers — keep the best.
     const byId = new Map<string, Scored>();
-    for (const row of perPartition.flat()) {
+    for (const row of perPartition.flatMap((p) => p.kept)) {
       const prev = byId.get(row.memory.id);
       if (!prev || row.score > prev.score) byId.set(row.memory.id, row);
     }
     const scored = [...byId.values()];
-    scored.sort((a, b) => (b.score - a.score) || (a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0));
+    // Weighted coverage leads, then score (ADR-0028). Both are relevance, but
+    // only one of them is suppressed by the other signals: recency and strength
+    // are age and use, and the bench's Chinese questions showed what that does
+    // at k=5 — a row holding one asked-for word ranked above the row holding
+    // three because it was newer and had been reinforced. The weight is what
+    // stops a word every row holds (the question's entity name) from counting
+    // the same as the word that identifies the answer; the gate above still
+    // reads the unweighted share, so admission semantics are ADR-0027's,
+    // measured and unchanged.
+    const order = (a: Scored, b: Scored) =>
+      (b.coverageWeightedScore - a.coverageWeightedScore) ||
+      (b.score - a.score) ||
+      (a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0);
+    scored.sort(order);
+
+    const added = await this.expand(scored, opts, uniquePartitions, queryEmbedding);
+    if (added > 0) scored.sort(order);
 
     if (scored.length === 0) {
-      return { memories: [], tokensUsed: 0, truncated: false, summary: null, agent: opts.agent, scopes: uniquePartitions };
+      // ADR-0037: an empty result explains itself. This one return covers both
+      // shapes of "empty": nothing was even a candidate, and everything that was a
+      // candidate fell below the gate. `explainEmpty` tells them apart by whether
+      // any partition rejected anything, so the two never need separate paths.
+      return {
+        memories: [],
+        tokensUsed: 0,
+        truncated: false,
+        summary: null,
+        agent: opts.agent,
+        scopes: uniquePartitions,
+        diagnostics: await this.explainEmpty(opts, uniquePartitions, perPartition)
+      };
     }
 
     // Stage 2: MMR diversify
     const mmrInput = scored.map(
       (s) =>
-        ({ id: s.memory.id, score: s.score, embedding: s.memory.embedding, _orig: s }) as unknown as {
+        ({ id: s.memory.id, score: s.coverageWeightedScore + s.score / 2, embedding: s.memory.embedding, _orig: s }) as unknown as {
           id: string;
           score: number;
           embedding: number[];
@@ -316,6 +493,10 @@ export class HybridRetriever {
     );
     // MMR order is the order. Re-sorting here by score undid Stage 2: the near-duplicate
     // that MMR demoted went straight back above the diverse pick, so the budget cut it off.
+    // MMR's `score` is the relevance half of its formula; the weighted coverage goes on
+    // that side of it (ADR-0028), so diversification can only reorder rows that hold the
+    // same share of the question. Both live in 0..1 and the score is otherwise <= 1.0,
+    // so `weighted + score / 2` orders by weighted coverage first and score within it.
     const diversified = mmr(mmrInput as never[], this.mmrLambda).map((m: unknown) => (m as { _orig: Scored })._orig);
 
     // Hard budget enforcement. A row that fits whole is kept whole; only a row
@@ -326,7 +507,9 @@ export class HybridRetriever {
     // leftover space cannot lose a row that already fit.
     const budgetInput = diversified.map((s) => ({
       id: s.memory.id,
-      score: s.score,
+      // Same ordering key MMR was given, so the budget cannot undo Stage 2 by
+      // preferring a row MMR demoted.
+      score: s.coverageWeightedScore + s.score / 2,
       recencyScore: s.recencyScore,
       text: s.memory.text
     }));
@@ -390,7 +573,212 @@ export class HybridRetriever {
       truncated: withBudget.truncated || limited.length < withBudget.kept.length,
       summary: withBudget.summary,
       agent: opts.agent,
-      scopes: uniquePartitions
+      scopes: uniquePartitions,
+      // ADR-0037: the gate let rows through but nothing reached the caller — the
+      // budget or `k` emptied the answer, not the relevance test. That is still an
+      // empty result a caller cannot explain, so it gets the same explanation, and
+      // the near misses are whatever the gate rejected (possibly none).
+      ...(memories.length === 0
+        ? { diagnostics: await this.explainEmpty(opts, uniquePartitions, perPartition) }
+        : {})
     };
+  }
+
+  /**
+   * The PRF second pass (ADR-0028), in place: seeds are the top rows of the
+   * first pass, the terms both seeds share name the topic, and one lexical-only
+   * re-search on those terms reaches rows that hold the rest of the answer but
+   * none of the question's vocabulary. Merged rows are re-covered against the
+   * *original* question, so an expansion hit is ordered by what was asked, not
+   * by the words that happened to fetch it. Best-effort on every step: no df
+   * capability, no seeds, or a failed read all leave the pool as pass one built
+   * it. Returns how many rows joined, so the caller re-sorts only when the pool
+   * changed.
+   */
+  private async expand(
+    scored: Scored[],
+    opts: SearchOptions,
+    partitions: string[],
+    queryEmbedding: number[]
+  ): Promise<number> {
+    if (!this.prfEnabled || scored.length === 0) return 0;
+    if (partitions.length === 0 || typeof this.store.termDf !== "function") return 0;
+    const asked = queryTerms(opts.query);
+    if (asked.length === 0) return 0;
+
+    const seeds = scored.slice(0, PRF_SEED_DOCS);
+    const seedHolders = new Map<string, number>();
+    for (const s of seeds) {
+      for (const term of new Set(indexTerms(s.memory.text))) {
+        seedHolders.set(term, (seedHolders.get(term) ?? 0) + 1);
+      }
+    }
+    const askedSet = new Set(asked);
+    const candidates = [...seedHolders.keys()].filter((t) => !askedSet.has(t));
+    if (candidates.length === 0) return 0;
+
+    // df bounds keep the expansion honest: a term held by fewer than two rows
+    // cannot lead anywhere, and one held by a third of the partition is the
+    // protagonist's name, not the topic (the same DF_CAP_RATIO rule the lexical
+    // arm applies to query words). With two seeds the term must sit in both —
+    // that intersection is what makes it the shared subject rather than either
+    // row's aside.
+    let dfMap: Map<string, number>;
+    try {
+      dfMap = await this.store.termDf(candidates);
+    } catch {
+      return 0;
+    }
+    const total = (await this.countRows(opts, partitions[0]!)).total;
+    const cap = Math.max(PRF_MIN_DF, Math.floor(total / 3));
+    const needed = Math.min(PRF_SEED_DOCS, seeds.length);
+    const expansion = candidates
+      .filter((t) => {
+        const n = dfMap.get(t) ?? 0;
+        return n >= PRF_MIN_DF && n <= cap && (needed < 2 || (seedHolders.get(t) ?? 0) >= 2);
+      })
+      .sort((a, b) => (dfMap.get(a) ?? 0) - (dfMap.get(b) ?? 0))
+      .slice(0, PRF_MAX_TERMS);
+    if (expansion.length === 0) return 0;
+
+    const expandedQuery = `${opts.query} ${expansion.join(" ")}`;
+    const pass2 = await Promise.all(
+      partitions.map((ns) =>
+        this.searchOne(ns, { ...opts, query: expandedQuery }, queryEmbedding, { lexicalOnly: true })
+      )
+    );
+    let originalDf: Map<string, number> = new Map();
+    try {
+      originalDf = await this.store.termDf(asked);
+    } catch {
+      // merged rows then carry coverage 0, which only demotes them
+    }
+    const seen = new Set(scored.map((s) => s.memory.id));
+    let added = 0;
+    for (const row of pass2.flatMap((p) => p.kept)) {
+      if (seen.has(row.memory.id)) continue;
+      seen.add(row.memory.id);
+      // Re-measured against the question the caller asked, both shares: the
+      // weighted one is what orders them from here on, and the unweighted one
+      // is what a later gate or explanation would read.
+      row.coverageScore = coverage(row.memory.text, opts.query);
+      row.coverageWeightedScore = coverageWeighted(row.memory.text, opts.query, originalDf);
+      scored.push(row);
+      added++;
+    }
+    return added;
+  }
+
+  /**
+   * Explain an empty result (ADR-0037).
+   *
+   * Called only from the two empty paths, and it costs one `list({limit:1})` per
+   * partition: `total` is the count of rows matching the search's own filters, so a
+   * caller can tell "this partition is empty" (nothing was ever stored) from "the
+   * rows exist and your wording missed them". `withVectors: false` because the count
+   * is the whole point and decoding 384 floats per partition to obtain it is not.
+   *
+   * ADR-0039 adds the other half of that answer: `outside` names the partitions this
+   * read did *not* cover that still hold rows for the same user. Without it the
+   * empty result of a layered read says "nothing was stored for this scope" while
+   * the fact the caller wants sits one agent layer over — the sentence is true and
+   * the conclusion it invites is wrong.
+   */
+  private async explainEmpty(
+    opts: SearchOptions,
+    partitions: string[],
+    perPartition: SearchOneResult[]
+  ): Promise<SearchDiagnostics> {
+    const counts: SearchPartitionCount[] = await Promise.all(
+      partitions.map((namespace) => this.countRows(opts, namespace))
+    );
+    const outside = await this.outsidePartitions(opts, partitions);
+
+    // Best first, by the number the gate compared. Ties keep partition order and
+    // then the gate's own order, so two runs of the same search explain it the same
+    // way — a diagnostic that reshuffles between retries is worse than none.
+    const nearMisses: SearchNearMiss[] = perPartition
+      .flatMap((p) => p.rejected)
+      .sort((a, b) => b.relevance - a.relevance)
+      .slice(0, NEAR_MISS_LIMIT)
+      .map(({ scored, relevance }) => ({
+        // The stored text, not the projection the budget would have produced: a
+        // rejected row never reached the budget, so there is no projection to
+        // report, and the caller is being shown *what nearly matched*.
+        text: scored.memory.text.slice(0, NEAR_MISS_TEXT_CHARS),
+        relevance,
+        bm25: scored.bm25Score,
+        vector: scored.vectorScore,
+        coverage: scored.coverageScore
+      }));
+
+    return {
+      // The gate's own number. Every partition shares one `opts.threshold`, and
+      // `searchOne` reads it from the same options object, so taking the first is
+      // exact rather than a guess — the default is materialized there, not here.
+      threshold: perPartition[0]?.threshold ?? opts.threshold ?? 0.72,
+      partitions: counts,
+      nearMisses,
+      // Absent rather than empty when the store cannot enumerate partitions: an
+      // empty array would read as "there is nothing outside" and the whole point of
+      // this field is that we cannot claim that from a store that never told us.
+      ...(outside === null ? {} : { outside })
+    };
+  }
+
+  /**
+   * How many rows this search would have admitted from one partition.
+   *
+   * `limit: 1` because only `total` is wanted, and every filter the search itself
+   * applies is passed through — a count that ignored `type` or `status` would report
+   * rows the search could never have returned, which is a different question than
+   * "were there candidates here".
+   */
+  private async countRows(opts: SearchOptions, namespace: string): Promise<SearchPartitionCount> {
+    const page = await this.store.list({
+      namespace,
+      type: opts.type,
+      includeDeleted: opts.includeDeleted ?? false,
+      status: opts.status,
+      includeArchived: opts.includeArchived,
+      includeDraft: opts.includeDraft,
+      project: opts.project,
+      kind: opts.kind,
+      knowledge: opts.knowledge,
+      limit: 1,
+      withVectors: false
+    });
+    return { namespace, total: page.total };
+  }
+
+  /**
+   * Partitions the same user holds rows in that this read did not cover (ADR-0039).
+   *
+   * The set comes from the store, not from a guess about which layers exist: a
+   * partition nobody ever wrote to is not worth naming, and a layer that exists only
+   * because some other agent ran is exactly the one worth naming. It reuses
+   * `allPartitions` — the same enumeration `--all` reads through — so a diagnostic
+   * cannot claim a partition set the `all` scope would not have read.
+   *
+   * Rows are counted with this search's own filters, so "366 rows in default:default"
+   * means 366 rows this query *could* have returned had it looked there.
+   *
+   * Returns `null` when the store cannot enumerate partitions, which keeps the
+   * absence of the key meaningful instead of silently reporting "nothing outside".
+   */
+  private async outsidePartitions(
+    opts: SearchOptions,
+    partitions: string[]
+  ): Promise<SearchPartitionCount[] | null> {
+    if (typeof this.store.distinctNamespaces !== "function") return null;
+
+    const seen = new Set(partitions);
+    const candidates = (await allPartitions(this.store)).filter((ns) => !seen.has(ns));
+    if (candidates.length === 0) return [];
+
+    const counted = await Promise.all(candidates.map((ns) => this.countRows(opts, ns)));
+    // Empty partitions outside the scope change nothing: they do not hold the
+    // answer, and listing them turns a one-line explanation into an inventory.
+    return counted.filter((p) => p.total > 0);
   }
 }

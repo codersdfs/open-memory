@@ -23,6 +23,21 @@ export interface Bm25CorpusStats {
   docs: number;
   /** Document frequency of each term (any term the query mentions). */
   df: Map<string, number>;
+  /**
+   * The query as it was asked, in the vocabulary the index stores.
+   *
+   * The denominator below is "what a document would score if it held every query
+   * term". For English that is the whole query. For Chinese a single topic word
+   * expands into unigrams and bigrams — 「配置」 is 配/配置/置 — so counting all of
+   * them meant a document holding the word *verbatim* earned 2 of 3 shares and
+   * could not clear 0.35. Measured on the real-time bench: the gold row scored
+   * bm25 0.135 while unrelated filler scored 0.127, so the correct answer and the
+   * noise were separated by 0.008 and the threshold could not tell them apart.
+   * Callers that expand a query this way pass the pre-expansion terms here; the
+   * numerator keeps using every term, so a document matching more of the
+   * expansion is still scored higher.
+   */
+  queryTerms?: string[];
 }
 
 export function bm25Score(query: string, doc: string, stats?: Bm25CorpusStats): number {
@@ -34,26 +49,48 @@ export function bm25Score(query: string, doc: string, stats?: Bm25CorpusStats): 
   const docLen = dTerms.length;
   const avgLen = stats && stats.avgLen > 0 ? stats.avgLen : 20;
   const k1 = 1.2, b = 0.75;
+  const idfOf = (t: string) =>
+    stats
+      ? Math.log(1 + (stats.docs - (stats.df.get(t) ?? 0) + 0.5) / ((stats.df.get(t) ?? 0) + 0.5))
+      : 1;
+  // A document at the mean length scores this per term when it holds it once.
+  const saturated = (k1 + 1) / (1 + k1 * (1 - b + b * (avgLen / avgLen)));
   let score = 0;
   let maxScore = 0;
   for (const q of qTerms) {
     // With corpus stats, rarity counts: a term in 1 of 40 candidates is worth
     // more than one in 30 of them. Without, every term is worth 1 — the v0.3
     // approximation kept for callers that have no corpus.
-    const idf = stats
-      ? Math.log(1 + (stats.docs - (stats.df.get(q) ?? 0) + 0.5) / ((stats.df.get(q) ?? 0) + 0.5))
-      : 1;
-    maxScore += idf * (k1 + 1) / (1 + k1 * (1 - b + b * (avgLen / avgLen)));
+    maxScore += idfOf(q) * saturated;
     const f = tf.get(q) ?? 0;
     if (f === 0) continue;
     const numerator = f * (k1 + 1);
     const denominator = f + k1 * (1 - b + b * (docLen / avgLen));
-    score += idf * (numerator / denominator);
+    score += idfOf(q) * (numerator / denominator);
   }
   // Normalize to 0..1 by the score a document of this length would get if it
   // contained every query term at tf=1. Keeps the threshold meaningful: 0.35 is
   // still "a third of the query's best possible match".
-  const denom = stats ? maxScore : qTerms.length * 1.5 + 1e-9;
+  let denom = stats ? maxScore : qTerms.length * 1.5 + 1e-9;
+  if (stats?.queryTerms?.length) {
+    // The scale the question was asked on, not the one its expansion produced.
+    // Every term the document could have held is still in the numerator, so a row
+    // matching more of the expansion still ranks higher — it is only the
+    // *denominator* that changes, and it stops a long Chinese question from
+    // dividing a verbatim match by the unigrams and straddle bigrams its own words
+    // happened to produce. A full match still lands at 1.0: the denominator is
+    // never smaller than what `maxScore` would have been for a query whose terms
+    // the document all holds.
+    let best = 0;
+    for (const q of stats.queryTerms) best += idfOf(q) * saturated;
+    let fullMatch = 0;
+    for (const q of qTerms) {
+      if ((tf.get(q) ?? 0) === 0) continue;
+      const f = Math.min(tf.get(q)!, 1);
+      fullMatch += idfOf(q) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * (docLen / avgLen)));
+    }
+    denom = Math.max(best, fullMatch);
+  }
   return Math.min(1, score / (denom + 1e-9));
 }
 

@@ -15,6 +15,19 @@ export const LEXICAL_TOKEN_LIMIT = 64;
 export const LEXICAL_RAREST_K = 8;
 
 /**
+ * Below this total df the lexical arm pins its join order (ADR-0033).
+ *
+ * Pinning makes the query seek the token index and probe `memories` once per posting,
+ * which is what stops a marker-word lookup from costing a scan of the partition — at
+ * 20k rows a word held by one row went from 8.8 ms to 0.005 ms. Once the chosen words
+ * are held by thousands of rows that probe count dominates, and letting the planner
+ * walk the partition index once is cheaper (measured at 10k rows / df 2,500: 9.7 ms
+ * planner vs 13.2 ms pinned). 2,000 sits between the two measured regimes. Both plans
+ * read the same rows, so this is a speed switch and never a correctness one.
+ */
+export const PINNED_ORDER_DF = 2000;
+
+/**
  * The project/kind slice of a query (ADR-0020, ADR-0021). Both stores implement it
  * identically or a test that passes on one proves nothing about the other:
  *   - `undefined` → do not filter (every project, every kind)
@@ -35,18 +48,54 @@ export interface MemoryFilter {
 
 /**
  * Knowledge pages (ADR-0023), optional like the other additions so a v0.6
- * third-party store keeps compiling. Files stay the truth; these four operations
- * are the only things the index needs from a store.
+ * third-party store keeps compiling. Files stay the truth; these operations are
+ * the only things the index needs from a store.
+ *
+ * Knowledge rows are ordinary memories carrying a `knowledge_id` and a
+ * `knowledge_section`, so the page tree is a projection of the memories table
+ * rather than a second copy of it.
  */
 export interface KnowledgeCapability {
   /** Live rows of one page, ordered by section key. */
   listByKnowledge(knowledgeId: string): Promise<Memory[]>;
   /** Every page id the index currently holds a live row for. */
-  listKnowledgeIds(): Promise<string[]>;
+  listKnowledgeIds(namespace?: string): Promise<string[]>;
+  /**
+   * Live knowledge rows of these partitions, page ids and section keys only.
+   *
+   * ADR-0030: `list` returns ordinary memories too, so a vault of 1,000 rows living
+   * in a partition of 21,000 made the knowledge index read and decode twenty rows
+   * for every one it kept — 388 ms, and memory proportional to the chat history
+   * rather than to the vault. Optional so a store that cannot filter by page keeps
+   * compiling; the caller falls back to `list`.
+   */
+  listKnowledge?(namespaces: string[]): Promise<Memory[]>;
   /** Replace one page's outgoing links in one transaction. */
   replaceLinks(from: string, edges: KnowledgeEdge[]): Promise<void>;
   /** Outgoing links of one page, or every edge when `from` is omitted. */
   links(from?: string): Promise<KnowledgeEdge[]>;
+}
+
+/**
+ * One project's footprint in the store (ADR-0020), as management reads it.
+ *
+ * Derived from the `project` column, never stored twice: a project exists because
+ * rows carry it, so a summary is a GROUP BY, not a registry row. `project` is null
+ * for the unscoped backlog — callers render that as "(unscoped)", the same key
+ * `stats.byProject` uses.
+ */
+export interface ProjectSummary {
+  project: string | null;
+  /**
+   * Rows a read can actually hand out: `status = 'active' AND is_deleted = 0`, the
+   * same population `list()` shows by default and the brief reads. Archived rows and
+   * tombstones belong to audit (stats and `--includeDeleted` see them); a project
+   * whose rows are all archived honestly reads as empty here.
+   */
+  rows: number;
+  byKind: Record<string, number>;
+  /** MAX(created_at) over those rows; 0 when the project holds none. */
+  lastActivityAt: number;
 }
 
 export interface VectorStore {
@@ -83,6 +132,13 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    /**
+     * Skip the vector join. The knowledge index reads thousands of rows to build a
+     * page tree and never looks at an embedding; attaching them is about 150 MB of
+     * copying at 10^5 rows. Optional and defaulting to `true` so a third-party store
+     * that predates it keeps behaving exactly as before.
+     */
+    withVectors?: boolean;
   }): Promise<{ memories: Memory[]; total: number }>;
   /**
    * Every partition holding at least one live memory. 
@@ -154,6 +210,19 @@ export interface VectorStore {
   }): Promise<{ memory: Memory; lexicalScore: number }[]>;
 
   /**
+   * Document frequency of each token in this partition's live rows, from the
+   * inverted index's own df table (ADR-0019 maintains it in the write
+   * transaction). Feeds the idf-weighted coverage (ADR-0028): a query word held
+   * by every row must not count toward coverage the same way a word two rows
+   * hold. Tokens the partition has never seen are absent from the returned map —
+   * that is information, not an error. Optional like `lexicalCandidates`: a
+   * third-party store without it keeps compiling, and the retriever falls back
+   * to the df of its own candidate set, which is a coarser estimate of the same
+   * quantity.
+   */
+  termDf?(tokens: string[]): Promise<Map<string, number>>;
+
+  /**
    * How this query's cosines are distributed across one partition.
    *
    * A top-1 cosine cannot say whether a match is real: measured on a 53-row corpus,
@@ -205,5 +274,29 @@ export interface VectorStore {
    * missing capability instead of writing rows no one can link.
    */
   knowledge?: KnowledgeCapability;
+
+  /**
+   * Project management (ADR-0042), optional like every other late capability so a
+   * store written against an earlier version keeps compiling. The operations are
+   * bulk statements over the `project` column — the dimension ADR-0020 added — and
+   * never touch namespaces: a project spans every partition that wrote into it.
+   * `MemoryService` falls back to a per-partition sweep for `listProjects` when a
+   * store lacks it; rename and forget have no row-wise fallback, so the service
+   * reports the missing capability instead of pretending.
+   */
+  listProjects?(): Promise<ProjectSummary[]>;
+  /**
+   * Move every row of one project to another slug, tombstones included — they are
+   * that project's audit trail. Deliberately does not touch `updated_at`: a rename
+   * rewrites identity, not content, and bumping the column would reset the clock
+   * `purgeDeleted` judges tombstones by.
+   */
+  renameProject?(from: string, to: string): Promise<number>;
+  /**
+   * `delete` soft-deletes the project's live rows (restorable row by row); `detach`
+   * unscopes them (`project = NULL`), which is how rows survive the project they
+   * were filed under.
+   */
+  forgetProject?(slug: string, opts: { mode: "detach" | "delete" }): Promise<{ detached: number; deleted: number }>;
   // for budget/BM25 we need raw access; list already covers
 }
