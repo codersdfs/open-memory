@@ -1,12 +1,24 @@
-# Open Memory — local-first memory for pi agents
+# Open Memory
 
-> **Status: `0.4.0-beta.2`** — pre-release. The storage format is settled; the HTTP and MCP surfaces
-> can still move between prereleases.
+**Local-first memory your coding agent can actually trust: one SQLite file, zero dependencies, no LLM call per search — and it out-retrieves the hosted "memory" products on their own benchmark.**
 
 ![the console: a query, the floor preset that made seven hits appear, the token budget,
 and the score decomposition behind every hit](docs/images/console-recall-dark.png)
 
-A **local-first, namespace-partitioned memory substrate** that stores *Episodic / Semantic / Procedural / Working* memories as vectors and retrieves them with **smart search + hard token budget** to prevent *Token Burning* (cost) and *Context Burning* (irrelevant dilution).
+> **Status: `0.4.0-beta.2`** — pre-release. The storage format is settled; the HTTP and MCP surfaces
+> can still move between prereleases.
+
+Agent memory is usually a vector database you babysit or a cloud you don't trust with your history.
+Open Memory is a single `memory.db` file (`node:sqlite`, WAL) that stores episodic, semantic, procedural
+and working memories and gets them back with hybrid **smart search** under a **hard token budget** — no
+*Token Burning* (cost), no *Context Burning* (dilution). It doesn't just hand back matches; it can show the
+exact score that earned every one.
+
+The proof, on one harness and one pinned reader/judge (LoCoMo `conv-26`, 152 questions):
+**open-memory 69.1% vs OpenViking 39.5% vs mem0 OSS 14.5%** — a judge-free string-hit audit agrees
+(35.3%) and the paired difference is significant (McNemar p=0.0003). Warm searches land in **~9 ms**, and
+it holds **80 req/s with zero dropped requests** while another agent writes underneath. One process, no
+Docker, and your history never leaves the machine.
 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
 - **Smart Search**: 2-stage — candidates are the **union** of the vector top-k and the term index (so an exact-word match competes even when its cosine is poor), scored `0.6*BM25 + 0.25*recency + 0.15*strength` (`vector` weight is `0` by default; see Embeddings), BM25 with real `df`/`avgLen` → MMR diversify → relevance floor `0.72` (empty allowed, and it is a floor on *relevance*, not on the total — an old exact match must never age out of reach) → **hard budget** (default 800 tokens) + projection into the leftover + overflow summary (ADR-0002, ADR-0012, ADR-0014). Deterministic, zero extra LLM call.
