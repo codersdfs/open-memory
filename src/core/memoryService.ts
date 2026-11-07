@@ -16,7 +16,8 @@ import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, t
 import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
 import type { BriefOptions, BriefResult } from "./types.js";
 import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
-import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, type CurationVerdict } from "./write/curation.js";
+import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, renderVerdict, type CurationVerdict } from "./write/curation.js";
+import { textHash } from "./write/text.js";
 import { jevEnabled, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
 
 export type SaveInput = Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope };
@@ -115,8 +116,17 @@ export class MemoryService {
    * The neighbour query below is the one the old dedup loop already ran: the five
    * nearest rows in this partition and type. It was thrown away after an exact-string
    * compare; `reconcile` is the only thing that changed about it.
+   *
+   * `opts.raw` is the bulk escape hatch (ADR-0018 amendment), honoured on the
+   * per-row path too so `{ reconcile: true, raw: true }` means exactly what the
+   * batch path means by it: every reject except `secret` and except empty text is
+   * excused, and both demotion ladders are skipped — the regex one and the model
+   * write gate (ADR-0041). Skipping the model gate is not cosmetic: leaving it on
+   * would spend a network call per row and price rows the caller just declared off-
+   * limits. A caller who says "raw" is not asking the store to second-guess their
+   * rows' importance.
    */
-  async saveDetailed(input: SaveInput): Promise<SaveResult> {
+  async saveDetailed(input: SaveInput, opts: { raw?: boolean } = {}): Promise<SaveResult> {
     const env = runtimeEnv();
     const namespace = input.namespace?.trim()
       ? input.namespace
@@ -140,8 +150,15 @@ export class MemoryService {
     let curation: CurationVerdict | undefined;
     if ((env.MEMORY_CURATE ?? "").trim().toLowerCase() !== "off") {
       const verdict = curate(input.text, { origin });
-      if (verdict.action === "reject") throw new CurationRejected(verdict);
-      if (verdict.action === "demote" && input.kind === undefined && input.importance === undefined) {
+      // `raw` excuses every reject except `secret` and except empty text — the two
+      // verdicts ADR-0040 calls false-kill-preferred, which no caller intent excuses
+      // ("Empty is empty on every path"). A raw row that is neither stays the
+      // caller's own act: demotion is skipped too, second-guessing a declared "raw"
+      // batch's importance is how a memory system stops being trusted.
+      if (verdict.action === "reject" && !(opts.raw && verdict.junk !== "secret" && input.text.trim())) {
+        throw new CurationRejected(verdict);
+      }
+      if (verdict.action === "demote" && !opts.raw && input.kind === undefined && input.importance === undefined) {
         effectiveKind = DEMOTE_KIND;
         importance = DEMOTE_IMPORTANCE;
         curationTag = verdict.tag;
@@ -152,9 +169,12 @@ export class MemoryService {
     // every write no judge has seen. Rows the extractor's jev already priced carry
     // `judged:jev` and skip this — one judgement per row, never two. A curation
     // demotion also stands: the structural verdict outranks the model's optimism about
-    // the same sentence. Fail-open, like everything else on the judge wire — no key or
-    // a failed call stores the write unjudged rather than losing it.
-    if (!curation && !alreadyJevJudged(input) && writeGateEnabled() && input.text.trim().length >= 12) {
+    // the same sentence. `raw` skips the gate entirely (ADR-0018 amendment): it is the
+    // model's half of the demotion ladder, and a caller who declared the batch off-
+    // limits should not pay a network call per row to be second-guessed anyway.
+    // Fail-open, like everything else on the judge wire — no key or a failed call
+    // stores the write unjudged rather than losing it.
+    if (!opts.raw && !curation && !alreadyJevJudged(input) && writeGateEnabled() && input.text.trim().length >= 12) {
       const verdict = await jevWriteGate(input.text);
       if (verdict) {
         const callerSetValues = input.kind === undefined && input.importance === undefined;
@@ -322,7 +342,7 @@ export class MemoryService {
   }
 
   /**
-   * Bulk save for imports and replayed history (ADR-0018).
+   * Bulk save for imports and replayed history (ADR-0018, amended 2026-11-07).
    *
    * `reconcile` defaults to **off** here, unlike `save`. Write-time reconcile runs a
    * 5-neighbour vector search per write to decide insert/reinforce/supersede; doing
@@ -330,21 +350,69 @@ export class MemoryService {
    * everything that matters. A bulk import is new material by definition — the
    * caller that is replaying something it already stored can turn reconcile back on
    * explicitly. Embeddings go through `embedBatch` where the provider offers one, so
-   * a remote embedder costs one round trip instead of one per row. Curation is off
-   * here for the same reason: an import is a deliberate act, and a 5,000-row file
-   * that fails on row 3 because one line ends in a colon is a hostile gate.
+   * a remote embedder costs one round trip instead of one per row.
+   *
+   * What the amendment changed: curation (ADR-0040) now runs here too — pure regex,
+   * zero network, so the "deliberate act" excuse no longer holds, and an unfiltered
+   * `saveMany` was the one door through which a 5,000-row import could put the
+   * secret-bearing junk the store had already refused back in. The old hostile-gate
+   * objection (a batch dying on row 3) is answered by skipping per row instead:
+   * every rejected line comes back in `skipDetails` with its input index and the
+   * `renderVerdict` advice, and the rest of the batch lands. `{ raw: true }` (the
+   * CLI's `--no-curate`, `POST /memories/bulk`'s `"raw"`) excuses every reject
+   * **except `secret` and except empty text** — ADR-0040 calls those two the
+   * false-kill-preferred verdicts, and a bulk path that could re-admit credentials
+   * or blanks would undo the gate it just got — and it excuses the demotion ladder
+   * too: a caller who says "raw" is not asking the store to price their rows.
+   * `MEMORY_CURATE=off` still turns the whole verdict off, same switch `save`
+   * honours. The `{reconcile: true}` branch skips per row under the same rules
+   * (`saveDetailed` honours `raw`, including its skip of the model write gate); its
+   * old contract of dying on the first reject after the earlier rows had each
+   * already committed was the same hostile gate with a half-import welded to it.
+   *
+   * Exact duplicates collapse for free, keyed on the partition — (namespace,
+   * project, type) — that `reconcile` itself reads over: the same sentence under
+   * two repositories is two facts with two lifetimes (ADR-0020), so one project's
+   * copy never folds away another's. Only a *readable live* row blocks a re-import
+   * — one outside the population `list()` shows by default (tombstoned, archived or
+   * draft), so the fold agrees with what a search can actually return. The cheap
+   * half of what reconcile was asked to do expensively; near-duplicates stay
+   * reconcile's job, still opt-in.
    */
   async saveMany(
     inputs: SaveInput[],
-    opts: { reconcile?: boolean } = {}
-  ): Promise<{ memories: Memory[]; skipped: number }> {
-    if (inputs.length === 0) return { memories: [], skipped: 0 };
+    opts: { reconcile?: boolean; raw?: boolean } = {}
+  ): Promise<{ memories: Memory[]; skipped: number; skipDetails: { index: number; reason: string }[] }> {
+    if (inputs.length === 0) return { memories: [], skipped: 0, skipDetails: [] };
     if (opts.reconcile) {
+      // Same bargain as the batch path: a rejected row skips with its index and
+      // reason, the rows around it land. Catching `CurationRejected` per row is
+      // also what makes `raw` mean the same thing in both branches.
       const memories: Memory[] = [];
-      for (const input of inputs) memories.push((await this.saveDetailed(input)).memory);
-      return { memories, skipped: 0 };
+      const skipDetails: { index: number; reason: string }[] = [];
+      for (let index = 0; index < inputs.length; index++) {
+        try {
+          memories.push((await this.saveDetailed(inputs[index], { raw: opts.raw })).memory);
+        } catch (err) {
+          if (err instanceof CurationRejected) {
+            skipDetails.push({ index, reason: renderVerdict(err.verdict) });
+            continue;
+          }
+          throw err;
+        }
+      }
+      skipDetails.sort((a, b) => a.index - b.index);
+      return { memories, skipped: skipDetails.length, skipDetails };
     }
-    const targets = inputs.map((input) => {
+    const env = runtimeEnv();
+    const gateOn = (env.MEMORY_CURATE ?? "").trim().toLowerCase() !== "off";
+
+    // 1. Shape each input into a target and run the verdict this door used to skip.
+    //    Demotion keeps `saveDetailed`'s bargain: only values the store derived may
+    //    sink — a caller that named a kind or an importance made its own judgement.
+    const gated: { index: number; target: MemoryInput }[] = [];
+    const skipDetails: { index: number; reason: string }[] = [];
+    inputs.forEach((input, index) => {
       const namespace = input.namespace?.trim()
         ? input.namespace
         : resolveWriteKey({ agent: input.agent, user: input.user, scope: input.scope });
@@ -367,19 +435,87 @@ export class MemoryService {
         status: input.status,
         pin: input.pin
       };
-      return target;
+      if (gateOn) {
+        const origin = input.source === "extractor" ? ("extracted" as const) : ("explicit" as const);
+        const verdict = curate(input.text, { origin });
+        if (verdict.action === "reject" && !(opts.raw && verdict.junk !== "secret" && input.text.trim())) {
+          skipDetails.push({ index, reason: renderVerdict(verdict) });
+          return;
+        }
+        if (verdict.action === "demote" && !opts.raw && input.kind === undefined && input.importance === undefined) {
+          target.kind = DEMOTE_KIND;
+          target.importance = DEMOTE_IMPORTANCE;
+          target.tags = verdict.tag ? [...(input.tags ?? []), verdict.tag] : input.tags;
+        }
+      }
+      gated.push({ index, target });
     });
+
+    // 2. Collapse exact duplicates before anything is embedded: a skipped row must
+    //    not cost a vector round trip either. Keyed on the partition (namespace,
+    //    project, type) reconcile reads over — never fold across projects (ADR-0020).
+    //    In-batch first — one file can repeat a line — then against the store. A
+    //    store without the capability treats every survivor as new: it cannot know
+    //    otherwise, and inserting is the honest default for an import.
+    const foldKeyOf = (t: MemoryInput) => [t.namespace, t.project ?? "\u0000", t.type].join("\u0000");
+    const seenInBatch = new Map<string, Set<string>>();
+    const unique: { index: number; target: MemoryInput; hash: string }[] = [];
+    for (const g of gated) {
+      const hash = textHash(g.target.text);
+      const key = foldKeyOf(g.target);
+      let byPartition = seenInBatch.get(key);
+      if (!byPartition) {
+        byPartition = new Set();
+        seenInBatch.set(key, byPartition);
+      }
+      if (byPartition.has(hash)) {
+        skipDetails.push({ index: g.index, reason: "duplicate in this batch (exact text)" });
+        continue;
+      }
+      byPartition.add(hash);
+      unique.push({ ...g, hash });
+    }
+    let kept = unique;
+    if (this.store.findExistingHashes && unique.length > 0) {
+      const groups = new Map<string, { namespace: string; project: string | null; type: string; hashes: string[] }>();
+      for (const u of unique) {
+        const key = foldKeyOf(u.target);
+        const group = groups.get(key);
+        if (group) group.hashes.push(u.hash);
+        else groups.set(key, { namespace: u.target.namespace, project: u.target.project ?? null, type: u.target.type, hashes: [u.hash] });
+      }
+      const existing = new Map<string, Set<string>>();
+      for (const [key, group] of groups) {
+        existing.set(key, await this.store.findExistingHashes(group));
+      }
+      kept = [];
+      for (const u of unique) {
+        if (existing.get(foldKeyOf(u.target))?.has(u.hash)) {
+          skipDetails.push({ index: u.index, reason: "already stored (exact text)" });
+          continue;
+        }
+        kept.push(u);
+      }
+    }
+
+    const finish = (memories: Memory[]) => {
+      // Both steps appended; a caller reading reasons by input order wants them sorted.
+      skipDetails.sort((a, b) => a.index - b.index);
+      return { memories, skipped: skipDetails.length, skipDetails };
+    };
+    if (kept.length === 0) return finish([]);
+
     const embeddings = await this.embedder.embedBatch(
-      targets.map((t) => t.text),
+      kept.map((k) => k.target.text),
       { inputType: "passage" }
     );
-    const items = targets.map((input, i) => ({ input, embedding: embeddings[i] }));
+    const items = kept.map((k, i) => ({ input: k.target, embedding: embeddings[i] }));
     if (this.store.insertMany) {
-      return { memories: await this.store.insertMany(items), skipped: 0 };
+      return finish(await this.store.insertMany(items));
     }
     const memories: Memory[] = [];
     for (const it of items) memories.push(await this.store.insert(it.input, it.embedding));
-    return { memories, skipped: 0 };
+    return finish(memories);
   }
 
   async get(id: string): Promise<Memory | null> {

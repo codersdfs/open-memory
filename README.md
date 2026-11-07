@@ -162,7 +162,7 @@ says which page and which part of it answered.
 | Method | Path | Body / Query |
 |---|---|---|
 | `POST` | `/memories` | `{namespace, type, text, project?, kind?, importance?, tags?, source?}` |
-| `POST` | `/memories/bulk` | `{items: [...], reconcile?}` — up to 5000 rows, one transaction and one embed batch; a bad item fails the request with its `index` |
+| `POST` | `/memories/bulk` | `{items: [...], reconcile?, raw?}` — up to 5000 rows, one transaction and one embed batch; a bad item fails the request with its `index`, and rows the bulk gate rejects or folds skip per row (`skipped`, `skipDetails[]` with input `index` + reason). `raw: true` excuses every reject except `secret` and empty text, and skips demotion — never the duplicate fold |
 | `GET` | `/memories?namespace=&type=&q=&includeDeleted=` | list |
 | `GET` | `/memories/:id` | |
 | `DELETE` | `/memories/:id` | soft-delete |
@@ -483,7 +483,6 @@ A store that only grows is not a memory, it is a log. Two passes share the same 
 
 - **Archive (default).** `runDecay(store)` demotes rows that were written, never retrieved, are older than 30 days and whose judge-rated `importance` is under `0.6` to `status = archived`. The age window follows the row's *kind*: a `task` gets 7 days, a `note` 30, a `fact` 90, and the durable kinds (`decision`, `convention`, `gotcha`) are never archived at all — only supersede or an explicit forget removes them ([ADR-0021](docs/adr/0021-kind-decides-retention.md)). Archived rows are hidden from search but still readable through `includeArchived`, so this is reversible, and re-running it is a no-op. On a copy of a real 299-row store it archived 2 rows and pruned nothing — the two were a stale `current task:` note and a procedure for a UI that no longer exists.
 - **Hard prune (opt-in).** `runDecay(store, { hard: true })` keeps the historical windows (episodic > 90d, working > 7d) and soft-deletes only when **both** `importance` and `strength` are at or below `0.5`. The floor moved 0.3 → 0.5 because the old rule could never fire: strength starts at importance, bottoms out at 0.4 in the real store, and only grows.
-
 `memory_stats` (and the console's Stats view) reports `archived`, `archivedRatio`, `neverRetrieved` and `neverRetrievedRatio`, and the decay preview lists each candidate with the action it would take. Before v0.4 the store had 308 of 335 rows never retrieved and a decay rule that pruned one row in its whole history ([ADR-0016](docs/adr/0016-archive-first-decay.md)).
 
 Seeding is isolated: `npm run seed` writes to a fresh temp directory unless `MEMORY_DB_PATH` is set explicitly, so demo fixtures can no longer land in your real store (`tests/seed-isolation.test.ts`).
@@ -514,7 +513,7 @@ Both dimensions are filters everywhere: `list`, `search`, `brief`, `prune`, `sta
 - `SqliteVectorStore` via `node:sqlite` (`DatabaseSync`, Node 22+). Single file `memory.db` (WAL). `InMemoryVectorStore` is used in tests.
 - For `LanceDB`/`sqlite-vec`/`Qdrant`, implement `VectorStore` interface and inject via `new MemoryService({store: myStore})`.
 - **Vectors are float32 blobs, not JSON.** A row's embedding lives in `memory_vectors(memory_id, dim, vec BLOB, norm)`; `vectorSearch` scores `(id, vec, dim, norm)` first and only fetches full rows for the survivors. `memoryFromRow` hands back `embedding: []`; `getById`/`list` attach it when someone actually needs it. Older files are migrated on open, resumably, in batches of 5000 — measured 335 rows in 51 ms, 10k rows in 1.03 s ([ADR-0017](docs/adr/0017-vector-blob-layout.md)).
-- **Batch writes:** `store.insertMany`, `service.saveMany(inputs, { reconcile })` and `POST /memories/bulk` write one transaction and one embed batch. `reconcile` defaults to off in bulk mode — a 5-neighbour search per row would make a 10k import quadratic ([ADR-0018](docs/adr/0018-batch-writes-and-purge.md)).
+- **Batch writes:** `store.insertMany`, `service.saveMany(inputs, { reconcile, raw })` and `POST /memories/bulk` write one transaction and one embed batch. `reconcile` defaults to off in bulk mode — a 5-neighbour search per row would make a 10k import quadratic ([ADR-0018](docs/adr/0018-batch-writes-and-purge.md)). The cheap gates do run here (ADR-0018 amendment, 2026-11-07), in both branches (batch and `{reconcile: true}`): curation per row — rejected lines skip with `skipDetails` instead of killing or half-committing the batch, and `secret` plus empty text are refused even under `raw` — and exact-text duplicates fold on the derived `text_hash` column within one partition (namespace, project, type), against readable live rows only: tombstoned, archived and draft rows block nothing.
 - **Space:** `prune` is a soft delete and keeps the bytes. `store.purgeDeleted({ olderThanMs })` is the opt-in hard delete, and `ai-memory db compact [--purge <days>]` (or `POST /compact`) VACUUMs the file and reports the footprint (db + WAL + shm).
 
 ### Scale, measured

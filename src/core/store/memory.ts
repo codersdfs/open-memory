@@ -5,6 +5,7 @@ import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CA
 import { cosineSimilarity } from "../embedding/provider.js";
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { deriveKind } from "../write/kind.js";
+import { textHash } from "../write/text.js";
 import { median } from "../stats.js";
 
 export class InMemoryVectorStore implements VectorStore {
@@ -47,6 +48,37 @@ export class InMemoryVectorStore implements VectorStore {
     const out: Memory[] = [];
     for (const it of items) out.push(await this.insert(it.input, it.embedding));
     return out;
+  }
+
+  /**
+   * Mirror of the SQL duplicate lookup (ADR-0018 amendment): the hash is derived
+   * from `text` on both sides, never stored on the row, so the two stores agree by
+   * construction. It applies the same readable-live population (tombstone, archived
+   * and draft rows excluded) and the same partition scoping (`project`/`type`) as
+   * the SQL store's WHERE — a test that passes on one proves the other.
+   */
+  async findExistingHashes(opts: {
+    namespace: string;
+    hashes: string[];
+    project?: string | null;
+    type?: string;
+  }): Promise<Set<string>> {
+    const wanted = new Set(opts.hashes);
+    const found = new Set<string>();
+    for (const m of this.map.values()) {
+      // Readable-live population, exactly as the SQL store's WHERE: a row outside
+      // the population `list()` shows blocks nothing, and the fold never crosses
+      // project or type.
+      if (m.namespace !== opts.namespace || m.isDeleted !== 0) continue;
+      if (m.status === "archived" || m.status === "draft") continue;
+      if (opts.project !== undefined) {
+        if (opts.project === null ? m.project !== null : m.project !== opts.project) continue;
+      }
+      if (opts.type && m.type !== opts.type) continue;
+      const h = textHash(m.text);
+      if (wanted.has(h)) found.add(h);
+    }
+    return found;
   }
 
   async getById(id: string): Promise<Memory | null> {

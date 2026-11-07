@@ -1,9 +1,13 @@
 /**
- * Text primitives for the write path. Pure, synchronous, no dependencies.
+ * Text primitives for the write path. Pure, synchronous. The only import is
+ * `node:crypto`, and only for `textHash` — a hash is as deterministic as a regex,
+ * so the isolation contract (a gate you can test without a store) still holds.
  *
  * These are the measurements `reconciler.ts` decides on, so they are separated from
  * the decision itself: a gate you cannot test in isolation is a gate nobody can tune.
  */
+
+import { createHash } from "node:crypto";
 
 /** Function words that carry no topic. Small on purpose: an over-long list turns a
  * short sentence into zero tokens and every short sentence into every other one. */
@@ -38,6 +42,19 @@ export function normalizeText(text: string): string {
     .trim()
     .replace(TRAILING_PUNCT, "")
     .trim();
+}
+
+/**
+ * The exact-duplicate key (ADR-0018 amendment 2026-11-07). SHA-256 over the same
+ * comparison form `normalizeText` defines — the two strings reconcile would call
+ * an exact duplicate are one hash here — truncated to 32 hex chars, which collides
+ * about as often as the UUIDs the rows are keyed by and stores 20x smaller.
+ *
+ * Derived, never input: every write path that can change `text` recomputes it,
+ * because a hash that drifted from its row would suppress inserts of *other* rows.
+ */
+export function textHash(text: string): string {
+  return createHash("sha256").update(normalizeText(text)).digest("hex").slice(0, 32);
 }
 
 /**

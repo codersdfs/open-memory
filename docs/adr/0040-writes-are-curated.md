@@ -100,9 +100,15 @@ Three secondary decisions:
 
 `extractAndSave` returns `{memories, rejected}` and `POST /extract` reports the
 count — Mem0's `{"facts": []}` is a success, and "the turn held nothing durable"
-must be distinguishable from "the extractor was off". `saveMany` keeps curation
-off, for the same reason reconcile is off there: a 5,000-row import that dies on
-row 3 because one line ends in a colon is a hostile gate.
+must be distinguishable from "the extractor was off". `saveMany` kept curation off
+when this ADR was written — "a 5,000-row import that fails on row 3 because one line
+ends in a colon is a hostile gate." That sentence is superseded (2026-11-07, P1 of
+`docs/research/memory-systems-notes-2026-11-07.md`, ADR-0018 Amendment): the bulk
+path now runs this same zero-network verdict and *skips* a rejected row instead of
+killing the batch, so row 3's colon costs one line of `skipDetails` and the import
+keeps its gate. `secret` and empty text are refused on every write path —
+`{raw:true}` excuses neither — short of the explicit `MEMORY_CURATE=off` switch that
+turns the whole verdict off.
 
 ## Consequences
 

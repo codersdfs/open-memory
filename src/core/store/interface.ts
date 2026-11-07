@@ -118,6 +118,25 @@ export interface VectorStore {
    * `MemoryService.saveMany` falls back to a loop.
    */
   insertMany?(items: { input: MemoryInput; embedding: number[] }[]): Promise<Memory[]>;
+  /**
+   * Which of these `textHash` values already have a READABLE LIVE row in one
+   * partition — the same population `list()` shows by default: not tombstoned, not
+   * archived, not draft (ADR-0018 amendment 2026-11-07). A row outside that default
+   * population is what no ordinary search can return, so it must not block a
+   * re-import either; `project`/`type` scope the fold to the partition `reconcile`
+   * reads over, so one project's copy of a sentence never folds away another's
+   * (ADR-0020).
+   *
+   * Optional like the rest: a third-party store written before it keeps compiling,
+   * and `saveMany` then inserts every survivor as if it were new — it cannot know
+   * otherwise, and losing an import to an unknown store would be the worse error.
+   */
+  findExistingHashes?(opts: {
+    namespace: string;
+    hashes: string[];
+    project?: string | null;
+    type?: string;
+  }): Promise<Set<string>>;
   getById(id: string): Promise<Memory | null>;
   list(opts: {
     namespace: string;
@@ -247,10 +266,10 @@ export interface VectorStore {
   /**
    * Retrieval reinforcement (R2): every id that came back above threshold gets a
    * little stronger and its use clock reset. One UPDATE, no read-modify-write
-   * race between the agents sharing this store.
    */
   reinforce(ids: string[]): Promise<number>;
   prune(opts: { olderThanMs: number; maxImportance: number; type?: string; kind?: string }): Promise<number>;
+
 
   /**
    * Reclaim file space. `prune` is a soft delete: the row, its postings and its

@@ -67,20 +67,31 @@ describe("sqlite store at scale", () => {
     expect(hits[0]!.memory.embedding).toHaveLength(DIM);
   });
 
-  it("saveMany skips write-time reconcile unless it is asked for", async () => {
+  it("saveMany folds exact duplicates but leaves reconcile off unless asked", async () => {
     const svc = new MemoryService({ store, embedder: new HashEmbeddingProvider() });
     await svc.init();
     const text = "user prefers answers in German";
-    const { memories } = await svc.saveMany([
+    const { memories, skipped, skipDetails } = await svc.saveMany([
       { namespace: "a:1", type: "semantic", text },
       { namespace: "a:1", type: "semantic", text },
       { namespace: "a:1", type: "semantic", text: "a different fact entirely" }
     ]);
-    // Reconcile would have folded the identical pair into one row; a bulk import is
-    // new material and keeps all three.
-    expect(memories).toHaveLength(3);
+    // The identical pair folds for free through `textHash` (ADR-0018 amendment);
+    // reconcile — near-duplicates, cross-project — is still off by default because
+    // it is still quadratic per bulk row.
+    expect(memories).toHaveLength(2);
+    expect(skipped).toBe(1);
+    expect(skipDetails).toEqual([{ index: 1, reason: "duplicate in this batch (exact text)" }]);
     const listed = await svc.list({ namespace: "a:1" });
-    expect(listed.total).toBe(3);
+    expect(listed.total).toBe(2);
+    // A replayed batch is a no-op against the store too — and only in the namespace
+    // that already holds the row: dedup is per partition, like reconcile.
+    const again = await svc.saveMany([
+      { namespace: "a:1", type: "semantic", text },
+      { namespace: "a:2", type: "semantic", text }
+    ]);
+    expect(again.memories).toHaveLength(1);
+    expect(again.skipDetails).toEqual([{ index: 0, reason: "already stored (exact text)" }]);
   });
 
   it("migrates a legacy JSON store on open, once", async () => {

@@ -602,8 +602,15 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       if ("status" in p) return send(res, p.status, { ...p.body, index: i });
       parsed.push(p.data);
     }
-    const { memories } = await service.saveMany(parsed, { reconcile: body.reconcile === true });
-    return send(res, 201, { saved: memories.length, ids: memories.map((m) => m.id) });
+    // The bulk gate (ADR-0018 amendment, 2026-11-07): curation runs on every item at
+    // zero network cost and rejected or folded rows come back per row in
+    // `skipDetails` — `raw: true` excuses every reject except `secret` and except
+    // empty text, and skips demotion; exact duplicates fold on every path.
+    const { memories, skipped, skipDetails } = await service.saveMany(parsed, {
+      reconcile: body.reconcile === true,
+      raw: body.raw === true
+    });
+    return send(res, 201, { saved: memories.length, ids: memories.map((m) => m.id), skipped, skipDetails });
   }
 
   const mem = new RegExp("^/memories(/[^/]+)?(/supersede)?$").exec(path);

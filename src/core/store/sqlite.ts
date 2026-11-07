@@ -7,6 +7,7 @@ import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CA
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { PartitionCache, type PartitionRow, type PartitionVectors } from "./partitionCache.js";
 import { deriveKind } from "../write/kind.js";
+import { textHash } from "../write/text.js";
 import { median } from "../stats.js";
 
 /**
@@ -467,6 +468,26 @@ export class SqliteVectorStore implements VectorStore {
     if (!cols.has("knowledge_section")) {
       this.db.exec(`ALTER TABLE memories ADD COLUMN knowledge_section TEXT`);
     }
+    // ADR-0018 amendment (2026-11-07): the exact-duplicate key. A derived column —
+    // every write that can change `text` recomputes it (runInsert, updateEmbedding) —
+    // backfilled once like `kind`, because hashing 10^5 rows on open is a one-off
+    // cost and checking per read would be a per-search one. A NULL hash (only from
+    // a foreign writer or an interrupted older migration) reads as "never seen":
+    // the worst outcome is a duplicate on a later re-import, never a lost row.
+    if (!cols.has("text_hash")) {
+      // ALTER and the backfill in ONE transaction — SQLite's DDL is transactional —
+      // so a crash rolls the column itself back and the next open re-runs the whole
+      // migration, instead of leaving NULL hashes that never get a second pass.
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(`ALTER TABLE memories ADD COLUMN text_hash TEXT`);
+        this.backfillTextHashes();
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw err;
+      }
+    }
     // 3. create indexes (after columns guaranteed to exist)
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_memories_ns_type ON memories(namespace, type);
@@ -484,6 +505,12 @@ export class SqliteVectorStore implements VectorStore {
         WHERE knowledge_id IS NOT NULL AND is_deleted = 0;
       CREATE INDEX IF NOT EXISTS idx_memories_knowledge ON memories(knowledge_id)
         WHERE knowledge_id IS NOT NULL;
+      -- ADR-0018 amendment: the fold lookup seeks on (namespace, hash) — that pair
+      -- is selective enough that the project/type/status predicates findExistingHashes
+      -- then applies run over a handful of rows, not the partition. The index is
+      -- partial because NULL hashes (only ever from a foreign writer) answer no query.
+      CREATE INDEX IF NOT EXISTS idx_memories_text_hash ON memories(namespace, text_hash)
+        WHERE text_hash IS NOT NULL;
     `);
     // 4. lexical index (ADR-0012). The postings every search reads are derived
     // state: they can always be recomputed from `memories.text`, so a corrupt or
@@ -804,6 +831,25 @@ export class SqliteVectorStore implements VectorStore {
   }
 
   /**
+   * One-time derivation of `text_hash` for rows that predate the column
+   * (ADR-0018 amendment). Same shape and same rationale as `backfillKinds`: a
+   * sha256 per row is a one-off cost on the first open after upgrade.
+   */
+  private backfillTextHashes(): void {
+    // Called inside the caller's transaction (see the ALTER site). Chunked SELECTs
+    // bound the memory — `.all()` on 10^5 rows' text would read the column twice —
+    // and the loop runs to empty, so no store is big enough to silently keep NULLs.
+    const stmt = this.db.prepare(`UPDATE memories SET text_hash = ? WHERE id = ?`);
+    for (;;) {
+      const rows = this.db
+        .prepare(`SELECT id, text FROM memories WHERE text_hash IS NULL LIMIT 5000`)
+        .all() as { id: string; text: string }[];
+      if (rows.length === 0) break;
+      for (const row of rows) stmt.run(textHash(row.text), row.id);
+    }
+  }
+
+  /**
    * One-time classification of rows that predate the `kind` column (ADR-0021).
    * Batched in a single transaction: the heuristic is a few regexes per row and
    * 10^5 rows is a one-off cost on the first open after upgrade, not per search.
@@ -914,6 +960,51 @@ export class SqliteVectorStore implements VectorStore {
     return made;
   }
 
+  /**
+   * Which of these hashes already have a readable-live row in one partition
+   * (ADR-0018 amendment). Chunked at 900 parameters so a 5,000-row import never
+   * leans on SQLite's variable limit, and partial-indexed on (namespace, text_hash)
+   * so a chunk is a seek, not a scan. The population is what `list()` shows by
+   * default — tombstoned, archived and draft rows are excluded on purpose, so a
+   * sentence no ordinary search returns can be re-imported — and `project`/`type`
+   * confine the fold to one partition so one project's copy never folds another's.
+   */
+  async findExistingHashes(opts: {
+    namespace: string;
+    hashes: string[];
+    project?: string | null;
+    type?: string;
+  }): Promise<Set<string>> {
+    this.ensure();
+    // The readable-live population, same exclusion `list()` applies by default:
+    // a row no read can show must not block an import either.
+    const extra: string[] = ["is_deleted = 0", "status != 'archived'", "status != 'draft'"];
+    const head: (string | number)[] = [opts.namespace];
+    if (opts.project !== undefined) {
+      if (opts.project === null) extra.push("project IS NULL");
+      else {
+        extra.push("project = ?");
+        head.push(opts.project);
+      }
+    }
+    if (opts.type) {
+      extra.push("type = ?");
+      head.push(opts.type);
+    }
+    const found = new Set<string>();
+    for (let i = 0; i < opts.hashes.length; i += 900) {
+      const chunk = opts.hashes.slice(i, i + 900);
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT text_hash FROM memories
+           WHERE namespace = ? AND ${extra.join(" AND ")} AND text_hash IN (${chunk.map(() => "?").join(", ")})`
+        )
+        .all(...head, ...chunk) as { text_hash: string | null }[];
+      for (const row of rows) if (row.text_hash) found.add(row.text_hash);
+    }
+    return found;
+  }
+
   /** `memories` is a rowid table; `last_insert_rowid` is how the FTS row finds its row. */
   private lastRowid(): number {
     return Number((this.db.prepare(`SELECT last_insert_rowid() AS r`).get() as any).r);
@@ -948,8 +1039,8 @@ export class SqliteVectorStore implements VectorStore {
 
   private insertStmt(): any {
     return this.db.prepare(
-      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at, text_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
   }
 
@@ -977,7 +1068,11 @@ export class SqliteVectorStore implements VectorStore {
       mem.status,
       mem.pin,
       mem.createdAt,
-      mem.updatedAt
+      mem.updatedAt,
+      // Derived here, at the one INSERT every write path shares (insert, insertMany,
+      // supersede): a hash computed anywhere else is a hash that can drift from its
+      // row and silence the wrong insert (ADR-0018 amendment).
+      textHash(mem.text)
     );
   }
 
@@ -1211,14 +1306,15 @@ export class SqliteVectorStore implements VectorStore {
 
   async updateEmbedding(id: string, embedding: number[], text: string): Promise<void> {
     this.ensure();
-    const stmt = this.db.prepare(`UPDATE memories SET embedding = '', text = ?, updated_at = ? WHERE id = ?`);
+    const stmt = this.db.prepare(`UPDATE memories SET embedding = '', text = ?, text_hash = ?, updated_at = ? WHERE id = ?`);
     // `reembed` can arrive with different text; the posting list has to follow or
     // lexical search keeps matching the words the row used to have. The vector row
-    // is rewritten in the same transaction for the same reason.
+    // is rewritten in the same transaction for the same reason — and so is the
+    // duplicate hash, which describes this row's text now, not the one it had.
     await this.retryWrite(() => {
       this.db.exec("BEGIN IMMEDIATE");
       try {
-        stmt.run(text, Date.now(), id);
+        stmt.run(text, textHash(text), Date.now(), id);
         const row = this.db.prepare(`SELECT rowid AS r FROM memories WHERE id = ?`).get(id) as { r: number } | undefined;
         this.indexTermsSync(id, text);
         this.writeVectorSync(id, embedding);
