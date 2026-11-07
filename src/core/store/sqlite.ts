@@ -388,12 +388,32 @@ export class SqliteVectorStore implements VectorStore {
     // at the same time — each with its own MCP server process, plus the daemon. WAL
     // lets readers proceed while a writer commits; busy_timeout makes a concurrent
     // writer wait for the lock instead of throwing SQLITE_BUSY at the agent.
+    //
+    // The order is load-bearing, from the 2026-11-07 final review: all three PRAGMAs
+    // used to share one try/catch, and `journal_mode = WAL` is the one that answers
+    // SQLITE_BUSY when another process holds the file — which is exactly what a first
+    // open after an upgrade does while a peer's migration transaction is still in
+    // flight. Swallowing that error swallowed `busy_timeout` with it, so every later
+    // BEGIN IMMEDIATE (the migration sites below) failed instantly with "database is
+    // locked" and the process died in init() — measured: a second opener crashed at
+    // the `text_hash` site (sqlite.ts:481, pre-fix) ~1 s into a peer's held
+    // migration transaction. Set the patience
+    // first, and let each remaining setting fall back on its own.
+    try {
+      this.db.exec("PRAGMA busy_timeout = 5000");
+    } catch {
+      // A build without the pragma still works; retryWrite() covers the contention.
+    }
     try {
       this.db.exec("PRAGMA journal_mode = WAL");
-      this.db.exec("PRAGMA busy_timeout = 5000");
+    } catch {
+      // Busy behind another writer, or a build without WAL: opening in the file's
+      // current journal mode still works, and a later uncontended open switches it.
+    }
+    try {
       this.db.exec("PRAGMA synchronous = NORMAL");
     } catch {
-      // Builds without WAL still work; retryWrite() covers the remaining contention.
+      // The default FULL is slower, not wrong.
     }
     // 1. create table (IF NOT EXISTS — safe for new + old DBs)
     this.db.exec(`
@@ -478,15 +498,22 @@ export class SqliteVectorStore implements VectorStore {
       // ALTER and the backfill in ONE transaction — SQLite's DDL is transactional —
       // so a crash rolls the column itself back and the next open re-runs the whole
       // migration, instead of leaving NULL hashes that never get a second pass.
-      this.db.exec("BEGIN IMMEDIATE");
-      try {
-        this.db.exec(`ALTER TABLE memories ADD COLUMN text_hash TEXT`);
-        this.backfillTextHashes();
-        this.db.exec("COMMIT");
-      } catch (err) {
-        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
-        throw err;
-      }
+      // `runMigrationTxn` keeps the shape but not the crash: this transaction holds
+      // the write lock across the whole-store hash backfill, and an opener racing it
+      // (daemon restart plus a first CLI write after an upgrade) must wait, not die.
+      await this.runMigrationTxn(`ALTER TABLE memories ADD COLUMN text_hash TEXT`, () => this.backfillTextHashes());
+    }
+    // P2 (ADR-0016 amendment, 2026-11-07): the retrieval counter the hotness rule
+    // reads. Same single-transaction shape as `text_hash` right above — ALTER and
+    // the zero-backfill commit together or not at all, so a crash mid-migration
+    // rolls the column back and the next open re-runs the whole thing instead of
+    // leaving NULLs that never get a second pass. Rows predating the counter get 0:
+    // "no evidence of use" is the honest reading, and the floor is what makes the
+    // rule safe — a migrated store never looks hotter than it was.
+    if (!cols.has("use_count")) {
+      await this.runMigrationTxn(`ALTER TABLE memories ADD COLUMN use_count INTEGER`, () =>
+        this.db.exec(`UPDATE memories SET use_count = 0 WHERE use_count IS NULL`)
+      );
     }
     // 3. create indexes (after columns guaranteed to exist)
     this.db.exec(`
@@ -544,6 +571,16 @@ export class SqliteVectorStore implements VectorStore {
         PRIMARY KEY (from_id, target)
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_links_to ON knowledge_links(to_id);
+    `);
+    // P2 (ADR-0016 amendment, 2026-11-07): store-level bookkeeping as a small KV,
+    // not a column — this describes the file, not any memory, and a maintenance
+    // timestamp on 10^5 rows would be the same number 10^5 times. IF NOT EXISTS,
+    // like every other table here: the same migration path runs on new and old DBs.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS store_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
     this.backfillTerms();
     this.rebuildTermDfIfEmpty();
@@ -896,9 +933,64 @@ export class SqliteVectorStore implements VectorStore {
     throw lastErr;
   }
 
+  /**
+   * A first-open migration transaction — the two ALTER+backfill sites in `init()` —
+   * as BEGIN IMMEDIATE, DDL, backfill, COMMIT under `retryWrite`, from the
+   * 2026-11-07 final review.
+   *
+   * These sites used to be bare `exec`s: a daemon restart racing a CLI's first
+   * write after an upgrade hit `database is locked` within milliseconds — the
+   * migration transaction deliberately holds the write lock across the whole-store
+   * `text_hash` backfill (10^5 row hashes can pass one five-second busy wait), and
+   * the loser of that race used to die in `service.init()` instead of waiting. The
+   * transaction shape (and with it the crash-rolls-back-then-re-run guarantee the
+   * sites were built for) is unchanged; only the failure mode moved from throw to
+   * wait-and-retry.
+   *
+   * `duplicate column name` is caught on purpose: two openers can both read the
+   * schema as missing the column, and the one that wakes from its lock-wait finds
+   * the winner already committed — and the winner's transaction backfilled in the
+   * same commit, so "already migrated" is the whole truth and the open proceeds.
+   */
+  private async runMigrationTxn(ddl: string, afterAlter: () => void): Promise<void> {
+    await this.retryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(ddl);
+        afterAlter();
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        if (/duplicate column name/i.test(String((err as Error)?.message ?? err))) return;
+        throw err;
+      }
+    });
+  }
+
   close(): void {
     try { this.db?.close(); } catch {}
     this.ready = false;
+  }
+
+  /**
+   * Store-level KV (P2, ADR-0016 amendment): today only `last_maintenance_at` and
+   * the last maintenance report, written by the daemon's scheduler and read back by
+   * `/stats` after a restart — the point of persisting them is precisely that a
+   * restarted daemon can tell whether the store is overdue instead of blind-running.
+   */
+  async getMeta(key: string): Promise<string | null> {
+    this.ensure();
+    const row = this.db.prepare(`SELECT value FROM store_meta WHERE key = ?`).get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  async setMeta(key: string, value: string): Promise<void> {
+    this.ensure();
+    await this.retryWrite(() =>
+      this.db
+        .prepare(`INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+        .run(key, value)
+    );
   }
 
   async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
@@ -1025,6 +1117,8 @@ export class SqliteVectorStore implements VectorStore {
       importance: input.importance ?? 0.5,
       strength: input.strength ?? input.importance ?? 0.5,
       lastUsedAt: null,
+      // P2: a fresh row has earned nothing yet; the counter only moves on `reinforce`.
+      useCount: 0,
       source: input.source,
       tags: input.tags,
       supersedesId: input.supersedesId ?? null,
@@ -1039,8 +1133,8 @@ export class SqliteVectorStore implements VectorStore {
 
   private insertStmt(): any {
     return this.db.prepare(
-      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at, text_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at, text_hash, use_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
   }
 
@@ -1072,7 +1166,8 @@ export class SqliteVectorStore implements VectorStore {
       // Derived here, at the one INSERT every write path shares (insert, insertMany,
       // supersede): a hash computed anywhere else is a hash that can drift from its
       // row and silence the wrong insert (ADR-0018 amendment).
-      textHash(mem.text)
+      textHash(mem.text),
+      mem.useCount
     );
   }
 
@@ -1864,7 +1959,11 @@ export class SqliteVectorStore implements VectorStore {
     const res = await this.retryWrite(() =>
       this.db
         .prepare(
-          `UPDATE memories SET strength = MIN(0.95, strength + 0.02), last_used_at = ?, updated_at = ?
+          // P2 (ADR-0016 amendment): `use_count` is the third number a retrieval moves,
+          // next to strength and the use clock. COALESCE because a NULL can only come
+          // from a foreign writer — the migration backfilled every row it saw — and a
+          // NULL must count as "used once from zero", not as a poisoned NULL forever.
+          `UPDATE memories SET strength = MIN(0.95, strength + 0.02), use_count = COALESCE(use_count, 0) + 1, last_used_at = ?, updated_at = ?
             WHERE id IN (${unique.map(() => "?").join(", ")}) AND is_deleted = 0`
         )
         .run(now, now, ...(unique as any))
@@ -2105,6 +2204,7 @@ type Row = {
   importance: number;
   strength: number | null;
   last_used_at: number | null;
+  use_count: number | null;
   source: string | null;
   tags: string | null;
   supersedes_id: string | null;
@@ -2136,6 +2236,9 @@ function memoryFromRow(r: Row): Memory {
     // A column added later can be null in a DB migrated by an older build.
     strength: r.strength ?? r.importance,
     lastUsedAt: r.last_used_at ?? null,
+    // P2: like `strength` and `last_used_at`, a column a pre-migration or foreign
+    // row can answer NULL for; 0 is the honest "no recorded use".
+    useCount: r.use_count ?? 0,
     source: r.source ?? undefined,
     tags: r.tags ? JSON.parse(r.tags) : undefined,
     supersedesId: r.supersedes_id,

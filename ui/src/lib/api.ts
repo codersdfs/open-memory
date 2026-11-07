@@ -78,20 +78,22 @@ export interface StatsBucket {
   count: number;
 }
 
-/** src/core/stats.ts:31-39 DecayCandidate. */
+/** src/core/stats.ts:56-71 DecayCandidate. */
 export interface DecayCandidate {
   id: string;
   type: MemoryType;
   createdAt: number;
   importance: number;
   strength: number;
+  /** Retrievals so far — what the hotness preview weighs (src/core/lifecycle/decay.ts). */
+  useCount: number;
   isDeleted: number;
   text: string;
   /** `archive` is the default pass (reversible status change); `prune` is the opt-in hard pass. */
   action: 'archive' | 'prune';
 }
 
-/** src/core/stats.ts:41-59 StatsSummary. */
+/** src/core/stats.ts:73-97 StatsSummary. */
 export interface StatsSummary {
   total: number;
   byType: Record<string, number>;
@@ -123,6 +125,10 @@ export interface StatsResponse extends StatsSummary {
   rowsScanned: number;
   dbPath: string | null;
   dbBytes: number | null;
+  /** P2: when the daemon's maintenance pass last ran (epoch ms), null = never. */
+  lastMaintenanceAt: number | null;
+  /** What the last maintenance pass did, as one line; null = never ran. */
+  lastMaintenanceResult: string | null;
 }
 
 /** src/core/sessions.ts:23-31 SessionTurn. */

@@ -73,6 +73,15 @@ export interface Memory {
   strength: number;
   /** Epoch ms of the last above-threshold retrieval. null = never used. */
   lastUsedAt: number | null;
+  /**
+   * How many above-threshold retrievals this row has earned (P2, ADR-0016
+   * amendment 2026-11-07). `lastUsedAt` says *when* it was last used and is a
+   * binary "used at all" on its own; decay's hotness rule needs the count, since
+   * a row recalled once a year and one recalled every day look identical without
+   * it. 0 for rows written before the column existed — the migration backfills
+   * zeros, so an old store starts scoring from "no evidence" rather than a guess.
+   */
+  useCount: number;
   source?: string;
   tags?: string[];
   supersedesId?: string | null;

@@ -49,6 +49,7 @@ function mem(o: Partial<Memory> & { type: Memory["type"] }): Memory {
     importance: 0.5,
     strength: 0.5,
     lastUsedAt: null,
+    useCount: 0,
     isDeleted: 0,
     visibility: "private",
     status: "active",

@@ -31,6 +31,19 @@ const LOW_IMPORTANCE = 0.5;
 const ARCHIVE_AGE_MS = 30 * DAY_MS;
 const ARCHIVE_IMPORTANCE_BELOW = 0.6;
 
+/**
+ * The P2 hotness rule (ADR-0016 amendment, 2026-11-07), mirrored here for the
+ * preview — same deliberate duplication as the constants above, so a change to
+ * `decay.ts` drifts the preview *visibly* instead of silently agreeing.
+ * `log1p(use_count) × exp(−ln2 · age / window)`, half-life = the kind's window,
+ * age from the last activity; keep line = one use one window past.
+ */
+function hotness(useCount: number, ageMs: number, halfLifeMs: number): number {
+  return Math.log1p(useCount) * Math.exp(-Math.LN2 * (ageMs / halfLifeMs));
+}
+/** Same derivation as `decay.ts:HOTNESS_KEEP`: `log1p(1) · exp(−ln2)` = `ln2/2`. */
+const ARCHIVE_HOTNESS_KEEP = Math.LN2 / 2;
+
 const STRENGTH_BUCKETS = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1"];
 const AGE_BUCKETS = ["<1d", "1-7d", "7-30d", "30-90d", ">90d"];
 
@@ -46,6 +59,8 @@ export interface DecayCandidate {
   createdAt: number;
   importance: number;
   strength: number;
+  /** Above-threshold retrievals so far — the number the hotness preview reads (P2). */
+  useCount: number;
   isDeleted: number;
   text: string;
   /**
@@ -137,15 +152,20 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
       : m.type === "working" && ageMs > WORKING_DECAY_MS;
     // ADR-0023: knowledge rows follow their file, not the clock, so the preview must
     // not advertise them as decay candidates the archive pass deliberately skips.
-    const archiveStale = m.knowledgeId === null && !isDurableKind(m.kind) && m.status === "active" && m.lastUsedAt === null
-      && now - m.createdAt > (KIND_RETENTION_MS[m.kind] ?? ARCHIVE_AGE_MS)
+    // P2 (ADR-0016 amendment): the binary "never retrieved" test is gone — the row is
+    // a candidate when its hotness fell under the keep line past its kind's window.
+    const window = KIND_RETENTION_MS[m.kind] ?? ARCHIVE_AGE_MS;
+    const clock = m.lastUsedAt ?? m.createdAt;
+    const archiveStale = m.knowledgeId === null && !isDurableKind(m.kind) && m.status === "active"
+      && now - clock > window
+      && hotness(m.useCount, now - clock, window) < ARCHIVE_HOTNESS_KEEP
       && m.importance < ARCHIVE_IMPORTANCE_BELOW;
     const hardStaleRow = m.knowledgeId === null && hardStale;
     const action: DecayCandidate["action"] | null = hardStaleRow ? "prune" : archiveStale ? "archive" : null;
     if (action) {
       decayCandidates.push({
         id: m.id, type: m.type, createdAt: m.createdAt, importance: m.importance,
-        strength: m.strength, isDeleted: m.isDeleted, text: m.text.slice(0, 120), action
+        strength: m.strength, useCount: m.useCount, isDeleted: m.isDeleted, text: m.text.slice(0, 120), action
       });
     }
   }

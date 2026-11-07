@@ -17,6 +17,10 @@ import { isDurableKind, KIND_RETENTION_MS } from "../write/kind.js";
  * flip (`updateMeta({status:"archived"})`), the row and its vector stay, and an
  * operator can put it back. A prune writes a tombstone whose id an autonomous run
  * never hands out, so the destructive path is opt-in only (`hard: true`).
+ *
+ * Since 2026-11-07 the archive rule reads a counter instead of a binary flag, and
+ * a scheduler actually calls this file (P2, ADR-0016 amendment): see `hotness` and
+ * `runScheduledDecay` below.
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -24,10 +28,45 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /** `list()` defaults to 100 rows; the real store's default partition alone holds 320. */
 const PAGE_SIZE = 500;
 
+/**
+ * Hotness of a row: `log1p(use_count) × exp(−ln2 · age / window)` — the shape
+ * OpenViking ships for exactly this question (bench/OpenViking/openviking/retrieve/
+ * memory_lifecycle.py:18-41: freq grows in log1p of the access count, recency
+ * decays exponentially from the last activity, half-life in the same units).
+ *
+ * The half-life is NOT a new global constant (that would have been inventing a
+ * seventh number): it is the kind's existing retention window from ADR-0021 —
+ * `fact` 90 days, `note` 30, `task` 7 — so a row ages out on the same clock that
+ * already decided when this kind stops being believed without evidence.
+ *
+ * `age` runs from the last activity, `lastUsedAt` when there was one and
+ * `createdAt` otherwise: the same COALESCE clock `store.prune()` reads, and the
+ * same convention the OpenViking decay keys on its last-access timestamp.
+ */
+export function hotness(useCount: number, ageMs: number, halfLifeMs: number): number {
+  return Math.log1p(useCount) * Math.exp(-Math.LN2 * (ageMs / halfLifeMs));
+}
+
+/**
+ * The keep line: the hotness of a row used exactly once, one half-life after that
+ * use — `log1p(1) · exp(−ln2)` = `ln2/2`. Derived, not tuned: it says "a row is
+ * retired once it is colder than the least evidence of use one window ago". A
+ * never-used row sits at 0 and expires at its window, exactly as ADR-0016 measured
+ * (308 of 335 rows never retrieved); a row used once is protected for one window
+ * per the old rule's bargain, and every further window costs double the uses
+ * (3 survive two windows, 16 three) — which is what replaces the binary: under the
+ * old rule, one retrieval in the store's first month made a row immortal forever
+ * (gap1: `lastUsedAt` only said "used at all", and strength saturates at 0.95).
+ */
+export const HOTNESS_KEEP = Math.LN2 / 2;
+
 export interface ArchiveStaleOptions {
-  /** How old a never-retrieved row must be before it stops being offered as context. Default 30 days. */
+  /**
+   * Fallback window for a kind `KIND_RETENTION_MS` has no entry for; the durable
+   * kinds are skipped before it is read. Default 30 days — the `note` window.
+   */
   ageMs?: number;
-  /** Rows the judge rated at or above this are kept even if never retrieved. Default 0.6. */
+  /** Rows the judge rated at or above this are kept even if the clock says otherwise. Default 0.6. */
   importanceBelow?: number;
   /** Test seam: pin "now" so age assertions do not depend on the wall clock. */
   now?: number;
@@ -36,8 +75,8 @@ export interface ArchiveStaleOptions {
 export interface RunDecayOptions extends ArchiveStaleOptions {
   /**
    * Opt into the old destructive pass. Kept because an operator asked for it can be
-   * trusted with it; the default must not be reachable by a scheduled job calling
-   * `runDecay(store)` with no arguments.
+   * trusted with it; the scheduled path cannot ask for it at all — the daemon's
+   * maintenance job goes through `runScheduledDecay`, which takes no options bag.
    */
   hard?: boolean;
   /**
@@ -79,13 +118,17 @@ async function forEachMemory(store: VectorStore, namespace: string, fn: (m: Memo
 }
 
 /**
- * Archive rows that were written, never retrieved, and are old enough to be dead weight.
+ * Archive rows whose use has decayed past the keep line — cold, not merely old.
  *
- * The signal is "never used" rather than "old": in the real store 274 of 299 live rows
- * have `lastUsedAt === null`, so age alone would archive the whole store while age plus
- * never-used plus a low importance selects only rows the write-time judge also thought
- * were minor. Archived rows stay readable through `includeArchived`, so this is a
- * reversible demotion, never a delete.
+ * The signal used to be the binary "never used" (`lastUsedAt !== null` skipped a row
+ * forever): in the real store 274 of 299 live rows had `lastUsedAt === null`, so age
+ * alone would archive everything and one retrieval in the first month immunised a row
+ * for life. The P2 rule (ADR-0016 amendment, 2026-11-07) reads `use_count` instead —
+ * a row stays while its hotness is at least `HOTNESS_KEEP`, so a frequently-recalled
+ * old row survives, a once-recalled-and-forgotten row ages out one window after its
+ * last use, and a never-used row still expires at its window exactly as measured.
+ * Archived rows stay readable through `includeArchived`, so this is a reversible
+ * demotion, never a delete.
  *
  * Returns how many rows were archived.
  */
@@ -106,14 +149,22 @@ export async function archiveStale(store: VectorStore, opts: ArchiveStaleOptions
       if (memory.knowledgeId !== null) return;
       // ADR-0021: a decision, a convention or a gotcha is the reason the store exists.
       // Age is not evidence against them — being wrong is — so no age rule may demote
-      // one. Only an explicit supersede or delete takes them out.
+      // one. Only an explicit supersede or delete takes them out. The hotness swap
+      // does not reach them: this skip runs before any clock is read.
       if (isDurableKind(memory.kind)) return;
-      if (memory.lastUsedAt !== null) return;
-      // Kind sets the window: a task nobody touched in a week is done, a fact gets
-      // longer than the default because facts age slower than notes. The importance
-      // floor stays for every kind, so a high-rated row is never demoted by age alone.
+      // Kind sets the window, and the window doubles as the hotness half-life: a task
+      // nobody touched in a week is done, facts age slower than notes (ADR-0021).
       const window = KIND_RETENTION_MS[memory.kind] ?? ageMs;
-      if (memory.createdAt >= now - window) return;
+      // The grace period stays a hard floor in front of the formula: a row younger
+      // than its own window is never touched, however cold the exponent says it is
+      // (`hotness` of a brand-new never-used row is 0 by construction, and 0 is not
+      // evidence of anything yet). Age runs from the last activity where there was one.
+      const clock = memory.lastUsedAt ?? memory.createdAt;
+      if (clock >= now - window) return;
+      if (hotness(memory.useCount, now - clock, window) >= HOTNESS_KEEP) return;
+      // The importance floor survives the swap for every kind, exactly as before: a
+      // row the write-time judge rated highly is never demoted by the clock alone
+      // (ADR-0021). Reviewers of the P2 change check this line on purpose.
       if (memory.importance >= importanceBelow) return;
       await store.updateMeta(memory.id, { status: "archived" });
       archived++;
@@ -158,4 +209,19 @@ export async function runDecayDetailed(store: VectorStore, opts: RunDecayOptions
 export async function runDecay(store: VectorStore, opts: RunDecayOptions = {}): Promise<number> {
   const report = await runDecayDetailed(store, opts);
   return report.archived + report.pruned;
+}
+
+/**
+ * The maintenance scheduler's entry point (P2, ADR-0016 amendment 2026-11-07).
+ *
+ * It runs the reversible half of `runDecayDetailed` and takes NO options bag:
+ * `hard` is unreachable from this path because the signature cannot express it —
+ * the guarantee the pre-scheduler comment on `RunDecayOptions.hard` asked for is
+ * held structurally, not by a calling convention someone could forget. An
+ * operator-visible `pruned` from here would mean the scheduler deleted rows; the
+ * constant zero is the contract. `POST /decay` and the CLI keep the opt-in.
+ */
+export async function runScheduledDecay(store: VectorStore): Promise<DecayReport & { pruned: 0 }> {
+  const report = await runDecayDetailed(store, {});
+  return { archived: report.archived, pruned: 0 };
 }

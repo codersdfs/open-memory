@@ -266,7 +266,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     const rows = (await service.list({ namespace: ns, includeDeleted: true, limit: STATS_ROW_CAP })).memories;
     const { total: _rows, byType: _byType, ...full } = summarize(rows, Date.now());
     const dbPath = (service as unknown as { dbPath?: string }).dbPath ?? null;
-    return send(res, 200, { ...base, rowsScanned: _rows, ...full, dbPath, dbBytes: dbPath ? await fileSize(dbPath) : null });
+    // P2 (ADR-0016 amendment): the decay panel has to say when the automatic pass
+    // last ran and what it did. The bookkeeping lives in `store_meta`, not in this
+    // process, because "overdue since when" survives restarts — and `null` here
+    // means "never", which is the honest answer on a store without the KV.
+    const { LAST_MAINTENANCE_AT_KEY, LAST_MAINTENANCE_RESULT_KEY } = await import("../core/lifecycle/maintenance.js");
+    const lastAt = await service.store.getMeta?.(LAST_MAINTENANCE_AT_KEY);
+    const lastResult = await service.store.getMeta?.(LAST_MAINTENANCE_RESULT_KEY);
+    return send(res, 200, {
+      ...base, rowsScanned: _rows, ...full, dbPath, dbBytes: dbPath ? await fileSize(dbPath) : null,
+      lastMaintenanceAt: lastAt === null || lastAt === undefined ? null : Number(lastAt),
+      lastMaintenanceResult: lastResult ?? null
+    });
   }
   if (path === "/namespaces" && method === "GET") {
     // The partitions a namespace picker has to offer. `includeDeleted` on purpose:
@@ -1062,7 +1073,7 @@ try {
 if (runsAsMain) {
   const port = Number(process.env.PORT ?? process.env.MEMORY_PORT ?? 3000);
   const host = process.env.HOST ?? "127.0.0.1";
-  const { app } = await buildServer();
+  const { app, service } = await buildServer();
   // Without this, a port clash is an unhandled 'error' event: the process dies
   // silently in the background and whoever spawned it just sees a timeout.
   app.on("error", (e: NodeJS.ErrnoException) => {
@@ -1071,4 +1082,12 @@ if (runsAsMain) {
     process.exit(1);
   });
   app.listen(port, host, () => console.log(`ai-memory → http://${host}:${port}`));
+  // P2 (ADR-0016 amendment): forgetting now has a trigger. `MEMORY_MAINTAIN_HOURS`
+  // (default 24, `0` off) drives a timer over the *reversible* pass only — the
+  // scheduler's entry point has no `hard` in its signature to pass. The call
+  // returns synchronously: an overdue store is caught up in the background and
+  // no request ever waits on a sweep. This block is the daemon too: `daemon
+  // restart` execs exactly this file.
+  const { startMaintenance } = await import("../core/lifecycle/maintenance.js");
+  startMaintenance(service.store);
 }

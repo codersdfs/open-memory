@@ -18,12 +18,14 @@ import { absTime, bytes, relTime, score3, truncate } from '../lib/format';
  * saving — the store keeps no recall log, so any "tokens saved" would be invented.
  *
  * D7 — `decay` previews first: the candidate count and the exact predicates are stated in
- * the dialog, and the preview reads the same constants the prune does (src/core/stats.ts:18-20
- * mirrors src/core/lifecycle/decay.ts).
+ * the dialog, and the preview mirrors the same hotness rule the archive pass runs
+ * (src/core/stats.ts duplicates src/core/lifecycle/decay.ts on purpose — drift has to be
+ * visible). Since the 2026-11-07 amendment the pass is also automatic: the daemon sweeps
+ * `MEMORY_MAINTAIN_HOURS` apart, reversible pass only, and the panel says when it last did.
  */
 
 const PREDICATES =
-  'archive: never retrieved, older than 30 days, importance < 0.6 (status change only); hard prune (opt-in): episodic older than 90 days with importance and strength <= 0.5, working older than 7 days';
+  'archive: hotness log1p(uses)·exp(−ln2·age/window) under one-use-one-window (window per kind: task 7d, note 30d, fact 90d; durable kinds and importance ≥ 0.6 are never archived), status change only; hard prune (opt-in): episodic older than 90 days with importance and strength <= 0.5, working older than 7 days';
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -690,6 +692,18 @@ export default function StatsView({ namespace }: { namespace: string }) {
       render: (row) => <span style={{ fontSize: 11 }}>{score3(row.strength)}</span>,
     },
     {
+      key: 'uses',
+      header: 'uses',
+      width: '1%',
+      align: 'right',
+      mono: true,
+      render: (row) => (
+        <span title={row.useCount === 0 ? 'never retrieved above threshold — the hotness rule has nothing to weigh' : `${row.useCount} retrievals`} style={{ fontSize: 11 }}>
+          {row.useCount}
+        </span>
+      ),
+    },
+    {
       key: 'text',
       header: 'text',
       render: (row) => (
@@ -775,6 +789,17 @@ export default function StatsView({ namespace }: { namespace: string }) {
             {decayError}
           </div>
         ) : null}
+        <div className="hairline" style={{ marginBottom: 12, padding: '7px 9px', fontSize: 11, color: 'var(--dim)' }}>
+          automatic maintenance (reversible pass only):{' '}
+          {stats.lastMaintenanceAt === null ? (
+            <span className="mono">never</span>
+          ) : (
+            <span className="mono" title={absTime(stats.lastMaintenanceAt)}>
+              {relTime(stats.lastMaintenanceAt)}
+            </span>
+          )}
+          {stats.lastMaintenanceResult !== null ? <>, ran {stats.lastMaintenanceResult}</> : null}
+        </div>
         <DataTable
           rows={candidates}
           columns={columns}
@@ -782,7 +807,7 @@ export default function StatsView({ namespace }: { namespace: string }) {
           empty={
             <Empty
               title="nothing to archive"
-              body="no row matches the decay predicates right now — nothing here is both old, never retrieved and weak."
+              body="no row matches the decay predicates right now — nothing here is cold past its window, or the clock says it was used too recently, or it is durable, or it is important."
             />
           }
         />

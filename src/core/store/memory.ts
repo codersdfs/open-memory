@@ -10,9 +10,19 @@ import { median } from "../stats.js";
 
 export class InMemoryVectorStore implements VectorStore {
   private map = new Map<string, Memory>();
+  /** Store-level KV, mirror of the SQL `store_meta` table (P2, ADR-0016 amendment). */
+  private meta = new Map<string, string>();
 
   async init(): Promise<void> {}
   close(): void {}
+
+  async getMeta(key: string): Promise<string | null> {
+    return this.meta.get(key) ?? null;
+  }
+
+  async setMeta(key: string, value: string): Promise<void> {
+    this.meta.set(key, value);
+  }
 
   async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
     const now = Date.now();
@@ -29,6 +39,9 @@ export class InMemoryVectorStore implements VectorStore {
       importance: input.importance ?? 0.5,
       strength: input.strength ?? input.importance ?? 0.5,
       lastUsedAt: null,
+      // P2: mirror of the SQL store — a fresh row has earned nothing; the counter
+      // only moves on `reinforce`.
+      useCount: 0,
       source: input.source,
       tags: input.tags,
       supersedesId: input.supersedesId ?? null,
@@ -367,13 +380,18 @@ export class InMemoryVectorStore implements VectorStore {
     return df;
   }
 
-  /** R2. Mirror of the SQL: +0.02, capped, and the use clock reset. */  async reinforce(ids: string[]): Promise<number> {
+  /**
+   * R2. Mirror of the SQL: +0.02, capped, the use clock reset, and — since P2
+   * (ADR-0016 amendment) — the retrieval count incremented. The `?? 0` guards a
+   * row built before the field existed, exactly as the SQL `COALESCE` does.
+   */  async reinforce(ids: string[]): Promise<number> {
     const now = Date.now();
     let n = 0;
     for (const id of new Set(ids)) {
       const m = this.map.get(id);
       if (!m) continue;
       m.strength = Math.min(0.95, m.strength + 0.02);
+      m.useCount = (m.useCount ?? 0) + 1;
       m.lastUsedAt = now;
       m.updatedAt = now;
       n++;

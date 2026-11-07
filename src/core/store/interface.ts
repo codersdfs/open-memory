@@ -265,11 +265,23 @@ export interface VectorStore {
   }): Promise<{ median: number; count: number }>;
   /**
    * Retrieval reinforcement (R2): every id that came back above threshold gets a
-   * little stronger and its use clock reset. One UPDATE, no read-modify-write
+   * little stronger, its use clock reset, and — since the P2 hotness rule (ADR-0016
+   * amendment) — its `useCount` incremented. One UPDATE, no read-modify-write
+   * race between the agents sharing this store.
    */
   reinforce(ids: string[]): Promise<number>;
   prune(opts: { olderThanMs: number; maxImportance: number; type?: string; kind?: string }): Promise<number>;
 
+  /**
+   * Store-level KV bookkeeping (P2, ADR-0016 amendment 2026-11-07): today only the
+   * maintenance scheduler's `last_maintenance_at` and its report — the file's own
+   * history, not any memory's, which is why it is a KV table and not a column.
+   * Optional like every late capability: a store that predates it keeps compiling,
+   * and the scheduler then runs on the timer alone, with no open-the-store-catch-up
+   * to lose (it cannot know it is overdue), and `/stats` shows the absence.
+   */
+  getMeta?(key: string): Promise<string | null>;
+  setMeta?(key: string, value: string): Promise<void>;
 
   /**
    * Reclaim file space. `prune` is a soft delete: the row, its postings and its
