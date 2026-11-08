@@ -7,6 +7,7 @@ import { buildServer } from "../src/api/server.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import type { EmbeddingProvider } from "../src/core/embedding/provider.js";
 import { MemoryClient } from "../src/cli/http.js";
 import { runPrincipalCommand } from "../src/cli/principal.js";
 import { buildInjection } from "../src/adapters/inject.js";
@@ -459,6 +460,69 @@ describe("principal: recover --from-db", () => {
     const { stat } = await import("node:fs/promises");
     const st = await stat(path.join(dir, "principal.key"));
     expect(st.mode & 0o777).toBe(0o600);
+  });
+
+  it("reads a store whose vectors disagree with this machine's env — the machine-move shape must not block the break-glass", async () => {
+    // The reviewer's scenario: recover runs on a machine whose EMBEDDING_PROVIDER and
+    // dim disagree with the file the hardest. `MemoryService.init` refuses that store
+    // (constructor throws on env under-configuration, init throws on the dim guard),
+    // so status/recover read the store directly, the way cmdReembed does.
+    const dir = tempDir();
+    const dbPath = path.join(dir, "memory.db");
+    const wide: EmbeddingProvider = {
+      name: "wide-test",
+      dim: 1536,
+      model: null,
+      embed: async () => new Array(1536).fill(0.01),
+      embedBatch: async (texts: string[]) => texts.map(() => new Array(1536).fill(0.01)),
+    };
+    const writer = new MemoryService({ dbPath, embedder: wide });
+    await writer.init();
+    await writer.save({ namespace: "pi:frank", type: "semantic", text: "a row written by another machine" });
+    await writer.close();
+
+    // The route the fix bypasses would refuse this file outright — pin the hazard:
+    const throughService = new MemoryService({ dbPath });
+    await expect(throughService.init()).rejects.toThrow(/dim mismatch/);
+    await throughService.close();
+
+    const out: string[] = [];
+    const code = await runPrincipalCommand(["recover"], { "from-db": true, db: dbPath, home: dir }, {
+      out: (s) => out.push(s),
+      err: () => {},
+    });
+    expect(code).toBe(0);
+    expect((JSON.parse(readFileSync(path.join(dir, "principal.key"), "utf8")) as { user: string }).user).toBe("frank");
+
+    const statusOut: string[] = [];
+    const code2 = await runPrincipalCommand(["status"], { db: dbPath, home: dir }, {
+      out: (s) => statusOut.push(s),
+      err: () => {},
+    });
+    expect(code2).toBe(0);
+    expect(statusOut.join("\n")).toContain("frank (1)");
+    expect(statusOut.join("\n")).not.toContain("dim mismatch");
+  });
+
+  it("survives an under-configured EMBEDDING_PROVIDER — the constructor guard cannot block recovery either", async () => {
+    const dir = tempDir();
+    const dbPath = await makeStore(dir);
+    // The other half of the guard: an env the factory refuses throws inside the
+    // MemoryService *constructor*, before any read could happen. recover must not care.
+    process.env.EMBEDDING_PROVIDER = "openai-local";
+    try {
+      expect(() => new MemoryService({ dbPath })).toThrow(/openai-local needs/);
+
+      const out: string[] = [];
+      const code = await runPrincipalCommand(["recover"], { "from-db": true, db: dbPath, home: dir }, {
+        out: (s) => out.push(s),
+        err: () => {},
+      });
+      expect(code).toBe(0);
+      expect((JSON.parse(readFileSync(path.join(dir, "principal.key"), "utf8")) as { user: string }).user).toBe("frank");
+    } finally {
+      delete process.env.EMBEDDING_PROVIDER;
+    }
   });
 
   it("reveal prints the raw token — the console's unlock gate takes it from here", async () => {

@@ -11,12 +11,12 @@
  *     the user segment from the partitions the store actually holds. Existing rows stay
  *     readable because the segment they were filed under is exactly what gets re-bound.
  *
- * Reads the store through `MemoryService` like every other whole-store command, so the
- * same precedence (`--db` → `MEMORY_DB_PATH` → home) decides which file is consulted.
+ * Reads the store directly (no `MemoryService`, whose embedder guards would block the
+ * machine-move shape this exists for — see `storeNamespaces`), with the same path
+ * precedence as every other whole-store command (`--db` → `MEMORY_DB_PATH` → home).
  */
 
 import { existsSync } from "node:fs";
-import { MemoryService } from "../core/memoryService.js";
 import { MemoryClient } from "./http.js";
 import { dbExists, resolveDbPath } from "../core/dbPath.js";
 import {
@@ -46,14 +46,25 @@ function mask(token: string): string {
   return token.length <= 8 ? "…" : `…${token.slice(-4)}`;
 }
 
-/** Every partition the store holds, tombstones included — the widest view of the data. */
+/**
+ * Every partition the store holds, tombstones included — the widest view of the data.
+ *
+ * Read directly over the store, deliberately not through `MemoryService`: its
+ * constructor runs the embedder resolution (an under-configured `EMBEDDING_PROVIDER`
+ * throws there) and its `init` refuses a store whose vector width disagrees with the
+ * resolved embedder — and `principal recover --from-db` exists exactly for the
+ * machine-move case, where the new machine's environment disagrees with the file the
+ * hardest. A break-glass command must read partition names, not embeddings; the same
+ * bypass `cmdReembed` takes, for the same reason.
+ */
 async function storeNamespaces(dbPath: string): Promise<string[]> {
-  const svc = new MemoryService({ dbPath });
-  await svc.init();
+  const { SqliteVectorStore } = await import("../core/store/sqlite.js");
+  const store = new SqliteVectorStore(dbPath);
+  await store.init();
   try {
-    return await svc.store.distinctNamespaces({ includeDeleted: true });
+    return await store.distinctNamespaces({ includeDeleted: true });
   } finally {
-    await svc.close();
+    store.close();
   }
 }
 
