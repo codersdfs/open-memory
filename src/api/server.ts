@@ -608,6 +608,18 @@ async function handle(
     return send(res, 200, { ...report, affected: report.archived + report.pruned });
   }
 
+  // Retroactive curation over the stock (ADR-0040 amendment, P3). Same reason this
+  // route must live in the daemon as /decay: the decoded partition snapshots are
+  // invalidated per process (ADR-0034's changes log), so an archive/demote written
+  // from another process would leave this daemon scoring dead rows as live until
+  // restart. The body is `{apply?: boolean}` — absent/false keeps the diff-first
+  // default and writes nothing.
+  if (path === "/triage" && method === "POST") {
+    const body = await readJson(req);
+    const { runTriage } = await import("../core/lifecycle/triage.js");
+    return send(res, 200, await runTriage(service.store, { apply: body.apply === true }));
+  }
+
   if (path === "/compact" && method === "POST") {
     // Soft delete keeps the bytes: this is the operator's one lever that gives them
     // back. Optional on the store, so a store without a file to rewrite answers 501

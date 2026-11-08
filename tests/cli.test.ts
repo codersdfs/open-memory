@@ -3,8 +3,12 @@ import { spawnSyncChild, closeAllChildren } from "./helpers/child.js";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { AddressInfo } from "node:net";
+import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import { restartDaemon, runDaemonCommand } from "../src/cli/daemon.js";
+import { main } from "../src/cli/index.js";
+import { appVersion } from "../src/version.js";
 
 /**
  * End-to-end CLI tests.
@@ -39,6 +43,53 @@ function run(args: string[], dbPath: string, env: Record<string, string> = {}) {
 
 const tmp = mkdtempSync(path.join(os.tmpdir(), "ai-memory-cli-"));
 const db = path.join(tmp, "memory.db");
+
+/**
+ * A fake daemon speaking the wire contract the CLI probes: /health with the running
+ * build's version, POST /triage answering in the report shape. Every request is
+ * recorded so a test can pin which path the CLI took. Same-process on purpose — see
+ * the comment on the tests that use it for why a spawned child cannot reach a
+ * listener held by the vitest worker on this machine.
+ */
+async function fakeDaemon(opts?: { triageStatus?: number }): Promise<{
+  url: string;
+  requests: { path: string; body: unknown }[];
+  close: () => Promise<void>;
+}> {
+  const requests: { path: string; body: unknown }[] = [];
+  const server: Server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c: Buffer) => { body += c.toString(); });
+    req.on("end", async () => {
+      requests.push({ path: req.url ?? "", body: body ? JSON.parse(body) : {} });
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, embedding: "hash", dim: 16, version: await appVersion() }));
+        return;
+      }
+      if (req.url === "/triage" && req.method === "POST") {
+        const status = opts?.triageStatus ?? 200;
+        res.writeHead(status, { "content-type": "application/json" });
+        if (status >= 400) {
+          res.end(JSON.stringify({ error: "not found" }));
+          return;
+        }
+        const apply = (JSON.parse(body || "{}") as { apply?: boolean }).apply === true;
+        res.end(JSON.stringify({ scanned: 1, partitions: 1, archives: [], demotions: [], merges: [], unjudged: 0, applied: apply }));
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return {
+    url,
+    requests,
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
 
 // Every child this file starts is gone before the file ends. Without this the
 // suite leaves a few hundred idle node.exe behind, and the run that inherits
@@ -207,6 +258,9 @@ describe("ai-memory CLI", () => {
     expect(applied.code).toBe(0);
     expect(applied.stdout).toContain("applied");
     expect(applied.stdout).toContain("archived 1");
+    // No daemon answered (AI_MEMORY_SERVER points at a closed port), so the writes
+    // happened in this child process — the caveat rides stderr, not the payload.
+    expect(applied.stderr).toContain("daemon");
     // A status flip, never a delete: readable, and reversible.
     const after = run(["get", id], db).stdout;
     expect(after).toContain("status: archived");
@@ -215,6 +269,89 @@ describe("ai-memory CLI", () => {
     // Idempotent: the archived junk row is not proposed again.
     const again = run(["triage"], db);
     expect(again.stdout).toContain("would archive 0");
+  });
+
+  it("triage --json keeps stdout machine-readable and carries the in-process caveat on stderr", () => {
+    const seeded = run(["save", "| json | table | row |", "--json"], db, { MEMORY_CURATE: "off" });
+    const { id } = JSON.parse(seeded.stdout) as { id: string };
+
+    const applied = run(["triage", "--apply", "--json"], db);
+    expect(applied.code).toBe(0);
+    const report = JSON.parse(applied.stdout) as { applied: boolean; archives: { id: string }[] };
+    expect(report.applied).toBe(true);
+    expect(report.archives.map((c) => c.id)).toContain(id);
+    // The fix for the --json blind spot: stdout stays the report, the caveat
+    // lives on stderr where a script can still read it.
+    expect(applied.stderr).toContain("daemon");
+    expect(run(["get", id], db).stdout).toContain("status: archived");
+  });
+
+  it("triage writes through the daemon when one answers, so no restart caveat is needed", async () => {
+    // The CLI must prefer POST /triage over an in-process sweep: the daemon's decoded
+    // snapshots are invalidated per process (ADR-0034), so an apply written from the
+    // CLI's process would leave the daemon scoring archived rows as live until
+    // restart. The daemon here is a fake speaking the same wire contract, called
+    // through main() in THIS process — a spawned child cannot reach a listener held
+    // by the vitest worker on this machine (its TCP connects but the data never
+    // arrives), which is exactly why the in-process call is the honest wiring.
+    const { url, requests, close } = await fakeDaemon();
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ai-memory-triage-daemon-"));
+    const prevServer = process.env.AI_MEMORY_SERVER;
+    process.env.AI_MEMORY_SERVER = url;
+    try {
+      const code = await main(["triage", "--apply", "--db", path.join(dir, "memory.db")]);
+      expect(code).toBe(0);
+      expect(requests.map((r) => r.path)).toEqual(["/health", "/triage"]);
+      expect(requests[1]!.body).toEqual({ apply: true });
+    } finally {
+      if (prevServer === undefined) delete process.env.AI_MEMORY_SERVER;
+      else process.env.AI_MEMORY_SERVER = prevServer;
+      await close();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+
+  it("a daemon too old for the route answers 404 and the CLI falls back in-process, caveating on stderr", async () => {
+    // /health says alive, /triage says not found — a daemon from before the route.
+    // The identical code then runs in-process, and the restart caveat prints on
+    // stderr in BOTH output modes (a script consuming --json reads stderr too).
+    const { url, requests, close } = await fakeDaemon({ triageStatus: 404 });
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ai-memory-triage-404-"));
+    // The caveat only prints when the in-process sweep actually wrote something,
+    // so the throwaway store gets one junk row — seeded straight into the store,
+    // because the write gate refuses junk on every path.
+    const storeDb = path.join(dir, "memory.db");
+    const { SqliteVectorStore } = await import("../src/core/store/sqlite.js");
+    const { HashEmbeddingProvider } = await import("../src/core/embedding/hash.js");
+    const seedStore = new SqliteVectorStore(storeDb);
+    await seedStore.init();
+    // A real-dim vector, so MemoryService.init's dimension guard admits the file.
+    const vec = await new HashEmbeddingProvider().embed("seed row", { inputType: "passage" });
+    await seedStore.insert({ namespace: "t:404", type: "semantic", text: "| seed | table | row |", kind: "note", importance: 0.5 }, vec);
+    seedStore.close();
+    const errLines: string[] = [];
+    const realErr = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: string) => { errLines.push(s); return true; }) as typeof process.stderr.write;
+    const prevServer = process.env.AI_MEMORY_SERVER;
+    process.env.AI_MEMORY_SERVER = url;
+    try {
+      const code = await main(["triage", "--apply", "--json", "--db", storeDb]);
+      expect(code).toBe(0);
+      expect(requests.map((r) => r.path)).toEqual(["/health", "/triage"]);
+      // stdout stays the pure JSON report; the caveat lives on stderr.
+      expect(errLines.join("")).toContain("daemon");
+    } finally {
+      process.stderr.write = realErr;
+      if (prevServer === undefined) delete process.env.AI_MEMORY_SERVER;
+      else process.env.AI_MEMORY_SERVER = prevServer;
+      await close();
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        // Windows keeps a just-closed SQLite file briefly; a leaked temp dir is
+        // strictly better than a red suite (the tempDir helper's rule).
+      }
+    }
   });
 
   it("lists and counts", () => {

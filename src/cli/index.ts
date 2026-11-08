@@ -13,6 +13,7 @@ import { appVersion } from "../version.js";
 import type { BriefResult, ChainView, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import type { ProjectSummary } from "../core/store/interface.js";
 import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/view.js";
+import type { TriageReport } from "../core/lifecycle/triage.js";
 import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
 import { isKind, KINDS, stripEmbedding } from "../core/types.js";
 import { renderEmptySearch } from "../core/retrieval/explain.js";
@@ -714,25 +715,48 @@ async function cmdDecay(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
  * default run writes nothing, `--apply` is the only mode that touches rows, and
  * nothing here can hard-delete — junk leaves the pools by a status flip.
  *
- * In-process only, like `reembed` and `db compact`: there is no daemon route for
- * it, and a whole-store sweep belongs to the operator's process. The daemon caveat
- * is printed after an apply because the cache noteChange expired lives in *this*
- * process, not the daemon's.
+ * The write goes through the daemon when one answers, exactly like `decay`
+ * (POST /triage): the decoded partition snapshots are invalidated per process
+ * (ADR-0034's changes log), so an apply has to run inside the daemon that serves
+ * the reads — written from here, that daemon would keep scoring archived and
+ * demoted rows as live until restart. A daemon older than the route answers 404
+ * and the identical code runs in-process — the `knowledge sync` fallback, safe
+ * because the write path is the same — and then the stderr note is what tells the
+ * caller why the running daemon must be restarted. The note rides stderr in BOTH
+ * output modes: stdout is the payload, and a script consuming `--json` must not
+ * lose the warning with it.
  */
 async function cmdTriage(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
-  const svc = await r.service();
+  const apply = flagBool(a, "apply") === true;
   const { runTriage, renderTriageReport } = await import("../core/lifecycle/triage.js");
-  const report = await runTriage(svc.store as never, { apply: flagBool(a, "apply") === true });
-  if (ctx.json) {
-    ctx.out(JSON.stringify(report, null, 2));
-  } else {
-    ctx.out(renderTriageReport(report));
-    if (report.applied && report.archives.length + report.demotions.length > 0) {
-      ctx.err(
-        "note: a daemon serving this store keeps its own decoded partitions — restart it " +
-        "(`ai-memory daemon restart`) so it serves the triaged rows, not cached ones."
-      );
+
+  if (await r.useDaemon()) {
+    const res = await r.client().post<TriageReport>("/triage", { apply });
+    if (res.ok) {
+      // The daemon wrote (or diffed) itself: its own noteChange expired its
+      // snapshots, so nothing here needs the restart caveat.
+      if (ctx.json) ctx.out(JSON.stringify(res.data, null, 2));
+      else ctx.out(renderTriageReport(res.data));
+      return 0;
     }
+    if (!/not found/i.test(res.error)) {
+      ctx.err(`triage: ${res.error}`);
+      return 1;
+    }
+    // A daemon from before the route existed: fall through, the write path is
+    // the same code, and the note below covers the cache it cannot invalidate.
+  }
+
+  const svc = await r.service();
+  const report = await runTriage(svc.store as never, { apply });
+  if (ctx.json) ctx.out(JSON.stringify(report, null, 2));
+  else ctx.out(renderTriageReport(report));
+  if (report.applied && report.archives.length + report.demotions.length > 0) {
+    ctx.err(
+      "note: the rows were written from this process; a daemon serving this store keeps its " +
+      "own decoded partitions — restart it (`ai-memory daemon restart`) so it serves the " +
+      "triaged rows, not cached ones."
+    );
   }
   return 0;
 }

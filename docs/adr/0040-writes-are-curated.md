@@ -191,6 +191,16 @@ What shipped, in the order the command promises it:
   keeps its trailing `noteChange`, so a demoted or archived row leaves every
   decoded partition snapshot it sat in (ADR-0034) — pinned by a cache-counter
   test, not assumed.
+- **The write runs inside the daemon when there is one** (added 2026-11-09, after
+  review caught the cross-process cache hole in the first cut). `--apply` posts
+  `POST /triage`, for the same reason `/decay` is a daemon route: the decoded
+  partition snapshots are invalidated per process (ADR-0034's changes log), so an
+  apply written from the caller's process would leave a running daemon scoring
+  archived and demoted rows as live until restart. A daemon older than the route
+  answers 404 and the identical code runs in-process — the `knowledge sync`
+  fallback — and the stderr caveat about restarting the daemon then prints in
+  **both** output modes: stdout is the payload, and a script consuming `--json`
+  must not lose the warning with it.
 - **The contracts outrank the regexes.** The pass skips durable kinds
   (`decision`/`convention`/`gotcha` — ADR-0021, the same skip P2 preserved when
   decay swapped to hotness), pinned rows (pin is the one explicit "keep this" —
@@ -212,6 +222,10 @@ What shipped, in the order the command promises it:
 Verified by `tests/triage.test.ts` (both stores: dry-run byte-identical; apply
 archives junk and idempotently re-reports zero; durable kinds, pin, draft,
 knowledge rows and tombstones unmoved; merge candidates listed and never merged;
-`updateMeta` importance on both stores plus the partition-cache invalidation) and
-by `tests/cli.test.ts` (dry-run prints the diff and writes nothing; `--apply`
-writes; the machine shape is stable under `--json`).
+`updateMeta` importance on both stores plus the partition-cache invalidation),
+by `tests/api.test.ts` (`POST /triage`: the dry run writes nothing, apply
+archives inside the daemon's own process, a bare POST stays the dry run) and by
+`tests/cli.test.ts` (dry-run prints the diff and writes nothing; `--apply`
+writes; the machine shape is stable under `--json`; the in-process fallback
+carries the daemon caveat on stderr in both output modes; against a live server
+the CLI posts `/triage` and prints no caveat).
