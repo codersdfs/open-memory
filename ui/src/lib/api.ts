@@ -241,8 +241,34 @@ function serverMessage(body: unknown, status: number): string {
   return `HTTP ${status}`;
 }
 
+// P7 (ADR-0049): the console authenticates like every other client. The daemon serves
+// its token to nobody — an injected meta tag was tried and removed by review (any
+// unauthenticated GET of a static page would hand the live token to a same-machine
+// process, the exact threat the boundary exists for) — so the operator pastes the token
+// once into the 401 gate (PrincipalGate) and the browser keeps it in localStorage,
+// scoped to this origin. An absent stored token sends no header and the server answers
+// 401, which is what the gate keys off. Nothing the server renders ever contains it.
+const TOKEN_STORAGE_KEY = 'ai-memory-principal';
+
+/** The principal token this browser holds, or null when the gate has not been passed. */
+export function storedPrincipalToken(): string | null {
+  return localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+/** Store (or clear) the principal token the console sends on every request. */
+export function setStoredPrincipalToken(token: string | null): void {
+  if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  else localStorage.removeItem(TOKEN_STORAGE_KEY);
+}
+
+function principalHeaders(): Record<string, string> {
+  const token = storedPrincipalToken();
+  return token ? { 'x-ai-memory-principal': token } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
+  const res = await fetch(path, { ...init, headers: { ...principalHeaders(), ...init?.headers } });
+
   const body: unknown = await res.json().catch(() => null);
   // The server's message is the useful one ("text required (1-5000 chars)"); a
   // generic "request failed" throws that away.

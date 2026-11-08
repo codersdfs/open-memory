@@ -31,6 +31,7 @@ Docker, and your history never leaves the machine.
 - **Vault graph** (`/graph.html`): Obsidian-style node graph over `vault/` — any markdown you point `VAULT_DIR` at. Edges come from `[[wikilinks]]` in the body plus the frontmatter `links:` that ingest writes — nothing is inferred, so the graph never lies about intent. Click a node for the local graph (depth 1-3), filter with `tag:x` / `path:x` / substring, colour by folder, drag nodes; positions persist to `vault/.positions.json`. Dangling and ambiguous links render as hollow nodes — hiding them would hide the maintenance debt.
 - **CLI** (`ai-memory`): every subcommand works non-interactively, because hooks call it. Uses the daemon when one answers, otherwise opens the store in-process.
 - **MCP server** (`src/mcp/tools.ts`): `memory_*` tools, every one accepting an explicit `scope` (`memory_knowledge` adds the vault index).
+- **Local boundary** (ADR-0049): the daemon serves one principal — a key file in the data dir, its token required on every read/write route (`x-ai-memory-principal`), and the namespace user segment owned server-side. Another OS account gets 401/403 instead of a partition it names; a second account runs its own store and port.
 - **Wire it in** ([docs/integrations.md](docs/integrations.md)): one command for the agents it knows, and `agent add` for any other MCP client — no code.
 - **Zero runtime dependencies.** `node:http`, `node:sqlite`, `node:crypto`. Dev-only: tsx, typescript, vitest.
 
@@ -187,6 +188,12 @@ says which page and which part of it answered.
 | `GET` | `/stats?namespace=` | |
 | `PATCH` | `/memories/:id` | `{status?, pin?}` governance |
 
+Every route above except `/health` and the static console requires the daemon's principal
+token in the `x-ai-memory-principal` header — tokenless answers **401**, a wrong token
+**403**, and a `namespace` naming a user segment the daemon's principal does not own
+**403**. The CLI, the MCP server and the hooks attach it automatically; see
+[The principal and the local boundary](#the-principal-and-the-local-boundary).
+
 ### Agent wiring (tool-first, ADR-0003)
 
 Wiring an agent that already exists is a CLI command, not this snippet — see
@@ -207,13 +214,63 @@ const { injected } = await autoInject(svc, messages, { namespace: "agent1:user42
 // injected is string to prepend to prompt, or null if no memories above threshold
 ```
 
-HTTP alternative (any language):
+HTTP alternative (any language) — the daemon serves one principal, so carry its token
+(read it from the key file shown by `ai-memory principal status`):
 
 ```bash
+TOKEN=$(node -e "console.log(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.ai-memory/principal.key','utf8')).token)")
 curl -X POST http://127.0.0.1:3000/memories/search \
   -H "Content-Type: application/json" \
+  -H "x-ai-memory-principal: $TOKEN" \
   -d '{"query":"where does user live?","namespace":"default:default","k":5,"budgetTokens":800,"threshold":0.72}'
 ```
+
+## The principal and the local boundary
+
+The daemon serves **exactly one principal**: the OS account that owns its data directory.
+On first start it writes `principal.key` into the memory home — a 256-bit token plus the
+namespace user segment this principal owns — and from then on every read/write route
+demands that token in the `x-ai-memory-principal` header ([ADR-0049](docs/adr/0049-principal-and-the-local-boundary.md)).
+
+What the token defends, and only what it defends: a process under **another OS account**
+can reach the loopback port but cannot read this account's key file, so it can no longer
+read another user's partitions by naming them — tokenless is **401**, a foreign token is
+**403**. The user segment itself is server-owned: scope you leave unpinned (`agent`/`scope`
+writes, `agent`/`scope`/`all` reads, the project marker) resolves with the principal's
+segment no matter what your environment says, and an explicit `namespace` naming someone
+else's segment is refused with 403 rather than honored or quietly relabeled. The legacy
+`default:default` partition stays open to the principal — that is where every pre-existing
+row lives, **no namespace in the store is rewritten and no migration runs**, so existing
+rows, the seed and the CLI behave exactly as before for the segments they were written
+under.
+
+Two honest limits, stated because a boundary that oversells is worse than none: a process
+under the **same** OS account is not defended — it can read the key file and open the
+SQLite file directly, so no token stops it — and there is **no at-rest encryption**; the
+store is plaintext SQLite. That is the same reservation the research review recorded, and
+it is drawn as a boundary, not claimed as a solution.
+
+- **The CLI, the MCP server and `ai-memory inject --server <url>`** read the key file and
+  attach the header themselves; a missing file degrades to the daemon's 401, which names
+  the path. **The console authenticates like every other client**: the daemon serves the
+  token to nobody — an earlier build injected it into the served HTML, and one
+  unauthenticated `GET /graph.html` was enough to mint the header, so it was removed —
+  and on a 401 the console shows a gate where you paste the token once (`ai-memory
+  principal reveal` prints it); the browser keeps it in localStorage for this origin,
+  and the vault graph page shares it. Nothing the daemon serves to an unauthenticated
+  reader contains the token.
+- **A second OS account** gets its own store file (the default already resolves under the
+  account's home) and its own `PORT`. There is no multi-principal daemon on purpose: a
+  daemon holding one secret cannot defend what it shares. Cross-principal sharing is an
+  explicit export, never a namespace.
+- **`ai-memory principal status`** shows the binding and whether the store's partitions
+  agree; **`ai-memory principal recover --from-db`** is the lost-key / machine-move path —
+  it writes a **new** token (the old one is never reconstructed) and re-derives the user
+  segment from the partitions the store actually holds, one-way. The running daemon still
+  holds the previous binding until restarted; the restart still walks, because
+  `/admin/shutdown` accepts the key file's *current* token even while the daemon holds an
+  older one — the one repair lever the gate keeps, and only the owning account could have
+  read that file. **`principal reveal`** prints the raw token for the console's gate.
 
 ### Retrieval floors
 
@@ -293,7 +350,7 @@ NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` 
 
 **A third path, from the console.** `Embeddings` in the Stats view picks a provider and writes `~/.ai-memory/settings.json`; `Settings` writes the provider keys there too, along with the judge's key and knobs and the extractor's. The file is flat — a setting key is an environment variable name — and only the console's own lists are accepted, so a name the console does not own is refused by name, never written. Precedence is **real environment > that file > built-in default**: an `EMBEDDING_PROVIDER` exported in your shell — or in `.env`, which is a real env value — beats the file, and the card says which of the three is in play (ADR-0010).
 
-**What a save costs depends on the key.** The embedding settings (`EMBEDDING_PROVIDER`, the dim, the model, the base URL) take effect on the **next start** — the running process keeps its embedder (ADR-0009). A key, `MEMORY_JEV` / `MEMORY_JEV_MIN` / `JEV_ENDPOINT` / `JEV_MODEL`, or `ENABLE_EXTRACTOR` / `EXTRACTOR_MODEL` is **live on the next call**: those are read per use, not frozen at boot. The file is created `0600`, which is a POSIX mode — on Windows it is inert and the protection is your profile ACL. A saved key is never sent back in clear: the console shows `…` and its last four characters, and no response or error body carries more.
+**What a save costs depends on the key.** The embedding settings (`EMBEDDING_PROVIDER`, the dim, the model, the base URL) take effect on the **next start** — the running process keeps its embedder (ADR-0009). A key, `MEMORY_JEV` / `MEMORY_JEV_MIN` / `JEV_ENDPOINT` / `JEV_MODEL`, or `ENABLE_EXTRACTOR` / `EXTRACTOR_MODEL` is **live on the next call**: those are read per use, not frozen at boot. The file is created with POSIX mode `0600` through an explicit `chmod` (`writeFile`'s own mode would be masked by the umask). That mode does not exist on Windows: the platform has no permission bits for Node to set, and what actually scopes the file is the ACL it inherits from your user profile directory — the same inheritance `%APPDATA%` relies on — so on Windows the protection is account-scoped ACL, not a mode. A saved key is never sent back in clear: the console shows `…` and its last four characters, and no response or error body carries more.
 
 **If a value already sits in `.env`, the console cannot save over it.** The environment wins the merge, so the save is refused and names where the live value is; `adopt .env` is the way out. Adopt copies the values into `settings.json` first, then comments their `.env` lines out — never deletes them, never reorders the file — with `.env.bak` written once beforehand, so the pre-edit copy survives every later adopt. A line whose value cannot be read back exactly (a backslash the loader would expand, unusual quoting) is left in `.env` untouched and reported instead, because commenting it out would make a wrong `settings.json` the only copy.
 
@@ -665,3 +722,5 @@ See `CONTEXT.md`. Canonical terms: **Memory**, **Episodic/Semantic/Procedural/Wo
 - `0045-write-history-and-two-clocks`
 - `0046-facet-index-and-third-candidate-arm`
 - `0047-conflict-window-and-pending-conflicts`
+- `0048-bucket-summaries-and-the-local-embedder-preset`
+- `0049-principal-and-the-local-boundary`

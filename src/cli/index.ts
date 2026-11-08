@@ -65,6 +65,10 @@ Setup & introspection
   db info                which store would be used, and why
   db compact             VACUUM the store file: give back what soft delete kept
   daemon restart         stop the running daemon and start a fresh one
+  principal              the identity this machine's daemon serves (ADR-0049):
+                         status (default) | recover --from-db — re-bind the user
+                         segment from the store's own partitions after a lost key |
+                         reveal — print the token (the console's unlock gate takes it)
   mcp                    run the MCP stdio server (agents spawn this)
   inject                 read a hook payload on stdin, print context for this turn
   agent <sub>            init | list | status | doctor | link | unlink (per-agent integration)
@@ -1228,6 +1232,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       case "daemon": {
         const { runDaemonCommand } = await import("./daemon.js");
         return await runDaemonCommand(a.positionals, ctx);
+      }
+      case "principal": {
+        const { runPrincipalCommand } = await import("./principal.js");
+        return await runPrincipalCommand(a.positionals, a.flags, ctx);
       }
       case "mcp": {
         const { runMcpServer } = await import("../mcp/server.js");

@@ -1,6 +1,8 @@
 import { MemoryService } from "../core/memoryService.js";
-import type { MemoryType } from "../core/types.js";
+import type { BriefResult, MemoryType, SearchResult } from "../core/types.js";
 import { resolveAgent, resolveRequestScope } from "../core/scope.js";
+import { MemoryClient } from "../cli/http.js";
+import { appVersion } from "../version.js";
 
 /**
  * `ai-memory inject` — the hook side of memory.
@@ -22,6 +24,15 @@ export interface InjectOptions {
   /** session-start | prompt-submit | stop | auto (default: sniff the payload). */
   mode?: string;
   db?: string;
+  /**
+   * Daemon base URL. P7 (ADR-0049) made this option live: with it set, the hook asks
+   * the daemon first and rides the same wire as the CLI — principal token included,
+   * because the client attaches it. Without it the hook opens the store in-process,
+   * exactly as it always has (a hook's boundary is the OS account it runs under; the
+   * daemon's token gate is about *cross*-account callers, and probing a daemon the
+   * caller never named would make every hook's colour depend on whatever happens to
+   * listen on :3000).
+   */
   server?: string;
   noDaemon?: boolean;
   budgetTokens?: number;
@@ -162,6 +173,63 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * The hook over the daemon (`--server`), P7 (ADR-0049). Same branches as the in-process
+ * body below — brief for a session start with nothing to query, sweep otherwise — served
+ * over the wire the CLI uses, principal token included (the client attaches it). Any
+ * refusal, mismatch or error answers `null` and the caller falls back to the store it
+ * can open in-process: a hook's first contract is that the user's turn never waits on
+ * or breaks for memory.
+ */
+async function daemonInjection(
+  opts: InjectOptions,
+  args: {
+    agent: string;
+    cwd: string | null;
+    query: string;
+    keywords: string[];
+    searchText: string;
+    namespaces: string[];
+  }
+): Promise<string | null> {
+  try {
+    const client = new MemoryClient(opts.server);
+    const health = await client.health();
+    if (!health?.ok) return null;
+    // The same stale-daemon guard the CLI applies: a daemon left from an older install
+    // answers /health happily while serving routes that may not exist yet.
+    if (health.version !== (await appVersion())) return null;
+
+    const budgetTokens = opts.budgetTokens ?? Number(process.env.AI_MEMORY_INJECT_BUDGET ?? 600);
+    if (!args.query && args.keywords.length === 0) {
+      const res = await client.get<BriefResult>(
+        "/brief" + MemoryClient.query({ namespaces: args.namespaces.join(","), budgetTokens })
+      );
+      if (res.ok && res.data.sections.some((s) => s.items.length > 0)) {
+        return renderBriefBlock(res.data.text, { agent: args.agent, cwd: args.cwd });
+      }
+      // Nothing filed (or an older route): fall through to the sweep, like the
+      // in-process body does.
+    }
+    const threshold = opts.threshold ?? Number(process.env.AI_MEMORY_INJECT_THRESHOLD ?? 0.25);
+    const res = await client.get<SearchResult>(
+      "/memories/search" +
+        MemoryClient.query({
+          query: args.searchText,
+          namespaces: args.namespaces.join(","),
+          k: opts.limit ?? 5,
+          budgetTokens,
+          threshold,
+        })
+    );
+    if (!res.ok) return null;
+    if (res.data.memories.length === 0) return "";
+    return renderBlock(res.data.memories, { agent: args.agent, cwd: args.cwd });
+  } catch {
+    return null;
+  }
+}
+
 /** The whole hook, minus process wiring, so it is unit-testable. */
 export async function buildInjection(opts: InjectOptions): Promise<string> {
   const raw = opts.stdin ?? (await readStdin());
@@ -174,6 +242,18 @@ export async function buildInjection(opts: InjectOptions): Promise<string> {
   const searchText = query || keywords.join(" ") || "*";
   const agent = resolveAgent(opts.agent);
   const { namespaces } = resolveRequestScope({ agent });
+
+  if (!opts.service && opts.server && !opts.noDaemon) {
+    const block = await daemonInjection(opts, {
+      agent,
+      cwd: payload.cwd,
+      query,
+      keywords,
+      searchText,
+      namespaces,
+    });
+    if (block !== null) return block;
+  }
 
   const svc = opts.service ?? new MemoryService({ dbPath: opts.db });
   if (!opts.service) await svc.init();

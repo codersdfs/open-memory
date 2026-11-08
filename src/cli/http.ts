@@ -4,7 +4,14 @@
  * The daemon stays the canonical writer. Every CLI/MCP operation tries it first and
  * silently falls back to an in-process store when it is not running, which is what
  * lets any agent use memory with no setup and still share state once the daemon is up.
+ *
+ * P7 (ADR-0049): every request this client sends carries the daemon's principal token
+ * (read once, lazily, from the memory home's `principal.key` — the same file the daemon
+ * binds). A missing file means no header, and the daemon's 401 names the path; this
+ * client never guesses a token and never sends one it did not read from disk.
  */
+
+import { PRINCIPAL_HEADER, readPrincipal } from "../core/principal.js";
 
 export type HttpResult<T> = { ok: true; data: T } | { ok: false; status: number; error: string };
 
@@ -42,13 +49,30 @@ export class MemoryClient {
     return this.baseUrl;
   }
 
+  /**
+   * The principal token for this process, read from the key file at most once. Memoized
+   * per instance: a hook or a CLI invocation issues a handful of calls against one
+   * daemon, and the file does not change under a running client (recover issues a new
+   * token, and the next process picks it up — the documented recovery contract).
+   */
+  private principalToken: string | null | undefined;
+
+  private async token(): Promise<string | null> {
+    if (this.principalToken !== undefined) return this.principalToken;
+    const principal = await readPrincipal();
+    return (this.principalToken = principal?.token ?? null);
+  }
+
   private async call<T>(method: string, path: string, body?: unknown): Promise<HttpResult<T>> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
     try {
+      const token = await this.token();
+      const headers: Record<string, string> = body === undefined ? {} : { "content-type": "application/json" };
+      if (token) headers[PRINCIPAL_HEADER] = token;
       const res = await fetch(this.baseUrl + path, {
         method,
-        headers: body === undefined ? {} : { "content-type": "application/json" },
+        headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: ctl.signal
       });
