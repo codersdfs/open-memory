@@ -265,13 +265,14 @@ export class InMemoryVectorStore implements VectorStore {
     if (m) { m.embedding = embedding; m.text = text; m.updatedAt = Date.now(); }
   }
 
-  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null }): Promise<Memory | null> {
+  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null }): Promise<Memory | null> {
     const m = this.map.get(id);
     if (!m) return null;
     if (patch.status !== undefined) m.status = patch.status as Memory["status"];
     if (patch.pin !== undefined) m.pin = patch.pin;
     if (patch.visibility !== undefined) m.visibility = patch.visibility as Memory["visibility"];
     if (patch.isDeleted !== undefined) m.isDeleted = patch.isDeleted;
+    if (patch.importance !== undefined) m.importance = patch.importance;
     if (patch.tags !== undefined) m.tags = patch.tags;
     if (patch.knowledgeId !== undefined) m.knowledgeId = patch.knowledgeId;
     if (patch.knowledgeSection !== undefined) m.knowledgeSection = patch.knowledgeSection;

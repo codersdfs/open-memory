@@ -1427,7 +1427,7 @@ export class SqliteVectorStore implements VectorStore {
     this.noteRewrite(id, embedding);
   }
 
-  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number }): Promise<Memory | null> {
+  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number }): Promise<Memory | null> {
     this.ensure();
     const fields: string[] = [];
     const vals: (string | number)[] = [];
@@ -1436,6 +1436,9 @@ export class SqliteVectorStore implements VectorStore {
     if (patch.visibility !== undefined) { fields.push("visibility = ?"); vals.push(patch.visibility); }
     // Restore support: `forget` is a soft delete, so un-forgetting is a flag flip.
     if (patch.isDeleted !== undefined) { fields.push("is_deleted = ?"); vals.push(patch.isDeleted); }
+    // Retroactive curation (ADR-0040 amendment 2026-11-08): triage sinks a stock
+    // row's rank through the same patch method, not a second write path.
+    if (patch.importance !== undefined) { fields.push("importance = ?"); vals.push(patch.importance); }
     // ADR-0023: a sync relabels an adopted pre-v0.7 row without re-embedding, so
     // tags and the two knowledge columns have to be patchable here.
     if (patch.tags !== undefined) { fields.push("tags = ?"); vals.push(JSON.stringify(patch.tags)); }

@@ -140,6 +140,9 @@ turns the whole verdict off.
   they name a kind — the same bargain `deriveKind` makes.
 - **No retroactive curation.** A `curate` pass over the existing 515 rows is a
   one-off audit, not a feature; the store does not silently rewrite its stock.
+  (Reversed 2026-11-08 by the user's decision, P3 of the memory-systems research —
+  see the Amendment below. The pass exists now, and "diff first" is what keeps it
+  from being silent.)
 - **Paraphrase dedup is still reconcile's job.** Curation decides existence,
   reconcile decides effect; the two stay separate verdicts on purpose, because
   the guards that make supersede safe (`episodic-no-delete`, `pinned-no-delete`)
@@ -147,3 +150,68 @@ turns the whole verdict off.
 - **The daemon applies this on restart.** A long-running daemon serves the code
   it booted with; the gate is live in every new process, MCP client, and CLI
   invocation that constructs a `MemoryService`.
+
+## Amendment (2026-11-08): retroactive curation exists now — `ai-memory triage`, diff first
+
+This record took two "the stock is never rewritten" positions, and both are now
+reversed by the same research (`docs/research/memory-systems-notes-2026-11-07.md`),
+one apiece:
+
+- **"`saveMany` kept curation off"** (Decision section) — reversed 2026-11-07 by
+  P1 (ADR-0018 amendment): the bulk path runs this same zero-network verdict per
+  row, skipping rejected lines instead of killing the batch. The inline note at
+  the end of the Decision section carries it.
+- **"No retroactive curation"** (the bullet above) — reversed 2026-11-08 by P3,
+  on the user's explicit decision (the research notes listed it as ⚖️ needing
+  sign-off; P1's reversal and this one were settled together). The verdict stops
+  being a write contract only: the stock gets the same judgement through
+  `ai-memory triage` (`src/core/lifecycle/triage.ts`), an explicit operator
+  command — never a silent rewrite, which is the part of the original decision
+  that survives unchanged.
+
+What shipped, in the order the command promises it:
+
+- **Diff first.** The default run writes nothing: it reports *would archive N /
+  would demote N / merge candidates M* with ids, classes and reasons as samples,
+  and `--apply` is the only mode that touches rows. The dry-run comparison in
+  `tests/triage.test.ts` is over every mutable column including `updated_at`, not
+  spot checks.
+- **Junk → archive, never a hard delete.** The seven hard classes flip
+  `status = archived` through `updateMeta` — the same reversible demotion decay's
+  default pass makes (ADR-0016); the row, its vector and its audit trail stay,
+  and `purgeDeleted` remains as unreachable from here as it is from the
+  scheduler.
+- **Weak classes → importance sinks, the row survives.** `progress` and
+  `self-narration` get the write-time explicit-write bargain: importance to 0.35
+  (`DEMOTE_IMPORTANCE`), kind untouched. A row already at or under the floor is
+  where the ladder would have put it, so it is neither written nor counted.
+- **`updateMeta` gained an `importance` patch — both stores.** The prerequisite
+  gap the research named (the patch had no way to move the judge's number) is
+  closed in `SqliteVectorStore` and `InMemoryVectorStore` alike; the SQLite path
+  keeps its trailing `noteChange`, so a demoted or archived row leaves every
+  decoded partition snapshot it sat in (ADR-0034) — pinned by a cache-counter
+  test, not assumed.
+- **The contracts outrank the regexes.** The pass skips durable kinds
+  (`decision`/`convention`/`gotcha` — ADR-0021, the same skip P2 preserved when
+  decay swapped to hotness), pinned rows (pin is the one explicit "keep this" —
+  ADR-0011), drafts (a governance state — ADR-0006), knowledge rows (an index of
+  a file, which the next sync would re-insert — ADR-0023), tombstones and rows
+  already archived. Only rows a read can still hand out are candidates.
+- **Merge is a report line, not an action.** Live rows sharing an `entity:*`
+  facet and the same `normalizeText` are listed as merge candidates in both
+  modes; picking a survivor rewrites identity, and that decision stays with
+  reconcile and its guards (ADR-0015), the same split the original "no
+  retroactive curation" bullet argued for — it was the *silence* it objected to
+  keeping, not the boundary itself.
+- **The judge's absence is counted, not recorded.** Live rows carrying no
+  `judged:*` tag are counted in-process (`unjudged`) — "the judge priced this row
+  low" and "the judge never ran" are indistinguishable after the fact (ADR-0041
+  stores unjudged rows untagged, fail-open), and whether a triage-visible tag
+  fixes that is ADR-0041's pending amendment (P5), deliberately not written here.
+
+Verified by `tests/triage.test.ts` (both stores: dry-run byte-identical; apply
+archives junk and idempotently re-reports zero; durable kinds, pin, draft,
+knowledge rows and tombstones unmoved; merge candidates listed and never merged;
+`updateMeta` importance on both stores plus the partition-cache invalidation) and
+by `tests/cli.test.ts` (dry-run prints the diff and writes nothing; `--apply`
+writes; the machine shape is stable under `--json`).

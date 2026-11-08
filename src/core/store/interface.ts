@@ -172,12 +172,16 @@ export interface VectorStore {
    * Patch the mutable metadata. `tags` and the knowledge columns are here because
    * a knowledge sync has to relabel an adopted pre-v0.7 row without re-embedding
    * it (ADR-0023) — the alternative was a second nearly identical method.
+   * `importance` is here because retroactive curation demotes a stock row's rank
+   * without re-judging it (ADR-0040 amendment 2026-11-08, `ai-memory triage`):
+   * the write-time ladder owns the value, triage only sinks an existing one.
    */
   updateMeta(id: string, patch: {
     status?: string;
     pin?: number;
     visibility?: string;
     isDeleted?: number;
+    importance?: number;
     tags?: string[];
     knowledgeId?: string | null;
     knowledgeSection?: string | null;

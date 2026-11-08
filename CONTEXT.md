@@ -76,6 +76,9 @@ _Avoid_: strength (the +0.02-per-use score), popularity, recency alone
 **Maintenance**: The daemon's scheduled sweep — `MEMORY_MAINTAIN_HOURS` (default 24, `0` off) fires the reversible pass from the server main entry, and `runScheduledDecay` takes no options bag, so the hard pass is unreachable from the trigger by signature. `store_meta` keeps `last_maintenance_at`, so an overdue store is caught up in the background at open instead of waiting an interval; no request blocks on a sweep and each pass logs to stderr (ADR-0016 amendment).
 _Avoid_: decay (the pass it runs), the `POST /decay` button (the human half), cron (this is not one)
 
+**Triage**: Retroactive curation over the stock — `ai-memory triage` runs the write-time `curate` verdict on every row the gates never saw, and by default *writes nothing*: the diff (would archive / would demote / merge candidates) is the product, `--apply` is the only writing mode, and nothing in it can hard-delete — junk leaves the pools by a status flip, weak rows sink to importance 0.35. Durable kinds, pinned rows, drafts, knowledge rows and tombstones are skipped; same-entity same-text rows are only *listed* as merge candidates (picking a survivor is reconcile's guarded decision). Reversed the "No retroactive curation" position of ADR-0040 on an explicit user decision, 2026-11-08 — the silence was the objection, not the boundary (ADR-0040 amendment).
+_Avoid_: backfill (nothing is re-embedded or re-judged by a model), cleanup (it deletes nothing), migration (no schema moves)
+
 **Projection**: Assembling a memory block from its most query-relevant lines — its best line, that line's neighbours, and the block's dated header — but only into budget left over after every whole row that fits has been placed. Projecting every block up front was measured to lose evidence (single-hop 55/70 → 43/70).
 _Avoid_: summarization, truncation, chunking
 

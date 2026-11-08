@@ -178,6 +178,45 @@ describe("ai-memory CLI", () => {
     expect(res.previousDim).toBe(res.dim);
   });
 
+  it("triage diffs the stock by default and only writes with --apply", () => {
+    // The write gate refuses junk on every path now, so the stock row a triage
+    // exists for has to come in through the documented escape hatch.
+    const seeded = run(["save", "| 网卡 | MediaTek Wi-Fi 6 | ✅ |", "--json"], db, { MEMORY_CURATE: "off" });
+    expect(seeded.code).toBe(0);
+    const { id } = JSON.parse(seeded.stdout) as { id: string };
+
+    const dry = run(["triage"], db);
+    expect(dry.code).toBe(0);
+    expect(dry.stdout).toContain("dry run — nothing written");
+    expect(dry.stdout).toContain("would archive 1");
+    expect(dry.stdout).toContain(`archive [${id}] (table-row)`);
+    // The dry run wrote nothing: the row is still active.
+    expect(run(["get", id], db).stdout).toContain("status: active");
+
+    const json = JSON.parse(run(["triage", "--json"], db).stdout) as {
+      applied: boolean;
+      archives: { id: string; reason: string }[];
+      merges: unknown[];
+      unjudged: number;
+    };
+    expect(json.applied).toBe(false);
+    expect(json.archives.map((c) => c.id)).toContain(id);
+    expect(json.archives[0]!.reason).toBe("table-row");
+
+    const applied = run(["triage", "--apply"], db);
+    expect(applied.code).toBe(0);
+    expect(applied.stdout).toContain("applied");
+    expect(applied.stdout).toContain("archived 1");
+    // A status flip, never a delete: readable, and reversible.
+    const after = run(["get", id], db).stdout;
+    expect(after).toContain("status: archived");
+    expect(after).not.toContain("deleted");
+
+    // Idempotent: the archived junk row is not proposed again.
+    const again = run(["triage"], db);
+    expect(again.stdout).toContain("would archive 0");
+  });
+
   it("lists and counts", () => {
     const list = run(["list", "--limit", "5", "--json"], db);
     expect(list.code).toBe(0);

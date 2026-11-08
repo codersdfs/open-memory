@@ -48,6 +48,9 @@ Memory
   meta <id>              --status active|draft|archived --pin 0|1
   stats                  counts per type for the resolved scope(s)
   decay                  apply lifecycle decay / pruning
+  triage                 retroactive curation over the stock (ADR-0040 amendment):
+                         dry-run diff by default — would archive / would demote /
+                         merge candidates; --apply writes. Never deletes.
   extract <text>         pull candidate memories out of free text and save them
   reembed                rewrite every stored vector with the current embedder
   knowledge              ls | show <id> | neighbors <id> | sync | link <from> <to>
@@ -648,6 +651,35 @@ async function cmdDecay(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
   return 0;
 }
 
+/**
+ * `ai-memory triage` — the retroactive half of the write contract (ADR-0040
+ * amendment 2026-11-08, P3 of the memory-systems research). Diff first: the
+ * default run writes nothing, `--apply` is the only mode that touches rows, and
+ * nothing here can hard-delete — junk leaves the pools by a status flip.
+ *
+ * In-process only, like `reembed` and `db compact`: there is no daemon route for
+ * it, and a whole-store sweep belongs to the operator's process. The daemon caveat
+ * is printed after an apply because the cache noteChange expired lives in *this*
+ * process, not the daemon's.
+ */
+async function cmdTriage(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const svc = await r.service();
+  const { runTriage, renderTriageReport } = await import("../core/lifecycle/triage.js");
+  const report = await runTriage(svc.store as never, { apply: flagBool(a, "apply") === true });
+  if (ctx.json) {
+    ctx.out(JSON.stringify(report, null, 2));
+  } else {
+    ctx.out(renderTriageReport(report));
+    if (report.applied && report.archives.length + report.demotions.length > 0) {
+      ctx.err(
+        "note: a daemon serving this store keeps its own decoded partitions — restart it " +
+        "(`ai-memory daemon restart`) so it serves the triaged rows, not cached ones."
+      );
+    }
+  }
+  return 0;
+}
+
 async function cmdExtract(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   const text = queryText(a, "text") ?? a.positionals.join(" ").trim();
   if (!text) {
@@ -1130,6 +1162,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdStats(runner, ctx, a);
       case "decay":
         return await cmdDecay(runner, ctx, a);
+      case "triage":
+        return await cmdTriage(runner, ctx, a);
       case "extract":
         return await cmdExtract(runner, ctx, a);
       case "reembed":
