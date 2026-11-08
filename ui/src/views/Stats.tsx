@@ -116,6 +116,10 @@ function FailedRows({ failed }: { failed: { id: string; error: string }[] }) {
 const PRESET_MODEL_ENV: Record<EmbeddingPreset['provider'], string | null> = {
   hash: null,
   openai: 'OPENAI_EMBED_MODEL',
+  // The model id is the endpoint's own (Ollama/LM Studio name their models); the
+  // console cannot guess it, so nothing is written and the server's preview names
+  // the variable when it is missing (ADR-0048).
+  'openai-local': null,
   nim: 'NIM_EMBED_MODEL',
 };
 
@@ -123,10 +127,14 @@ const PRESET_MODEL_ENV: Record<EmbeddingPreset['provider'], string | null> = {
  * The body `POST /embedding` takes is the environment-variable vocabulary, not a key: a
  * preset becomes `EMBEDDING_PROVIDER` + `EMBEDDING_DIM` + the provider's model variable.
  * `EMBEDDING_DIM` is always sent — the write is a patch, and a width left over from the
- * previous provider would be the one field that could make the next start refuse.
+ * previous provider would be the one field that could make the next start refuse — with
+ * one exception: `dim === 0` (openai-local) is the preset saying "no width of its own",
+ * so the field is omitted and the user's `EMBEDDING_DIM` setting decides; the server
+ * previews the patch and names the variable when it is missing.
  */
 function presetPatch(p: EmbeddingPreset): Record<string, string> {
-  const patch: Record<string, string> = { EMBEDDING_PROVIDER: p.provider, EMBEDDING_DIM: String(p.dim) };
+  const patch: Record<string, string> = { EMBEDDING_PROVIDER: p.provider };
+  if (p.dim > 0) patch.EMBEDDING_DIM = String(p.dim);
   const modelEnv = PRESET_MODEL_ENV[p.provider];
   if (modelEnv !== null && p.model !== null) patch[modelEnv] = p.model;
   return patch;
@@ -368,8 +376,14 @@ function EmbeddingsCard() {
                       className="mono"
                       style={{ display: 'block', fontSize: 11, color: 'var(--dim)', fontVariantNumeric: 'tabular-nums' }}
                     >
-                      {p.model ?? '—'} · {p.dim}d
+                      {p.model ?? '—'} · {p.dim > 0 ? `${p.dim}d` : 'set EMBEDDING_DIM'}
                     </span>
+                    {p.provider === 'openai-local' ? (
+                      <span style={{ display: 'block', marginTop: 2, fontSize: 11, color: 'var(--dim)', lineHeight: 1.5 }}>
+                        local OpenAI-compatible endpoint (Ollama, LM Studio): set OPENAI_BASE_URL, OPENAI_EMBED_MODEL and
+                        EMBEDDING_DIM in Settings first. key optional — empty sends no Authorization header.
+                      </span>
+                    ) : null}
                     {missingKey ? (
                       <span style={{ display: 'block', marginTop: 2, fontSize: 11, color: 'var(--warn)' }}>
                         needs {p.keyEnv} in the environment, not here

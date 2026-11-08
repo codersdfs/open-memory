@@ -368,10 +368,15 @@ export const api = {
 
 /** One entry of `GET /embedding`'s `presets` — the factory's own defaults (ticket 015 D3). */
 export interface EmbeddingPreset {
-  provider: "hash" | "openai" | "nim";
-  /** The environment variable this provider needs, **by name**; `null` for `hash`. */
+  provider: 'hash' | 'openai' | 'openai-local' | 'nim';
+  /**
+   * The environment variable this provider reads, **by name**; `null` when none is
+   * needed — which since ADR-0048 covers `hash` (no credential exists) and
+   * `openai-local` (a key is optional: empty sends no Authorization header).
+   */
   keyEnv: string | null;
   model: string | null;
+  /** `0` for `openai-local`: the endpoint's model decides, so `EMBEDDING_DIM` is a user setting. */
   dim: number;
 }
 

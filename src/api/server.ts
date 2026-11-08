@@ -1102,5 +1102,19 @@ if (runsAsMain) {
   // no request ever waits on a sweep. This block is the daemon too: `daemon
   // restart` execs exactly this file.
   const { startMaintenance } = await import("../core/lifecycle/maintenance.js");
-  startMaintenance(service.store);
+  startMaintenance(service.store, {
+    // P8 (ADR-0048): the bucket refresh rides the P2 scheduler — same serialized
+    // chain, after the reversible decay, its own ≥10% threshold deciding the work.
+    // The service returns null when MEMORY_BUCKET_PREFILTER is off (the default),
+    // which the hook logs as nothing.
+    refreshBuckets: () => service.refreshBucketSummaries()
+  });
+  // P8 (ADR-0048): warm the summaries at boot, so enabling the flag takes one
+  // restart rather than one restart plus up to a full maintenance interval of
+  // full scans. The refresh's own thresholds make this a no-op — zero embed
+  // calls — when every summary is already fresh; a failure costs one stderr
+  // line, and the searches it would have served were full scans anyway.
+  void service.refreshBucketSummaries().catch((e: unknown) => {
+    console.error(`ai-memory buckets: boot warm failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
 }

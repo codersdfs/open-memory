@@ -6,6 +6,21 @@ import type { KnowledgeCapability, ProjectSummary, VectorStore } from "./interfa
 import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CAP, PINNED_ORDER_DF } from "./interface.js";
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { PartitionCache, type PartitionRow, type PartitionVectors } from "./partitionCache.js";
+import {
+  BUCKET_ABSTRACT_ROWS,
+  accumulateCentroid,
+  addToCentroid,
+  boundCanReachFloor,
+  bucketScanBound,
+  bucketScanOrder,
+  buildAbstract,
+  bucketPrefilterEnabled,
+  BUCKET_RADIUS_SLACK,
+  finishCentroid,
+  planBucketRefresh,
+  queryToCentroid,
+  type BucketRefreshReport,
+} from "./buckets.js";
 import { deriveKind } from "../write/kind.js";
 import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
@@ -381,6 +396,23 @@ export class SqliteVectorStore implements VectorStore {
   private static readonly CHANGE_LOG = 4096;
   /** Prepared once; `node:sqlite` statements are cheap to hold, expensive to rebuild per write. */
   private _eventStmt: any;
+  /**
+   * P8 (ADR-0048): whether writes mark their bucket pending. Snapshotted in init()
+   * because this sits on the hottest write path (`noteChange` runs for every row of
+   * every import) and a `process.env` read per write is real money on Windows; every
+   * `MEMORY_*` flag in this repo is a process-lifetime knob, and this one is no
+   * different — flipping it is a restart, like the provider switch.
+   */
+  private bucketWritesEnabled = false;
+  /**
+   * The per-search bucket-universe read, cached against the change log's seq (the
+   * same driver the partition cache replays). A search needs the set of projects the
+   * candidate population actually spans — data, not summaries — and a warm partition
+   * answers it from this field instead of a GROUP BY. Cleared outright by the rare
+   * sweeps that move membership without `noteChange` (rename/detach/prune/purge),
+   * which are the same sweeps that already clear the vector cache wholesale.
+   */
+  private bucketUniverse: { seq: number; key: string; projects: (string | null)[] } | null = null;
 
   constructor(dbPath = process.env.MEMORY_DB_PATH ?? "memory.db") {
     this.dbPath = dbPath;
@@ -665,11 +697,44 @@ export class SqliteVectorStore implements VectorStore {
       );
       CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events(memory_id);
     `);
+    // P8 (ADR-0048): the bucket summaries — one row per (namespace, project), the
+    // model-free abstract, the bucket's centroid geometry, and the drift counters.
+    // NOT memories: these rows never enter `list`, a search result, or any candidate
+    // pool — they are derived state like the postings, rebuilt by the maintenance
+    // pass and read only by the vector arm behind MEMORY_BUCKET_PREFILTER=on.
+    // `project` uses '' for the unscoped backlog (the `memories.project IS NULL`
+    // rows) because a PRIMARY KEY over a nullable column would let two NULL rows
+    // coexist; the mapping lives at the two boundaries (bucketKeyOf / projectOfKey).
+    // `embedding` is the bucket's unit centroid (mean row direction), `cos_theta` the
+    // covering radius of that cap — together they bound every cosine the bucket's
+    // rows can reach, which is what the prefilter's skip rule reads. The summary is
+    // written in two shapes: a refresh writes abstract+geometry+counters; a write's
+    // pending bump (noteChange) upserts a placeholder with no embedding — both are
+    // "stale" to the search path, and stale is the safe state (full scan, never a
+    // skip).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_buckets (
+        namespace TEXT NOT NULL,
+        project TEXT NOT NULL,
+        abstract TEXT NOT NULL DEFAULT '',
+        dim INTEGER NOT NULL DEFAULT 0,
+        embedding BLOB,
+        norm REAL NOT NULL DEFAULT 0,
+        cos_theta REAL NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        pending INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (namespace, project)
+      );
+    `);
     this.backfillTerms();
     this.backfillFacets();
     this.rebuildTermDfIfEmpty();
     this.migrateVectors();
     this.ready = true;
+    // P8 (ADR-0048): the pending marker is write-path state, so the flag is read once
+    // per open — the same one-per-process reading every constructor-time knob uses.
+    this.bucketWritesEnabled = bucketPrefilterEnabled();
   }
 
   /**
@@ -798,6 +863,94 @@ export class SqliteVectorStore implements VectorStore {
     // Precise marking: only the partitions that actually held the row lose their
     // decoded data. A blanket clear would make the cache useless under a write burst.
     this.vectors.dropRow(id);
+    this.bucketUniverse = null;
+    // P8 (ADR-0048): one write marks its bucket pending, so the prefilter treats the
+    // bucket as summary-less until the next refresh — a row written moments ago is
+    // scanned, never skipped (the ADR-0026 "written moments ago" rule, held at the
+    // write path instead of an index update). One statement, upsert: the placeholder
+    // it can create carries no embedding, which the search reads as stale → full
+    // scan for that bucket. Off unless the feature is on: with the prefilter off
+    // this adds nothing to any write, and the table stays empty.
+    if (this.bucketWritesEnabled) this.markBucketPending(id);
+  }
+
+  /** `''` encodes the unscoped backlog in the bucket key (the PK column is NOT NULL). */
+  private static bucketKeyOf(project: string | null | undefined): string {
+    return project ?? "";
+  }
+
+  private static projectOfKey(key: string): string | null {
+    return key === "" ? null : key;
+  }
+
+  /**
+   * The predicate that selects one bucket's rows inside a candidate WHERE. The
+   * unscoped arm matches the empty-string project too — a defensive `OR` no current
+   * writer can trigger (`normalizeProject` slugs `""` to null) but the key mapping
+   * folds that value into the unscoped bucket, so the scan must fold with it.
+   */
+  private static bucketWhere(project: string | null): string {
+    return project === null ? "(m.project IS NULL OR m.project = '')" : "m.project = ?";
+  }
+
+  /**
+   * Mark one row's bucket pending (P8, ADR-0048). The bucket is read off the row —
+   * `noteChange` is the single choke point every write path already passes, and its
+   * callers mostly hold only the id. One primary-key seek plus one upsert, the same
+   * order of cost as the history event a write already records; a purged id finds no
+   * row and marks nothing (nothing of it remains to scan).
+   */
+  private markBucketPending(id: string): void {
+    try {
+      const row = this.db.prepare(`SELECT namespace, project FROM memories WHERE id = ?`).get(id) as
+        | { namespace: string; project: string | null }
+        | undefined;
+      if (!row) return;
+      this.db
+        .prepare(
+          `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, total, pending, updated_at)
+           VALUES (?, ?, '', 0, NULL, 0, 0, 1, 0)
+           ON CONFLICT(namespace, project) DO UPDATE SET pending = pending + 1`
+        )
+        .run(row.namespace, SqliteVectorStore.bucketKeyOf(row.project));
+    } catch (err) {
+      // A pending marker must never fail a write that already committed. The marker
+      // only costs freshness (the bucket scans in full until it lands), and warnOnce
+      // keeps a broken marker from flooding an import's output.
+      warnOnce(
+        "bucket-pending",
+        `bucket pending marker failed (search falls back to full scans): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /** The projects the candidate population spans — data, not summaries (a missing summary must be visible). */
+  private bucketUniverseProjects(whereSql: string, params: (string | number)[]): (string | null)[] {
+    // The key carries the bound values, not just the clause text: two partitions share
+    // a WHERE string (`namespace = ?`), and a cache keyed on the text alone would hand
+    // one partition's buckets to another.
+    const key = `${whereSql}|${JSON.stringify(params)}`;
+    if (this.bucketUniverse && this.bucketUniverse.seq === this.changeSeq && this.bucketUniverse.key === key) {
+      return this.bucketUniverse.projects;
+    }
+    // The CASE folds a (never-writable) '' project into the unscoped bucket, the same
+    // fold `bucketKeyOf` applies on the write side.
+    const projects = (
+      this.db
+        .prepare(
+          `SELECT DISTINCT CASE WHEN m.project IS NULL OR m.project = '' THEN NULL ELSE m.project END AS project
+             FROM memories m WHERE ${whereSql}`
+        )
+        .all(...(params as any)) as { project: string | null }[]
+    ).map((r) => r.project);
+    this.bucketUniverse = { seq: this.changeSeq, key, projects };
+    return projects;
+  }
+
+  /** Invalidate the bucket state the rare sweeps strand (see the call sites). */
+  private dropBucketsWhere(clause: string, ...params: (string | number)[]): void {
+    this.db.prepare(`DELETE FROM memory_buckets WHERE ${clause}`).run(...(params as any));
+    this.bucketUniverse = null;
   }
 
   /**
@@ -1227,6 +1380,152 @@ export class SqliteVectorStore implements VectorStore {
         .prepare(`INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
         .run(key, value)
     );
+  }
+
+  /**
+   * Bucket summary refresh (P8, ADR-0048). The threshold decision is `planBucketRefresh`
+   * (shared with the in-memory store). The summary itself is local compute over the
+   * vectors the store already holds — the unit centroid of the bucket's row
+   * directions plus the smallest radius that covers them all (`finishCentroid`) —
+   * and the abstract is `buildAbstract` over the newest live rows. No embedder: a
+   * refresh never makes a network call, and the geometry is in the same space the
+   * rows are by construction.
+   */
+  async refreshBucketSummaries(opts: { now?: number } = {}): Promise<BucketRefreshReport> {
+    this.ensure();
+    const now = opts.now ?? Date.now();
+    const universe = this.db
+      .prepare(
+        `SELECT namespace,
+                CASE WHEN project IS NULL OR project = '' THEN NULL ELSE project END AS project,
+                COUNT(*) AS total
+           FROM memories
+          WHERE is_deleted = 0 AND status = 'active'
+          GROUP BY namespace, CASE WHEN project IS NULL OR project = '' THEN NULL ELSE project END`
+      )
+      .all() as { namespace: string; project: string | null; total: number }[];
+    const existingRows = this.db
+      .prepare(`SELECT namespace, project, dim, total, pending FROM memory_buckets`)
+      .all() as { namespace: string; project: string; dim: number; total: number; pending: number }[];
+    const existing = new Map(existingRows.map((r) => [`${r.namespace}\u0000${r.project}`, r]));
+    const planned = planBucketRefresh(
+      universe.map((u) => ({ key: `${u.namespace}\u0000${SqliteVectorStore.bucketKeyOf(u.project)}`, total: u.total })),
+      new Map(
+        [...existing].map(([key, r]) => [key, { dim: r.dim, total: r.total, pending: r.pending }])
+      ),
+      await this.storedDim()
+    );
+
+    // Dropped first: a summary whose bucket holds no live row is a phantom that would
+    // spend scan time ranking rows no scan can return.
+    for (const key of planned.dropped) {
+      const [namespace, project] = key.split("\u0000");
+      await this.retryWrite(() =>
+        this.db.prepare(`DELETE FROM memory_buckets WHERE namespace = ? AND project = ?`).run(namespace, project)
+      );
+    }
+
+    const targets = universe.filter(
+      (u) => planned.targets.includes(`${u.namespace}\u0000${SqliteVectorStore.bucketKeyOf(u.project)}`)
+    );
+    const currentDim = await this.storedDim();
+    let refreshed = 0;
+    for (const t of targets) {
+      // The abstract: newest live rows, deterministically — the sample the refresh
+      // can cite (kept in the table for diagnostics, never ranked on).
+      const rows = this.db
+        .prepare(
+          `SELECT text FROM memories m
+            WHERE m.namespace = ? AND ${SqliteVectorStore.bucketWhere(t.project)}
+              AND m.is_deleted = 0 AND m.status = 'active'
+            ORDER BY m.created_at DESC, m.id ASC
+            LIMIT ?`
+        )
+        .all(...(t.project === null ? [t.namespace] : [t.namespace, t.project]), BUCKET_ABSTRACT_ROWS) as {
+        text: string;
+      }[];
+      // The geometry: every live row's direction, meaned. Rows at a foreign width
+      // (an interrupted reembed) are excluded here exactly as the search path
+      // excludes them, so the radius covers precisely the rows a scan can score.
+      if (currentDim === null) continue;
+      const vectors = this.db
+        .prepare(
+          `SELECT v.vec AS vec, v.dim AS dim FROM memories m JOIN memory_vectors v ON v.memory_id = m.id
+            WHERE m.namespace = ? AND ${SqliteVectorStore.bucketWhere(t.project)}
+              AND m.is_deleted = 0 AND m.status = 'active'`
+        )
+        .all(...(t.project === null ? [t.namespace] : [t.namespace, t.project])) as { vec: Buffer; dim: number }[];
+      const usable = vectors.filter((r) => r.dim === currentDim).map((r) => unpackVector(r.vec));
+      if (usable.length === 0) continue; // nothing scannable — leave the summary absent
+      const acc = accumulateCentroid(currentDim);
+      for (const vec of usable) addToCentroid(acc, vec);
+      const geo = finishCentroid(acc, 1);
+      // The radius: the smallest centroid-to-row cosine, against the finished
+      // centroid — the true cap the bound consumes.
+      let cosTheta = 1;
+      for (const vec of usable) cosTheta = Math.min(cosTheta, queryToCentroid(vec, geo.centroid, geo.norm));
+      await this.retryWrite(() =>
+        this.db
+          .prepare(
+            `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, cos_theta, total, pending, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+             ON CONFLICT(namespace, project) DO UPDATE SET
+               abstract = excluded.abstract, dim = excluded.dim, embedding = excluded.embedding,
+               norm = excluded.norm, cos_theta = excluded.cos_theta, total = excluded.total,
+               pending = 0, updated_at = excluded.updated_at`
+          )
+          .run(
+            t.namespace,
+            SqliteVectorStore.bucketKeyOf(t.project),
+            buildAbstract(rows.map((r) => r.text)),
+            geo.centroid.length,
+            packVector(geo.centroid),
+            geo.norm,
+            Math.max(-1, cosTheta - BUCKET_RADIUS_SLACK),
+            t.total,
+            now
+          )
+      );
+      refreshed++;
+    }
+    return { refreshed, skipped: planned.skipped, dropped: planned.dropped.length, total: universe.length };
+  }
+
+  /** The summary rows without their embedding bytes — the read side for tests and diagnostics. */
+  async bucketSummaries() {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT namespace, project, dim, total, pending, embedding, updated_at FROM memory_buckets`)
+      .all() as {
+      namespace: string;
+      project: string;
+      dim: number;
+      total: number;
+      pending: number;
+      embedding: Buffer | null;
+      updated_at: number;
+    }[];
+    return rows.map((r) => ({
+      namespace: r.namespace,
+      project: SqliteVectorStore.projectOfKey(r.project),
+      dim: r.dim,
+      total: r.total,
+      pending: r.pending,
+      hasEmbedding: r.embedding !== null && r.embedding.length > 0,
+      updatedAt: r.updated_at
+    }));
+  }
+
+  /**
+   * Drop every summary — `reembedAll`'s invalidation (P8, ADR-0048). A provider swap
+   * can keep the old width, so the dim check alone would leave old-model cosines
+   * ranking new-model queries; no summary is the safe state (full scans everywhere)
+   * until the next refresh rebuilds.
+   */
+  async dropBucketSummaries(): Promise<void> {
+    this.ensure();
+    await this.retryWrite(() => this.db.exec(`DELETE FROM memory_buckets`));
+    this.bucketUniverse = null;
   }
 
   async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
@@ -1672,19 +1971,32 @@ export class SqliteVectorStore implements VectorStore {
     // Identity moved, vectors did not: snapshots keyed by the old project (or the
     // new one) answer the wrong membership. Rare sweep, so the prune precedent
     // applies — one clear instead of reading ids back to mark precisely.
-    if (res.changes > 0) this.vectors.clear();
+    if (res.changes > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): the move also changed which bucket every row belongs to, and
+      // it did not pass noteChange (renames deliberately leave updated_at alone).
+      // Both slugs' summaries go: a missing summary is the safe state — the next
+      // search scans those buckets in full, and the next refresh rebuilds.
+      this.dropBucketsWhere("project IN (?, ?)", from, to);
+    }
     return res.changes;
   }
 
   async forgetProject(slug: string, opts: { mode: "detach" | "delete" }): Promise<{ detached: number; deleted: number }> {
     this.ensure();
     if (opts.mode === "detach") {
-      const res = await this.retryWrite(() =>
-        this.db.prepare(`UPDATE memories SET project = NULL WHERE project = ?`).run(slug)
-      );
-      if (res.changes > 0) this.vectors.clear();
-      return { detached: res.changes, deleted: 0 };
+    const res = await this.retryWrite(() =>
+      this.db.prepare(`UPDATE memories SET project = NULL WHERE project = ?`).run(slug)
+    );
+    if (res.changes > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): detach moves every row into the unscoped bucket without
+      // noteChange — same rare-sweep clear as the rename above.
+      this.dropBucketsWhere("project = ?", slug);
+      this.dropBucketsWhere("project = ?", "");
     }
+    return { detached: res.changes, deleted: 0 };
+  }
     // Soft delete, like `deleteSoft` per row: the audit trail stays restorable.
     // Tombstones are left as they are — they already left every candidate pool.
     const res = await this.retryWrite(() =>
@@ -1692,7 +2004,12 @@ export class SqliteVectorStore implements VectorStore {
         .prepare(`UPDATE memories SET is_deleted = 1, updated_at = ? WHERE project = ? AND is_deleted = 0`)
         .run(Date.now(), slug)
     );
-    if (res.changes > 0) this.vectors.clear();
+    if (res.changes > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): the project's rows just left every candidate pool; its summary
+      // would rank a phantom bucket until the next refresh. Same sweep clear.
+      this.dropBucketsWhere("project = ?", slug);
+    }
     return { detached: 0, deleted: res.changes };
   }
 
@@ -1917,19 +2234,22 @@ export class SqliteVectorStore implements VectorStore {
     this.ensure();
     const { whereSql, params } = candidateWhere(opts, "m");
     const q = opts.queryEmbedding;
-    if (this.q8Enabled()) {
-      const hit = this.vectorSearchQ8(whereSql, params, q, opts.limit);
-      if (hit) return hit;
+    // P8 (ADR-0048): the bucket prefilter, before the exact scan. It answers with the
+    // same rows the full scan would (each bucket scan applies the full candidate WHERE
+    // plus its own project predicate; the union's top-`limit` over per-bucket top-`limit`
+    // lists is the global top-`limit`), so this is a cost path, not a semantics one.
+    // Any incapability — feature off, no summaries, undiscriminating summaries, a scan
+    // set that covers everything — falls through to the exact path unchanged.
+    if (bucketPrefilterEnabled()) {
+      const hit = this.vectorSearchBucketed(opts, whereSql, params, q, opts.limit);
+      if (hit !== null) return hit;
     }
     const qf = new Float32Array(q);
     let qn = 0;
     for (let i = 0; i < q.length; i++) qn += q[i] * q[i];
     qn = Math.sqrt(qn);
 
-    const partition = this.partitionVectors(whereSql, params, q.length);
-    const { top, vecs } = partition
-      ? topFromPartition(partition, qf, qn, opts.limit)
-      : this.scanPartition(whereSql, params, qf, qn, opts.limit);
+    const { top, vecs } = this.scanCandidates(whereSql, params, qf, qn, opts.limit);
     const byId = this.fetchByIds(top.map((s) => s.id));
     return top.flatMap((s, i) => {
       const row = byId.get(s.id);
@@ -1938,6 +2258,149 @@ export class SqliteVectorStore implements VectorStore {
       // The scan already had this vector in hand; reading it back would be a second
       // trip for data the caller (MMR) genuinely needs.
       memory.embedding = Array.from(vecs[i]);
+      return [{ memory, vectorScore: s.vectorScore }];
+    });
+  }
+
+  /**
+   * One exact scan over a resolved candidate WHERE — the body `vectorSearch` has run
+   * since ADR-0017, factored out so the bucket prefilter can run it per bucket (P8,
+   * ADR-0048). Same two-phase shape, same partition cache (keyed by the bucket-scoped
+   * WHERE, so each bucket's decode warms separately), same int8 shortlist when
+   * MEMORY_Q8 asks for it: the prefilter narrows *which* rows are scanned, never how
+   * a row is scored.
+   */
+  private scanCandidates(
+    whereSql: string,
+    params: (string | number)[],
+    qf: Float32Array,
+    qn: number,
+    limit: number
+  ): { top: { id: string; vectorScore: number }[]; vecs: Float32Array[] } {
+    if (this.q8Enabled()) {
+      const hit = this.vectorSearchQ8(whereSql, params, Array.from(qf), limit);
+      if (hit) {
+        // Same shape as the float path's return; the vectors came back attached to
+        // the memories, so they are lifted out of the hit rather than re-read.
+        return {
+          top: hit.map((h) => ({ id: h.memory.id, vectorScore: h.vectorScore })),
+          vecs: hit.map((h) => new Float32Array(h.memory.embedding)),
+        };
+      }
+    }
+    const partition = this.partitionVectors(whereSql, params, qf.length);
+    return partition ? topFromPartition(partition, qf, qn, limit) : this.scanPartition(whereSql, params, qf, qn, limit);
+  }
+
+  /**
+   * The bucket prefilter itself (P8, ADR-0048). Per bucket, an UPPER bound on the
+   * cosine any of its rows can reach with the query — `bucketScanBound` over the
+   * bucket's centroid and its covering radius. Walk the buckets best-bound first,
+   * merging each one's top-`limit` into the result; stop at the first bucket whose
+   * bound cannot reach the current floor. A skipped bucket provably holds no row
+   * that could enter the top-`limit`, so the returned list is the exact scan's list
+   * (up to the BUCKET_BOUND_EPS slack, which is float-noise sized, and to the order
+   * of exact ties — see the ADR). Returns `null` for the plain exact scan whenever
+   * there is nothing to save: one bucket, no summaries yet.
+   *
+   * The universe comes from the DATA (`bucketUniverseProjects`), never from the
+   * summary table — a bucket with no summary is stale and scanned in full, never
+   * skipped. Per-bucket scans reuse `scanCandidates`, so a warm bucket costs the
+   * partition-cache hit ADR-0029 measured, not a re-decode.
+   */
+  private vectorSearchBucketed(
+    opts: {
+      namespace: string;
+      queryEmbedding: number[];
+      includeDeleted?: boolean;
+      status?: string;
+      includeArchived?: boolean;
+      includeDraft?: boolean;
+    },
+    whereSql: string,
+    params: (string | number)[],
+    q: number[],
+    limit: number
+  ): { memory: Memory; vectorScore: number }[] | null {
+    // P8 exactness guard (independent review, 2026-11-08): the summaries describe
+    // the DEFAULT population — `is_deleted = 0 AND status = 'active'`, which is what
+    // refreshBucketSummaries' universe, abstract and geometry queries all read. A
+    // search over a wider one (tombstones via includeDeleted, archived or draft rows
+    // via the include flags, any explicit status slice) ranks buckets by caps that do
+    // not cover those rows' directions, and a skip there drops true top hits — found
+    // by review probe: an archived row was the exact scan's top-1 and ABSENT from the
+    // prefiltered result. The contract is "cost time, never rows", so a wider
+    // population falls back to the plain exact scan. Narrower filters (type, kind,
+    // project, knowledge, facet) need no guard: a cap over a superset still bounds
+    // every subset of it.
+    if (opts.status !== undefined || opts.includeDeleted || opts.includeArchived || opts.includeDraft) {
+      return null;
+    }
+    const summaries = this.db
+      .prepare(`SELECT project, dim, embedding, norm, cos_theta, total, pending FROM memory_buckets WHERE namespace = ?`)
+      .all(opts.namespace) as {
+      project: string;
+      dim: number;
+      embedding: Buffer | null;
+      norm: number;
+      cos_theta: number;
+      total: number;
+      pending: number;
+    }[];
+    if (summaries.length === 0) return null; // never warmed — one tiny read, then the exact path
+
+    const qf = new Float32Array(q);
+    let qn = 0;
+    for (let i = 0; i < q.length; i++) qn += q[i] * q[i];
+    qn = Math.sqrt(qn);
+
+    const byKey = new Map(summaries.map((s) => [SqliteVectorStore.bucketKeyOf(s.project), s]));
+    const universe = this.bucketUniverseProjects(whereSql, params);
+    if (universe.length < 2) return null; // one bucket is the exact scan already
+
+    // Stale = no summary, no embedding yet (a write's placeholder), a summary at
+    // another width, a degenerate (zero-norm) centroid, or a bucket with writes
+    // since its refresh. All of these scan in full; none of them is ever skipped.
+    const fresh: { key: string; bound: number }[] = [];
+    const stale: string[] = [];
+    for (const project of universe) {
+      const key = SqliteVectorStore.bucketKeyOf(project);
+      const s = byKey.get(key);
+      if (!s || s.embedding === null || s.dim !== q.length || s.norm <= 0 || s.pending > 0) {
+        stale.push(key);
+        continue;
+      }
+      const a = queryToCentroid(q, unpackVector(s.embedding), s.norm);
+      fresh.push({ key, bound: bucketScanBound(a, s.cos_theta) });
+    }
+    const order = bucketScanOrder(fresh, stale);
+
+    // Walk. The merged list is re-sorted per bucket so the floor is always the
+    // limit-th best score seen; `limit` is ≤ overFetch (20), so this is cheap next
+    // to any scan.
+    const merged: { id: string; vectorScore: number; vec: Float32Array }[] = [];
+    let floor = Number.NEGATIVE_INFINITY;
+    for (const step of order) {
+      if (merged.length >= limit && !boundCanReachFloor(step.bound, floor)) break;
+      const project = SqliteVectorStore.projectOfKey(step.key);
+      const bucketWhere = `${whereSql} AND ${SqliteVectorStore.bucketWhere(project)}`;
+      const bucketParams = project === null ? params : [...params, project];
+      const { top, vecs } = this.scanCandidates(bucketWhere, bucketParams, qf, qn, limit);
+      for (let i = 0; i < top.length; i++) merged.push({ ...top[i], vec: vecs[i] });
+      if (merged.length > 0) {
+        merged.sort((a, z) => z.vectorScore - a.vectorScore || (a.id < z.id ? -1 : a.id > z.id ? 1 : 0));
+        if (merged.length > limit) merged.length = limit;
+        floor = merged[merged.length - 1]!.vectorScore;
+      }
+    }
+    const top = merged.slice(0, limit);
+    if (top.length === 0) return [];
+    const byId = this.fetchByIds(top.map((s) => s.id));
+    return top.flatMap((s) => {
+      const row = byId.get(s.id);
+      if (!row) return [];
+      const memory = memoryFromRow(row);
+      memory.embedding = Array.from(s.vec);
       return [{ memory, vectorScore: s.vectorScore }];
     });
   }
@@ -2527,7 +2990,14 @@ export class SqliteVectorStore implements VectorStore {
     // bug ADR-0035 fixed for single writes, and it cannot be fixed the same way —
     // prune returns a count, not the ids, and it is a rare sweep (decay, the daemon),
     // so dropping every decoded partition once is cheaper than reading the ids back.
-    if (pruned > 0) this.vectors.clear();
+    if (pruned > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): the sweep also shrank buckets without noteChange. Summaries go
+      // wholesale, per the same precedent — a full scan until the next refresh is the
+      // correct answer, and the next refresh rebuilds only what it finds.
+      await this.retryWrite(() => this.db.exec(`DELETE FROM memory_buckets`));
+      this.bucketUniverse = null;
+    }
     return pruned;
   }
 
@@ -2583,6 +3053,10 @@ export class SqliteVectorStore implements VectorStore {
       this.vectors.clear();
       this.changes.length = 0;
       this.changeSeq++;
+      // P8 (ADR-0048): same sweep shape — the summaries go with the rows that fed
+      // them, and the next refresh rebuilds from what is left.
+      await this.retryWrite(() => this.db.exec(`DELETE FROM memory_buckets`));
+      this.bucketUniverse = null;
     }
     return purged;
   }

@@ -75,6 +75,16 @@ export interface StartMaintenanceOptions {
   intervalMs?: number;
   now?: () => number;
   log?: (line: string) => void;
+  /**
+   * P8 (ADR-0048): the bucket-summary refresh, run after the reversible decay on the
+   * same serialized chain. The service owns the embedder, so the step arrives as a
+   * callback and returns null when the feature is off — the common case, which then
+   * costs this pass nothing but one call. Its own ≥10% threshold decides the work,
+   * so running it every tick is cheap by construction, and a thrown refresh lands in
+   * the same catch a failed decay does: one stderr line, the chain survives, the
+   * next tick retries.
+   */
+  refreshBuckets?: () => Promise<unknown>;
 }
 
 /**
@@ -109,6 +119,16 @@ export function startMaintenance(store: VectorStore, opts: StartMaintenanceOptio
       .then(async () => {
         if (stopped) return;
         await runMaintenancePass(store, { now, log });
+        // P8 (ADR-0048): after the decay, on the same chain — a refresh never runs
+        // concurrently with a sweep. The ≥10% threshold inside makes a no-op cheap;
+        // the report is logged only when it did work.
+        const report = await opts.refreshBuckets?.();
+        if (report && typeof report === "object" && "refreshed" in report) {
+          const r = report as { refreshed: number; skipped: number; dropped: number };
+          if (r.refreshed > 0 || r.dropped > 0) {
+            log(`ai-memory buckets: refreshed ${r.refreshed}, skipped ${r.skipped}, dropped ${r.dropped}`);
+          }
+        }
       })
       .catch((err) => {
         // One line, and the chain survives: a rejected link is how a scheduled

@@ -1,6 +1,8 @@
 import "../config.js";
 import type { EmbeddingProvider } from "./embedding/provider.js";
 import { createEmbeddingProvider } from "./embedding/index.js";
+import type { BucketRefreshReport } from "./store/buckets.js";
+import { bucketPrefilterEnabled } from "./store/buckets.js";
 import type { ProjectSummary, VectorStore } from "./store/interface.js";
 import { HybridRetriever } from "./retrieval/hybrid.js";
 import type { ChainView, Memory, MemoryInput, SearchOptions, SearchResult } from "./types.js";
@@ -959,5 +961,21 @@ export class MemoryService {
       }
     }
     return { memories: saved, rejected };
+  }
+
+  /**
+   * Refresh the bucket summaries (P8, ADR-0048) — the maintenance pass's second step.
+   *
+   * The feature flag is checked here, not in the store: `MEMORY_BUCKET_PREFILTER=off`
+   * (the default) must cost nothing anywhere — no writes, no table growth — and the
+   * store has no business re-reading the env per call. The refresh itself needs no
+   * embedder (the summary is the bucket's own centroid, computed from stored
+   * vectors), so this is pure local work when it runs. `null` says "not running"
+   * back, which the scheduler logs as nothing and the boot warm treats the same way.
+   */
+  async refreshBucketSummaries(): Promise<BucketRefreshReport | null> {
+    if (!bucketPrefilterEnabled()) return null;
+    if (typeof this.store.refreshBucketSummaries !== "function") return null;
+    return this.store.refreshBucketSummaries();
   }
 }

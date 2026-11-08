@@ -158,12 +158,17 @@ describe("previewEmbedding", () => {
 });
 
 describe("EMBEDDING_PRESETS", () => {
-  it("lists hash, openai, nim in that order, from the factory's own defaults", () => {
-    expect(EMBEDDING_PRESETS.map((p) => p.provider)).toEqual(["hash", "openai", "nim"]);
-    expect(EMBEDDING_PRESETS.map((p) => p.dim)).toEqual([384, 1536, 2048]);
+  it("lists hash, openai, openai-local, nim in that order, from the factory's own defaults", () => {
+    expect(EMBEDDING_PRESETS.map((p) => p.provider)).toEqual(["hash", "openai", "openai-local", "nim"]);
+    // dim 0 is the openai-local sentinel: a local endpoint has no width of its own,
+    // EMBEDDING_DIM is a user setting (ADR-0048).
+    expect(EMBEDDING_PRESETS.map((p) => p.dim)).toEqual([384, 1536, 0, 2048]);
     expect(EMBEDDING_PRESETS[0]!.keyEnv).toBeNull();
     expect(EMBEDDING_PRESETS[1]!.keyEnv).toBe("OPENAI_API_KEY");
-    expect(EMBEDDING_PRESETS[2]!.keyEnv).toBe("NVIDIA_API_KEY");
+    // The local preset needs no key by construction — that is the whole difference
+    // between it and the hosted openai row beside it.
+    expect(EMBEDDING_PRESETS[2]!.keyEnv).toBeNull();
+    expect(EMBEDDING_PRESETS[3]!.keyEnv).toBe("NVIDIA_API_KEY");
     // A preset with its key in the environment builds exactly what the preset claims.
     expect(previewEmbedding({ EMBEDDING_PROVIDER: "openai", OPENAI_API_KEY: "k" })).toMatchObject({
       provider: "openai",

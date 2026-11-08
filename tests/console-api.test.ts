@@ -308,7 +308,10 @@ describe("embedding switch", () => {
     expect(info.live).toEqual({ provider: "hash", dim: 384, model: null, source: "default" });
     expect(info.target).toEqual({ provider: "hash", dim: 384, model: null });
     expect(info.needsRestart).toBe(false);
-    expect(info.presets.map((p) => p.provider)).toEqual(["hash", "openai", "nim"]);
+    // The local preset (ADR-0048) rides the same route: no key requirement, so it is
+    // never disabled for a missing credential the way the hosted rows are.
+    expect(info.presets.map((p) => p.provider)).toEqual(["hash", "openai", "openai-local", "nim"]);
+    expect(info.presets.find((p) => p.provider === "openai-local")!.keyEnv).toBeNull();
     expect(info.keys.find((k) => k.env === "OPENAI_API_KEY")?.present).toBe(false);
     expect(info.stored.byVectorDim).toEqual({ "384": 1 });
     expect(info.stored.unreadable).toBe(0);

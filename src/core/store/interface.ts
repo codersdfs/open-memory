@@ -1,6 +1,23 @@
 import type { ChainView, KnowledgeEdge, Memory, MemoryEvent, MemoryInput, WriteEventMeta } from "../types.js";
+import type { BucketRefreshReport } from "./buckets.js";
 
 export type { ChainView, KnowledgeEdge, MemoryEvent };
+
+/**
+ * One bucket summary (P8, ADR-0048) as a read reports it — the mirror of a
+ * `memory_buckets` row without its embedding bytes. `project` is the slug or `null`
+ * for the unscoped backlog; `hasEmbedding` is false for a placeholder row a write
+ * created before any refresh pass reached it.
+ */
+export interface BucketSummaryInfo {
+  namespace: string;
+  project: string | null;
+  dim: number;
+  total: number;
+  pending: number;
+  hasEmbedding: boolean;
+  updatedAt: number;
+}
 
 /**
  * Lexical candidate hygiene at scale (ADR-0019), shared by both stores so their
@@ -336,6 +353,34 @@ export interface VectorStore {
    */
   getMeta?(key: string): Promise<string | null>;
   setMeta?(key: string, value: string): Promise<void>;
+
+  /**
+   * Rebuild the (namespace, project) bucket summaries whose drift crossed the refresh
+   * threshold (P8, ADR-0048): missing or stale-dim summaries and small buckets always,
+   * larger ones only when the pending share reached `BUCKET_REFRESH_RATIO` (0.10,
+   * OpenViking's freshness ratio). Needs NO embedder — the summary is the bucket's
+   * own centroid (mean row direction) plus the radius that covers every row, both
+   * read from the vectors already stored — so a refresh is pure local compute and
+   * the summary is always in the same space the queries are (a provider swap
+   * re-embeds the rows and drops the summaries with them).
+   *
+   * Called from the P2 maintenance pass (after the reversible decay, same serialized
+   * chain) and once at daemon boot when `MEMORY_BUCKET_PREFILTER=on`. Optional like
+   * every late capability: a store without it keeps compiling, and the service then
+   * reports the feature as unavailable instead of pretending.
+   */
+  refreshBucketSummaries?(opts?: { now?: number }): Promise<BucketRefreshReport>;
+
+  /** Every summary row, for tests and diagnostics — no embedding bytes, just the shape. */
+  bucketSummaries?(): Promise<BucketSummaryInfo[]>;
+
+  /**
+   * Drop every summary (P8, ADR-0048). `reembedAll` is the only caller: a provider swap
+   * can keep the old width (1536 → another 1536-d model), and a dim check alone would
+   * then serve old-model summary cosines against new-model queries. Dropped summaries
+   * are the safe state — every bucket scans in full until the next refresh rebuilds.
+   */
+  dropBucketSummaries?(): Promise<void>;
 
   /**
    * Reclaim file space. `prune` is a soft delete: the row, its postings and its

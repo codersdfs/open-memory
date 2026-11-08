@@ -102,5 +102,20 @@ export async function reembedAll(
     opts.onProgress?.(Math.min(i + batchSize, rows.length), rows.length);
   }
 
+  // P8 (ADR-0048): the bucket summaries are embeddings of abstracts from the OLD
+  // model. A width change is caught by the search path's dim check, but a swap that
+  // keeps the width (1536 -> another 1536-d model) would leave old-model cosines
+  // ranking new-model queries while every summary "looked fresh". Dropping them is
+  // the safe state — every bucket scans in full until the next maintenance refresh
+  // rebuilds them with the new provider. Best-effort: a store without the capability
+  // predates the feature, and a failed drop costs freshness, never correctness.
+  if (result.rewritten > 0 && typeof store.dropBucketSummaries === "function") {
+    try {
+      await store.dropBucketSummaries();
+    } catch {
+      // The refresh pass rebuilds on its next tick either way.
+    }
+  }
+
   return result;
 }

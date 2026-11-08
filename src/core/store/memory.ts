@@ -8,9 +8,46 @@ import { deriveKind } from "../write/kind.js";
 import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
 import { median } from "../stats.js";
+import {
+  BUCKET_ABSTRACT_ROWS,
+  accumulateCentroid,
+  addToCentroid,
+  boundCanReachFloor,
+  bucketScanBound,
+  bucketScanOrder,
+  buildAbstract,
+  bucketPrefilterEnabled,
+  BUCKET_RADIUS_SLACK,
+  finishCentroid,
+  planBucketRefresh,
+  queryToCentroid,
+  type BucketRefreshReport,
+} from "./buckets.js";
+
+/** In-memory mirror of a `memory_buckets` row (P8, ADR-0048): the same shape, no BLOB. */
+interface BucketSummary {
+  namespace: string;
+  projectKey: string; // '' encodes the unscoped backlog, exactly as the SQL PK does
+  abstract: string;
+  dim: number;
+  /** The bucket's unit centroid; null for a write's placeholder (stale by definition). */
+  centroid: number[] | null;
+  norm: number;
+  cosTheta: number;
+  total: number;
+  pending: number;
+  updatedAt: number;
+}
 
 export class InMemoryVectorStore implements VectorStore {
   private map = new Map<string, Memory>();
+  /**
+   * The bucket summaries (P8, ADR-0048), mirror of the SQL `memory_buckets` table —
+   * maintained by the same call sites, decided by the same shared `buckets.ts`
+   * helpers, so a test that passes on one backend means the same thing on the other.
+   * Like the SQL rows, these never enter `list` or any result set.
+   */
+  private buckets = new Map<string, BucketSummary>();
   /**
    * The facet postings (P4, ADR-0046), mirror of the SQL `memory_facets` table keyed
    * the way its `memory_id` index reads it: one memory -> its facet values, lowercased
@@ -34,12 +71,147 @@ export class InMemoryVectorStore implements VectorStore {
   async init(): Promise<void> {}
   close(): void {}
 
+  /**
+   * The two bucket helpers (P8, ADR-0048), mirror of the SQL store's. The flag is
+   * read per write here rather than snapshotted: this store has no init() a caller
+   * is obliged to await, so there is no single moment the snapshot could hang on —
+   * and an in-memory write is a map set, where one `process.env` read is noise.
+   */
+  private get bucketWritesEnabled(): boolean {
+    return bucketPrefilterEnabled();
+  }
+
+  private static bucketKey(namespace: string, projectKey: string): string {
+    return `${namespace}\u0000${projectKey}`;
+  }
+
+  /**
+   * One write marks its bucket pending (the SQL `noteChange` tail, mirrored): the
+   * prefilter then treats the bucket as summary-less and scans it in full, so a row
+   * written moments ago is never skipped. The placeholder this can create carries no
+   * embedding — stale by construction, the safe state until the next refresh.
+   */
+  private markBucketPending(m: Memory): void {
+    if (!this.bucketWritesEnabled) return;
+    const projectKey = m.project ?? "";
+    const key = InMemoryVectorStore.bucketKey(m.namespace, projectKey);
+    const row = this.buckets.get(key);
+    if (row) row.pending++;
+    else
+      this.buckets.set(key, {
+        namespace: m.namespace,
+        projectKey,
+        abstract: "",
+        dim: 0,
+        centroid: null,
+        norm: 0,
+        cosTheta: 0,
+        total: 0,
+        pending: 1,
+        updatedAt: 0
+      });
+  }
+
+  /** Drop the summaries the rare sweeps strand (rename/detach/forget — no noteChange there). */
+  private dropBucketsFor(project: string | null): void {
+    const projectKey = project ?? "";
+    for (const [key, row] of this.buckets) {
+      if (row.projectKey === projectKey) this.buckets.delete(key);
+    }
+  }
+
   async getMeta(key: string): Promise<string | null> {
     return this.meta.get(key) ?? null;
   }
 
   async setMeta(key: string, value: string): Promise<void> {
     this.meta.set(key, value);
+  }
+
+  /**
+   * Bucket refresh (P8, ADR-0048), mirror of the SQL implementation over the same
+   * shared `planBucketRefresh` / `buildAbstract` / centroid helpers: the thresholds,
+   * the sampling, the geometry and the report have one implementation; only the
+   * plumbing differs. Needs no embedder — the centroid is the mean of the rows' own
+   * vectors, so a refresh is pure local compute.
+   */
+  async refreshBucketSummaries(opts: { now?: number } = {}): Promise<BucketRefreshReport> {
+    const now = opts.now ?? Date.now();
+    const universeRows = new Map<string, { namespace: string; projectKey: string; total: number; sample: Memory[] }>();
+    for (const m of this.map.values()) {
+      if (m.isDeleted !== 0 || m.status !== "active") continue;
+      const projectKey = m.project ?? "";
+      const key = InMemoryVectorStore.bucketKey(m.namespace, projectKey);
+      const bucket = universeRows.get(key);
+      if (bucket) {
+        bucket.total++;
+        bucket.sample.push(m);
+      } else {
+        universeRows.set(key, { namespace: m.namespace, projectKey, total: 1, sample: [m] });
+      }
+    }
+    const planned = planBucketRefresh(
+      [...universeRows.keys()].map((key) => ({ key, total: universeRows.get(key)!.total })),
+      new Map(
+        [...this.buckets.entries()].map(([key, r]) => [
+          key,
+          { dim: r.dim, total: r.total, pending: r.pending },
+        ])
+      ),
+      await this.storedDim()
+    );
+    for (const key of planned.dropped) this.buckets.delete(key);
+
+    const targets = [...universeRows.entries()].filter(([key]) => planned.targets.includes(key));
+    const currentDim = await this.storedDim();
+    let refreshed = 0;
+    for (const [key, bucket] of targets) {
+      if (currentDim === null) continue;
+      // Newest first, id as the tie-break — the same ORDER BY the SQL sample reads.
+      const rows = bucket.sample
+        .sort((a, z) => z.createdAt - a.createdAt || (a.id < z.id ? -1 : a.id > z.id ? 1 : 0))
+        .slice(0, BUCKET_ABSTRACT_ROWS);
+      const usable = bucket.sample.map((m) => m.embedding).filter((v) => v.length === currentDim);
+      if (usable.length === 0) continue; // nothing scannable — leave the summary absent
+      const acc = accumulateCentroid(currentDim);
+      for (const v of usable) addToCentroid(acc, v);
+      const geo = finishCentroid(acc, 1);
+      let cosTheta = 1;
+      for (const v of usable) cosTheta = Math.min(cosTheta, queryToCentroid(v, geo.centroid, geo.norm));
+      this.buckets.set(key, {
+        namespace: bucket.namespace,
+        projectKey: bucket.projectKey,
+        abstract: buildAbstract(rows.map((m) => m.text)),
+        dim: geo.centroid.length,
+        centroid: geo.centroid,
+        norm: geo.norm,
+        cosTheta: Math.max(-1, cosTheta - BUCKET_RADIUS_SLACK),
+        total: bucket.total,
+        pending: 0,
+        updatedAt: now
+      });
+      refreshed++;
+    }
+    return { refreshed, skipped: planned.skipped, dropped: planned.dropped.length, total: universeRows.size };
+  }
+
+  async bucketSummaries() {
+    return [...this.buckets.values()]
+      .map((r) => ({
+        namespace: r.namespace,
+        project: r.projectKey === "" ? null : r.projectKey,
+        dim: r.dim,
+        total: r.total,
+        pending: r.pending,
+        hasEmbedding: r.centroid !== null && r.centroid.length > 0,
+        updatedAt: r.updatedAt
+      }))
+      .sort((a, b) => a.namespace.localeCompare(b.namespace) || (a.project ?? "").localeCompare(b.project ?? ""));
+  }
+
+  /** Drop every summary (P8, ADR-0048) — `reembedAll`'s invalidation, same as the SQL store. */
+  async dropBucketSummaries(): Promise<void> {
+    this.buckets.clear();
   }
 
   /** Append one history row; the caller owns "same instant as the write". */
@@ -100,6 +272,7 @@ export class InMemoryVectorStore implements VectorStore {
     this.map.set(mem.id, mem);
     this.facetsByMemory.set(mem.id, facets);
     this.logEvent(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
+    this.markBucketPending(mem);
     return mem;
   }
 
@@ -241,6 +414,12 @@ export class InMemoryVectorStore implements VectorStore {
         moved++;
       }
     }
+    // P8 (ADR-0048): the move changed bucket membership without noteChange — drop
+    // both slugs' summaries, the same rare-sweep clear the SQL store does.
+    if (moved > 0) {
+      this.dropBucketsFor(from);
+      this.dropBucketsFor(to);
+    }
     return moved;
   }
 
@@ -258,6 +437,13 @@ export class InMemoryVectorStore implements VectorStore {
         m.updatedAt = now;
         deleted++;
       }
+    }
+    if (detached > 0) {
+      // P8: detach moves rows into the unscoped bucket — both summaries go.
+      this.dropBucketsFor(slug);
+      this.dropBucketsFor(null);
+    } else if (deleted > 0) {
+      this.dropBucketsFor(slug);
     }
     return { detached, deleted };
   }
@@ -321,7 +507,11 @@ export class InMemoryVectorStore implements VectorStore {
     // No history row, `invalid_at` stays NULL — same contract as the SQL store: a
     // plain forget is a tombstone, not one of the four write points.
     const m = this.map.get(id);
-    if (m) { m.isDeleted = 1; m.updatedAt = Date.now(); }
+    if (m) {
+      m.isDeleted = 1;
+      m.updatedAt = Date.now();
+      this.markBucketPending(m); // P8: the bucket's rows changed; scan it fully until refresh
+    }
   }
 
   async updateEmbedding(id: string, embedding: number[], text: string): Promise<void> {
@@ -372,6 +562,7 @@ export class InMemoryVectorStore implements VectorStore {
     if (patch.knowledgeId !== undefined) m.knowledgeId = patch.knowledgeId;
     if (patch.knowledgeSection !== undefined) m.knowledgeSection = patch.knowledgeSection;
     m.updatedAt = Date.now();
+    this.markBucketPending(m); // P8: status/visibility/restores change what the bucket's scan returns
     return m;
   }
 
@@ -389,6 +580,7 @@ export class InMemoryVectorStore implements VectorStore {
     old.isDeleted = 1;
     old.invalidAt = now;
     old.updatedAt = now;
+    this.markBucketPending(old); // P8: the predecessor left the pool (the successor marked via insert)
     this.logEvent(oldId, "supersede", now, {
       oldValue: old.text,
       newValue: created.text,
@@ -424,6 +616,14 @@ export class InMemoryVectorStore implements VectorStore {
     knowledge?: string | null;
     facet?: string;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
+    // P8 (ADR-0048): the prefilter, mirroring the SQL path. The candidate pool comes
+    // from `candidates(opts)` — the same population the exact scan ranks — and the
+    // prefilter only decides which buckets get their cosines computed; any
+    // incapability falls through to the full scan.
+    if (bucketPrefilterEnabled()) {
+      const hit = this.vectorSearchBucketed(opts);
+      if (hit !== null) return hit;
+    }
     const scored = this.candidates(opts).flatMap((memory) =>
       memory.embedding.length !== opts.queryEmbedding.length
         ? [] // stale width from an interrupted reembed: skip, do not throw
@@ -431,6 +631,72 @@ export class InMemoryVectorStore implements VectorStore {
     );
     scored.sort((a, b) => b.vectorScore - a.vectorScore);
     return scored.slice(0, opts.limit);
+  }
+
+  /**
+   * The bucketed scan (P8, ADR-0048), the SQL `vectorSearchBucketed` over maps:
+   * universe from the data (never from the summaries), stale buckets always scanned,
+   * the bound walk from the shared helpers — per bucket an upper bound on the cosine
+   * any of its rows can reach, walked best-bound first with an early stop at the
+   * floor. `null` = run the plain full scan.
+   */
+  private vectorSearchBucketed(opts: {
+    namespace: string;
+    queryEmbedding: number[];
+    limit: number;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+  }): { memory: Memory; vectorScore: number }[] | null {
+    // P8 exactness guard (independent review, 2026-11-08) — the InMemory mirror of
+    // the SQL store's: the summaries cover the DEFAULT population only
+    // (`is_deleted = 0 AND status = 'active'`), so a search over a wider one ranks
+    // buckets by caps that do not cover those rows and falls back to the exact scan
+    // rather than skip one. Narrower filters are safe: a cap over a superset still
+    // bounds the subset.
+    if (opts.status !== undefined || opts.includeDeleted || opts.includeArchived || opts.includeDraft) {
+      return null;
+    }
+    if (this.buckets.size === 0) return null;
+    const q = opts.queryEmbedding;
+    const groups = new Map<string, Memory[]>();
+    for (const m of this.candidates(opts)) {
+      if (m.embedding.length !== q.length) continue; // the exact path skips these too
+      const key = m.project ?? "";
+      const rows = groups.get(key);
+      if (rows) rows.push(m);
+      else groups.set(key, [m]);
+    }
+    if (groups.size < 2) return null; // one bucket is the exact scan already
+    const fresh: { key: string; bound: number }[] = [];
+    const stale: string[] = [];
+    for (const [key, rows] of groups) {
+      const s = this.buckets.get(InMemoryVectorStore.bucketKey(opts.namespace, key));
+      // Stale = no summary, no centroid yet (a write's placeholder), a summary at
+      // another width, a degenerate centroid, or writes since the refresh.
+      if (!s || s.centroid === null || s.dim !== q.length || s.norm <= 0 || s.pending > 0) {
+        stale.push(key);
+        continue;
+      }
+      fresh.push({ key, bound: bucketScanBound(queryToCentroid(q, s.centroid, s.norm), s.cosTheta) });
+    }
+    const order = bucketScanOrder(fresh, stale);
+
+    const merged: { memory: Memory; vectorScore: number }[] = [];
+    let floor = Number.NEGATIVE_INFINITY;
+    for (const step of order) {
+      if (merged.length >= opts.limit && !boundCanReachFloor(step.bound, floor)) break;
+      for (const memory of groups.get(step.key) ?? []) {
+        merged.push({ memory, vectorScore: cosineSimilarity(q, memory.embedding) });
+      }
+      if (merged.length > 0) {
+        merged.sort((a, b) => b.vectorScore - a.vectorScore || (a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0));
+        if (merged.length > opts.limit) merged.length = opts.limit;
+        floor = merged[merged.length - 1]!.vectorScore;
+      }
+    }
+    return merged;
   }
 
   /**
@@ -578,6 +844,7 @@ export class InMemoryVectorStore implements VectorStore {
         if (opts.type && m.type !== opts.type) continue;
         m.isDeleted = 1;
         m.updatedAt = Date.now();
+        this.markBucketPending(m); // P8: mirror of the SQL sweep's summary invalidation
         n++;
       }
     }
