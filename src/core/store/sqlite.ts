@@ -7,6 +7,7 @@ import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CA
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { PartitionCache, type PartitionRow, type PartitionVectors } from "./partitionCache.js";
 import { deriveKind } from "../write/kind.js";
+import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
 import { median } from "../stats.js";
 
@@ -593,6 +594,23 @@ export class SqliteVectorStore implements VectorStore {
         n INTEGER NOT NULL
       );
     `);
+    // P4 (ADR-0046): the facet index, the join-key half of `tags`. Same shape as
+    // `memory_terms` — a posting list keyed by the joined value, maintained by the
+    // same code paths in the same transactions — because it answers the same kind of
+    // question ("which rows share this key") and inherits the same crash property:
+    // a row and its facets commit together or not at all. `namespace` is carried
+    // denormalized so "same entity, this partition" (the P5 conflict window) is one
+    // indexed seek without a join; the candidate query still joins `memories` for
+    // the rest of its filters, exactly as the lexical arm does.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_facets (
+        facet TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        PRIMARY KEY (facet, memory_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_facets_memory ON memory_facets(memory_id);
+    `);
     // 5. knowledge links (ADR-0023). A row per written link, not per resolved edge:
     // a target that resolves only when a second page is created has to be visible
     // as debt (to_id NULL), and `target` is what tells an editor which line to fix.
@@ -636,6 +654,7 @@ export class SqliteVectorStore implements VectorStore {
       CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events(memory_id);
     `);
     this.backfillTerms();
+    this.backfillFacets();
     this.rebuildTermDfIfEmpty();
     this.migrateVectors();
     this.ready = true;
@@ -890,6 +909,21 @@ export class SqliteVectorStore implements VectorStore {
   }
 
   /**
+   * Replace this row's facet postings (P4, ADR-0046). Caller owns the transaction —
+   * every call site sits inside the same BEGIN/COMMIT as the write that moved the
+   * tags, so a row whose facets drifted from its tags can only come from a writer
+   * that bypassed this file, never from a crash. Values are lowercased: derived
+   * facets are already slugs, and a caller-supplied `entity:Foo` joins `entity:foo`.
+   */
+  private indexFacetsSync(id: string, namespace: string, tags: string[] | undefined): void {
+    this.db.prepare(`DELETE FROM memory_facets WHERE memory_id = ?`).run(id);
+    const facets = facetTagsOf(tags);
+    if (facets.length === 0) return;
+    const stmt = this.db.prepare(`INSERT OR IGNORE INTO memory_facets (facet, memory_id, namespace) VALUES (?, ?, ?)`);
+    for (const facet of facets) stmt.run(facet.toLowerCase(), id, namespace);
+  }
+
+  /**
    * `term_df` is the document frequency of every token, kept next to the postings
    * (ADR-0019). Counting it with `GROUP BY token` per search meant scanning the
    * postings of every query word — on a 10k-row store that was 103 ms per search,
@@ -944,6 +978,64 @@ export class SqliteVectorStore implements VectorStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of missing) this.indexTermsSync(row.id, row.text);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+      throw err;
+    }
+  }
+
+  /**
+   * Self-heal for rows whose tags hold facets but whose `memory_facets` postings are
+   * missing (P4, ADR-0046) — rows written before the index existed, or by a writer
+   * that bypassed these code paths. Same `NOT EXISTS` anti-join shape as
+   * `backfillTerms`, for the same reason: no marker row to forget, so a crashed
+   * write is repaired on the next open instead of one memory being unfindable by
+   * its entity forever.
+   *
+   * Two differences from `backfillTerms`, and both come from one fact: a ZERO-FACET
+   * row is common (casual prose legitimately derives nothing), where a zero-term row
+   * is rare. (1) A zero-facet row is a *permanent* member of this anti-join — it will
+   * never earn postings — so a LIMIT on the scan itself would let the first 5,000 of
+   * them shadow an injured row further down the table on every open, and the self-heal
+   * would silently die exactly on the chat-heavy stores this index matters for. The
+   * scan is therefore chunked by rowid and runs to exhaustion (or to the write cap);
+   * the 5,000 bounds what ONE open *repairs*, never what it *evaluates*, and only an
+   * actual repair consumes the budget. (2) Zero-facet rows are skipped before the
+   * write transaction opens, so the steady state is a scan per open and no write —
+   * not a permanent no-op transaction.
+   */
+  private backfillFacets(): void {
+    const scan = this.db.prepare(
+      `SELECT m.rowid AS rid, m.id AS id, m.namespace AS namespace, m.tags AS tags
+         FROM memories m
+        WHERE m.rowid > ? AND NOT EXISTS (SELECT 1 FROM memory_facets f WHERE f.memory_id = m.id)
+        ORDER BY m.rowid
+        LIMIT 5000`
+    );
+    const repairable: { id: string; namespace: string; tags: string[] | undefined }[] = [];
+    let cursor = 0;
+    for (;;) {
+      const rows = scan.all(cursor) as { rid: number; id: string; namespace: string; tags: string | null }[];
+      if (rows.length === 0) break;
+      cursor = rows[rows.length - 1]!.rid;
+      for (const row of rows) {
+        let tags: string[] | undefined;
+        try {
+          tags = row.tags ? (JSON.parse(row.tags) as string[]) : undefined;
+        } catch {
+          tags = undefined; // a foreign writer's malformed JSON is not ours to fix here
+        }
+        if (facetTagsOf(tags).length === 0) continue; // no facets, no postings, no budget spent
+        repairable.push({ id: row.id, namespace: row.namespace, tags });
+        if (repairable.length >= 5000) break;
+      }
+      if (repairable.length >= 5000) break;
+    }
+    if (repairable.length === 0) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of repairable) this.indexFacetsSync(row.id, row.namespace, row.tags);
       this.db.exec("COMMIT");
     } catch (err) {
       try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
@@ -1141,6 +1233,10 @@ export class SqliteVectorStore implements VectorStore {
       try {
         this.runInsert(stmt, mem);
         this.indexTermsSync(mem.id, mem.text);
+        // The facet postings ride the same transaction (P4, ADR-0046): a row whose
+        // entity landed in memory_facets while its row rolled back — or the reverse —
+        // would join the wrong memories together, which is worse than not joining.
+        this.indexFacetsSync(mem.id, mem.namespace, mem.tags);
         this.writeVectorSync(mem.id, embedding);
         this.insertEventSync(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
         this.db.exec("COMMIT");
@@ -1174,6 +1270,10 @@ export class SqliteVectorStore implements VectorStore {
         for (let i = 0; i < made.length; i++) {
           this.runInsert(stmt, made[i]);
           this.indexTermsSync(made[i].id, made[i].text);
+          // Same-transaction facet postings (P4, ADR-0046), one statement per row
+          // exactly like the terms above — the bulk path is not a second class of
+          // index consistency.
+          this.indexFacetsSync(made[i].id, made[i].namespace, made[i].tags);
           this.writeVectorSync(made[i].id, items[i].embedding);
           // One event per row, same transaction as the batch (P6, ADR-0045): a bulk
           // import that left no history would be the one write nobody could audit.
@@ -1591,7 +1691,7 @@ export class SqliteVectorStore implements VectorStore {
   async updateEmbedding(id: string, embedding: number[], text: string): Promise<void> {
     this.ensure();
     const stmt = this.db.prepare(
-      `UPDATE memories SET embedding = '', text = ?, text_hash = ?, valid_at = ?, updated_at = ? WHERE id = ?`
+      `UPDATE memories SET embedding = '', text = ?, text_hash = ?, tags = ?, valid_at = ?, updated_at = ? WHERE id = ?`
     );
     // `reembed` can arrive with different text; the posting list has to follow or
     // lexical search keeps matching the words the row used to have. The vector row
@@ -1599,12 +1699,27 @@ export class SqliteVectorStore implements VectorStore {
     // duplicate hash and the event-time clock, which both describe this row's text
     // now, not the one it had (valid_at recomputes from the new text; no match
     // leaves it NULL — a date the text no longer states is a date it no longer has).
+    //
+    // P4 (ADR-0046): the facets follow the text too. They were derived from the
+    // sentence the row used to be, so a rewritten row re-derives them — the caller's
+    // plain tags survive (`rederiveTags`), the `entity:`/`topic:`/`path:` values move
+    // to what the new text states — and the tags column and the facet postings are
+    // rewritten together, which is what keeps the invariant (facet postings == the
+    // row's facet tags) true on this path instead of only at insert time.
     await this.retryWrite(() => {
       this.db.exec("BEGIN IMMEDIATE");
       try {
-        stmt.run(text, textHash(text), extractValidAt(text), Date.now(), id);
-        const row = this.db.prepare(`SELECT rowid AS r FROM memories WHERE id = ?`).get(id) as { r: number } | undefined;
+        const row = this.db.prepare(`SELECT namespace, tags FROM memories WHERE id = ?`).get(id) as
+          | { namespace: string; tags: string | null }
+          | undefined;
+        if (!row) {
+          this.db.exec("COMMIT");
+          return; // nothing to update — same contract as the old UPDATE matching zero rows
+        }
+        const tags = rederiveTags(row.tags ? (JSON.parse(row.tags) as string[]) : undefined, text);
+        stmt.run(text, textHash(text), JSON.stringify(tags), extractValidAt(text), Date.now(), id);
         this.indexTermsSync(id, text);
+        this.indexFacetsSync(id, row.namespace, tags);
         this.writeVectorSync(id, embedding);
         this.db.exec("COMMIT");
       } catch (err) {
@@ -1644,6 +1759,13 @@ export class SqliteVectorStore implements VectorStore {
     if (fields.length === 0) return this.getById(id);
     fields.push("updated_at = ?"); vals.push(Date.now());
     const stmt = this.db.prepare(`UPDATE memories SET ${fields.join(", ")} WHERE id = ?`);
+    // A tags patch rewrites the row's join keys (P4, ADR-0046): the knowledge sync's
+    // relabel and P5's conflict marker both arrive here, so the facet postings are
+    // replaced in the same transaction as the tags column — a relabel that committed
+    // while the postings still named the old facets would hand the facet arm (and
+    // P5's same-entity lookups) rows the tags no longer describe. Every branch below
+    // that can carry a tags field therefore reindexes; a patch without one keeps the
+    // bare single-statement shape it had.
     if (patch.status === "archived") {
       // The archive write point (P6, ADR-0045): the flip and its history row commit
       // together. The prior status has to be read inside the same transaction — an
@@ -1655,7 +1777,9 @@ export class SqliteVectorStore implements VectorStore {
       await this.retryWrite(() => {
         this.db.exec("BEGIN IMMEDIATE");
         try {
-          const row = this.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(id) as { status: string | null } | undefined;
+          const row = this.db.prepare(`SELECT status, namespace FROM memories WHERE id = ?`).get(id) as
+            | { status: string | null; namespace: string }
+            | undefined;
           stmt.run(...vals, id);
           if (row && row.status !== null && row.status !== "archived") {
             this.insertEventSync(id, "archive", now, {
@@ -1664,6 +1788,22 @@ export class SqliteVectorStore implements VectorStore {
               reason: meta?.reason ?? null
             });
           }
+          if (row && patch.tags !== undefined) this.indexFacetsSync(id, row.namespace, patch.tags);
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+          throw err;
+        }
+      });
+    } else if (patch.tags !== undefined) {
+      await this.retryWrite(() => {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          const row = this.db.prepare(`SELECT namespace FROM memories WHERE id = ?`).get(id) as
+            | { namespace: string }
+            | undefined;
+          stmt.run(...vals, id);
+          if (row) this.indexFacetsSync(id, row.namespace, patch.tags);
           this.db.exec("COMMIT");
         } catch (err) {
           try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
@@ -1703,6 +1843,10 @@ export class SqliteVectorStore implements VectorStore {
       try {
         this.runInsert(stmt, created);
         this.indexTermsSync(created.id, created.text);
+        // The successor's facet postings commit with it (P4, ADR-0046): its tags
+        // carry the facets inherited from the row it replaced, and the version
+        // chain reads as one entity only while every link in it is indexed.
+        this.indexFacetsSync(created.id, created.namespace, created.tags);
         this.writeVectorSync(created.id, newEmbedding);
         this.insertEventSync(created.id, "insert", now, { newValue: created.text, reason: newInput.source ?? null });
         this.db.prepare(`UPDATE memories SET is_deleted = 1, invalid_at = ?, updated_at = ? WHERE id = ?`).run(now, now, oldId);
@@ -2146,6 +2290,67 @@ export class SqliteVectorStore implements VectorStore {
     return memories.map((memory, i) => ({ memory, lexicalScore: scores[i] }));
   }
 
+  /**
+   * Facet candidates (P4, ADR-0046): rows whose stored tags share at least one of the
+   * given facets, most shared facets first. Read from the postings, not the partition —
+   * the same ADR-0033 shape `lexicalCandidates` uses: seek `memory_facets` by facet
+   * value, join `memories` once per hit for the visibility filters, group and cap. The
+   * facet values arrive already derived (`deriveFacets` on the query, or a caller's
+   * own list for P5), lowercased here because that is how `indexFacetsSync` stores them.
+   */
+  async facetCandidates(opts: {
+    namespace: string;
+    facets: string[];
+    limit: number;
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
+  }): Promise<{ memory: Memory; sharedFacets: string[] }[]> {
+    this.ensure();
+    const facets = [...new Set(opts.facets.map((f) => String(f ?? "").toLowerCase()).filter((f) => f.length > 0))];
+    if (facets.length === 0 || opts.limit <= 0) return [];
+    const { whereSql, params } = candidateWhere(opts, "m");
+    const marks = facets.map(() => "?").join(", ");
+    // GROUP BY over the posting lists: a facet held by a popular entity can have
+    // thousands of postings, but the ranked head is what the LIMIT keeps, and the
+    // count is one integer per candidate row. Ties break by id, like every other
+    // ranked read here — the same query must answer the same way twice.
+    const rows = this.db
+      .prepare(
+        `SELECT f.memory_id AS id, COUNT(*) AS shared
+           FROM memory_facets f
+           JOIN memories m ON m.id = f.memory_id AND ${whereSql}
+          WHERE f.facet IN (${marks})
+          GROUP BY f.memory_id
+          ORDER BY shared DESC, id ASC
+          LIMIT ?`
+      )
+      .all(...(params as any), ...(facets as any), opts.limit) as { id: string; shared: number }[];
+    if (rows.length === 0) return [];
+    const byId = this.fetchByIds(rows.map((r) => r.id));
+    const wanted = new Set(facets);
+    const out: { memory: Memory; sharedFacets: string[] }[] = [];
+    for (const r of rows) {
+      const row = byId.get(r.id);
+      if (!row) continue;
+      const memory = memoryFromRow(row);
+      // The intersection comes from the row's own tags, not from the postings: the
+      // tags column is the source the invariant pins the table to, and reporting
+      // what the postings counted would report the index rather than the row.
+      const sharedFacets = facetTagsOf(memory.tags)
+        .map((t) => t.toLowerCase())
+        .filter((t) => wanted.has(t));
+      out.push({ memory, sharedFacets: [...new Set(sharedFacets)] });
+    }
+    this.attachVectors(out.map((o) => o.memory));
+    return out;
+  }
+
   /** df of each query token, from `term_df`. */
   private postingsDocumentFrequencies(tokens: string[]): { token: string; n: number }[] {
     return this.db
@@ -2325,6 +2530,9 @@ export class SqliteVectorStore implements VectorStore {
         this.db.exec("BEGIN IMMEDIATE");
         try {
           this.db.prepare(`DELETE FROM memory_terms WHERE memory_id IN (${marks})`).run(...(ids as any));
+          // The facet postings are derived state like the terms above — a purged row
+          // must not keep joining anything (P4, ADR-0046).
+          this.db.prepare(`DELETE FROM memory_facets WHERE memory_id IN (${marks})`).run(...(ids as any));
           this.db.prepare(`DELETE FROM memory_vectors WHERE memory_id IN (${marks})`).run(...(ids as any));
           this.db.prepare(`DELETE FROM memories WHERE id IN (${marks})`).run(...(ids as any));
           // `memory_events` is deliberately not in this list (P6, ADR-0045): the

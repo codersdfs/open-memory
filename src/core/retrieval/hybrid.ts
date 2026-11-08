@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { bm25Score, tokenize, type Bm25CorpusStats } from "./bm25.js";
 import { coverage, coverageWeighted, indexTerms, queryTerms } from "./terms.js";
+import { deriveFacets, facetTagsOf } from "../write/facets.js";
 import { assembleFragment } from "./assemble.js";
 import { mmr } from "./mmr.js";
 import { budgetEnforce, countTokens } from "./tokens.js";
@@ -100,7 +101,7 @@ function clipToTokens(text: string, max: number, tokens: number): string {
 }
 
 export interface RetrievalConfig {
-  weights?: { vector: number; bm25: number; recency: number; strength: number };
+  weights?: { vector: number; bm25: number; recency: number; strength: number; entity?: number };
   recencyHalfLifeDays?: number;
   mmrLambda?: number;
 }
@@ -120,6 +121,14 @@ type Scored = {
    * count as three quarters of an answer.
    */
   coverageWeightedScore: number;
+  /**
+   * The share of the query's own facets the row holds (P4, ADR-0046), from the same
+   * `deriveFacets` the write path built the row's tags with. Orders (through
+   * `w.entity`, default 0) and is reported in the breakdown; it never gates — a
+   * facet-only candidate still has to clear the same relevance gate as everything
+   * else, which is what keeps the third arm from being a free channel.
+   */
+  entityScore: number;
   recencyScore: number;
   score: number;
   breakdown: ScoreBreakdown;
@@ -152,7 +161,7 @@ interface SearchOneResult {
 }
 
 export class HybridRetriever {
-  private weights: { vector: number; bm25: number; recency: number; strength: number };
+  private weights: { vector: number; bm25: number; recency: number; strength: number; entity: number };
   private halfLifeDays: number;
   private mmrLambda: number;
   /** How far the best vector hit must lead its partition's median cosine to count. */
@@ -161,6 +170,13 @@ export class HybridRetriever {
   private assembleEnabled: boolean;
   /** Second lexical pass on the seeds' shared terms (ADR-0028). */
   private prfEnabled: boolean;
+  /**
+   * The third candidate arm (P4, ADR-0046). Off by default, like PRF before it and
+   * for the same discipline: the arm widens the candidate pool, and ADR-0028 measured
+   * what a wider pool does to a fixed 800-token budget before. `MEMORY_LINKS=on` opts
+   * in; the measurement that decides whether it ever flips is the evidence ruler.
+   */
+  private linksEnabled: boolean;
   constructor(
     private store: VectorStore,
     private embedder: EmbeddingProvider,
@@ -175,14 +191,22 @@ export class HybridRetriever {
     const vectorWeight = envWeight === undefined
       ? (embedder.name === "hash" ? 0 : 0.6)
       : Number(envWeight);
-    this.weights = config.weights ?? {
-      vector: Number.isFinite(vectorWeight) ? vectorWeight : 0,
-      bm25: 0.6,
-      recency: 0.25,
-      // Reads `strength`, which starts at the judge's importance and grows with
-      // use (R2). The field name is the contract: this term must not be fed the
-      // write-time number, or reinforcement would have no effect on ranking.
-      strength: 0.15
+    this.weights = {
+      ...(config.weights ?? {
+        vector: Number.isFinite(vectorWeight) ? vectorWeight : 0,
+        bm25: 0.6,
+        recency: 0.25,
+        // Reads `strength`, which starts at the judge's importance and grows with
+        // use (R2). The field name is the contract: this term must not be fed the
+        // write-time number, or reinforcement would have no effect on ranking.
+        strength: 0.15
+      }),
+      // The entity term exists to be measurable (it is in the breakdown), not to
+      // rank: default 0 means the facet arm can only change results through the
+      // gate, the same way the lexical arm's rows do — never through a boost
+      // nobody asked for. mem0's entity boost is the cautionary tale here
+      // (bench/REPORT.md: 14.5% overall, 6% multi-hop on this repo's bench).
+      entity: config.weights?.entity ?? 0
     };
     this.halfLifeDays = config.recencyHalfLifeDays ?? 30;
     this.mmrLambda = config.mmrLambda ?? 0.6;
@@ -197,6 +221,7 @@ export class HybridRetriever {
     // Opt-in (ADR-0028): measured net-negative on the LoCoMo audit — merged rows
     // crowd a fixed budget — so the second pass runs only when asked for.
     this.prfEnabled = process.env.MEMORY_PRF === "on";
+    this.linksEnabled = process.env.MEMORY_LINKS === "on";
   }
 
   /**
@@ -209,6 +234,10 @@ export class HybridRetriever {
    * cosine spread: the second pass exists to widen the *lexical* reach, the
    * first pass's vector hits are already in the pool, and skipping them keeps
    * the extra pass at the cost of two posting-list reads.
+   *
+   * The facet arm (P4, ADR-0046, `MEMORY_LINKS=on`) is skipped on that pass for
+   * the same reason, and joins the pool under the lexical arm's own entry rule:
+   * `vectorScore` 0, the same `relevant` floor, the same threshold/coverage gate.
    */
   private async searchOne(
     namespace: string,
@@ -263,11 +292,50 @@ export class HybridRetriever {
           knowledge: opts.knowledge
         })
       : [];
+    // P4 (ADR-0046): the third candidate arm. The query goes through the SAME
+    // `deriveFacets` the write path built the rows' tags with, so both sides of the
+    // join speak one vocabulary; rows sharing a query facet join the pool exactly
+    // the way the lexical arm's rows join — with `vectorScore` 0 and no exemption:
+    // the `relevant` floor and the threshold/coverage gate below read them
+    // identically to every other candidate, so a facet hit with no lexical support
+    // dies where any other zero-overlap row dies. What the arm buys is reach, not
+    // rank: `w.entity` defaults to 0, so the join can lift nothing on its own — and
+    // that is deliberate, because mem0's entity boost measured 14.5% overall / 6%
+    // multi-hop on this repo's bench (bench/REPORT.md) and is not a number to copy.
+    // Like the vector arm, skipped in the PRF second pass: `lexicalOnly` exists to
+    // widen the lexical reach at posting-list cost, and a third query per pass
+    // would price the expansion at more than ADR-0028 already measured it losing.
+    const queryFacets = this.linksEnabled ? deriveFacets(opts.query) : [];
+    const facetHits =
+      this.linksEnabled && !hints?.lexicalOnly && queryFacets.length > 0 && typeof this.store.facetCandidates === "function"
+        ? await this.store.facetCandidates({
+            namespace,
+            facets: queryFacets,
+            limit: overFetch,
+            type: opts.type,
+            includeDeleted: opts.includeDeleted ?? false,
+            status: opts.status,
+            includeArchived: opts.includeArchived,
+            includeDraft: opts.includeDraft,
+            project: opts.project,
+            kind: opts.kind,
+            knowledge: opts.knowledge
+          })
+        : [];
     const candidates = new Map<string, { memory: Memory; vectorScore: number }>();
     for (const hit of vectorHits) candidates.set(hit.memory.id, hit);
     for (const hit of lexicalHits) {
       // A row only the words found gets vectorScore 0: it still has to clear the
       // same relevance gate, so being lexically plausible is not a free pass.
+      if (!candidates.has(hit.memory.id)) {
+        candidates.set(hit.memory.id, { memory: hit.memory, vectorScore: 0 });
+      }
+    }
+    for (const hit of facetHits) {
+      // Same entry rule as the lexical-only rows above: vectorScore 0, same gate,
+      // no free channel. The shared facets are kept on the hit for callers that
+      // want the join named (P5); scoring recomputes the share from the row's own
+      // tags below so every candidate's `entityScore` has exactly one definition.
       if (!candidates.has(hit.memory.id)) {
         candidates.set(hit.memory.id, { memory: hit.memory, vectorScore: 0 });
       }
@@ -321,6 +389,11 @@ export class HybridRetriever {
 
     // enrich with BM25 + recency + importance + pin boost (ADR-0006)
     const now = Date.now();
+    // The query's own facets, once: `entityScore` is the share of them a row holds,
+    // measured against the row's stored tags — the same values the facet arm joined
+    // on, read back from the row so a row that entered through the vector or lexical
+    // arm is scored on the identical scale.
+    const queryFacetSet = new Set(queryFacets.map((f) => f.toLowerCase()));
     const scored: Scored[] = [...candidates.values()].map(({ memory, vectorScore }) => {
       const b = bm25Score(opts.query, memory.text, stats);
       const ageDays = (now - memory.createdAt) / (1000 * 60 * 60 * 24);
@@ -328,22 +401,40 @@ export class HybridRetriever {
       const strengthScore = memory.strength;
       const w = this.weights;
       const pinBoost = memory.pin ? 0.3 : 0;
+      const entityScore =
+        queryFacetSet.size === 0
+          ? 0
+          : [...new Set(facetTagsOf(memory.tags).map((t) => t.toLowerCase()))].filter((t) => queryFacetSet.has(t))
+              .length / queryFacetSet.size;
       const weighted = {
         vector: w.vector * vectorScore,
         bm25: w.bm25 * b,
         recency: w.recency * recencyScore,
-        strength: w.strength * strengthScore
+        strength: w.strength * strengthScore,
+        // Default weight 0: the term is always reported, never felt, until a caller
+        // turns it up (P4, ADR-0046).
+        entity: w.entity * entityScore
       };
-      const score = weighted.vector + weighted.bm25 + weighted.recency + weighted.strength + pinBoost;
+      const score = weighted.vector + weighted.bm25 + weighted.recency + weighted.strength + weighted.entity + pinBoost;
       return {
         memory,
         vectorScore,
         bm25Score: b,
         coverageScore: coverage(memory.text, opts.query),
         coverageWeightedScore: coverageWeighted(memory.text, opts.query, coverageDf),
+        entityScore,
         recencyScore,
         score,
-        breakdown: { vector: vectorScore, bm25: b, recency: recencyScore, strength: strengthScore, pinBoost, weighted, final: score }
+        breakdown: {
+          vector: vectorScore,
+          bm25: b,
+          recency: recencyScore,
+          strength: strengthScore,
+          entity: entityScore,
+          pinBoost,
+          weighted,
+          final: score
+        }
       };
     });
 

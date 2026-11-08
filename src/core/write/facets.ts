@@ -210,6 +210,40 @@ export function buildTags(text: string, callerTags?: string[]): string[] {
 }
 
 /**
+ * The tags of a row that are facets — the exact set the `memory_facets` index mirrors
+ * (P4, ADR-0046). The store's write paths, the backfill and the invariant test all read
+ * their facet set through this one function, so the index and the tags column cannot
+ * disagree about what a facet is.
+ */
+export function facetTagsOf(tags?: string[]): string[] {
+  return (tags ?? []).filter(
+    (t): t is string => typeof t === "string" && FACET_PREFIXES.some((p) => t.toLowerCase().startsWith(p))
+  );
+}
+
+/**
+ * Tags after a rewrite (`updateEmbedding` — reembed, knowledge sync). The caller's
+ * plain tags are the caller's own convention and survive; the facets follow the text,
+ * because a facet was derived from the sentence the row used to be and a row whose
+ * text moved is about different things now. Same order as `buildTags`/`inheritFacets`:
+ * facets first, so the cap drops free-form notes before it drops a join key.
+ */
+export function rederiveTags(previous: string[] | undefined, text: string): string[] {
+  const plain = (previous ?? []).filter(
+    (t) => !(typeof t === "string" && FACET_PREFIXES.some((p) => t.toLowerCase().startsWith(p)))
+  );
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const tag of [...deriveFacets(text), ...plain]) {
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+  }
+  return out.slice(0, MAX_TAGS);
+}
+
+/**
  * Facets a successor keeps from the row it replaced. `entity:` and `topic:` describe the
  * subject and survive a rewrite; `path:` describes the sentence that happened to mention
  * a file, so it is not inherited.

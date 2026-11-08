@@ -187,8 +187,15 @@ export interface ScoreBreakdown {
   bm25: number;
   recency: number;
   strength: number;
+  /**
+   * The share of the query's own facets the row holds (P4, ADR-0046) — reported raw
+   * here, weighted by `w.entity` in `weighted.entity`. The weight defaults to 0, so
+   * the term is always visible and contributes nothing unless a caller turns it up;
+   * like coverage it never gates.
+   */
+  entity: number;
   pinBoost: number;
-  weighted: { vector: number; bm25: number; recency: number; strength: number };
+  weighted: { vector: number; bm25: number; recency: number; strength: number; entity: number };
   final: number;
 }
 

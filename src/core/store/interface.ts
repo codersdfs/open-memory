@@ -252,6 +252,34 @@ export interface VectorStore {
   termDf?(tokens: string[]): Promise<Map<string, number>>;
 
   /**
+   * Facet candidates (P4, ADR-0046): rows of one partition whose stored `tags` share at
+   * least one of the given facets, most shared facets first, capped at `limit`.
+   * `sharedFacets` is the intersection that ranked the row — the same values a caller
+   * can recompute from `memory.tags`, returned because the store has already computed
+   * them for the ranking and a conflict marker (P5) will want the shared entity named.
+   *
+   * This is the store capability the facet arm reads when `MEMORY_LINKS=on`, and the
+   * one P5's conflict window consumes — the capability exists whether or not the search
+   * flag is on; the flag only decides whether *retrieval* reads it.
+   *
+   * Optional like `lexicalCandidates`: a third-party store keeps compiling, and the
+   * retriever then runs with two candidate arms exactly as before this landed.
+   */
+  facetCandidates?(opts: {
+    namespace: string;
+    facets: string[];
+    limit: number;
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
+  }): Promise<{ memory: Memory; sharedFacets: string[] }[]>;
+
+  /**
    * How this query's cosines are distributed across one partition.
    *
    * A top-1 cosine cannot say whether a match is real: measured on a 53-row corpus,

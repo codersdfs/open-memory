@@ -16,9 +16,16 @@ describe("R1 explainable recall", () => {
     await s.save({ namespace: NS, type: "semantic", text: "user lives in Berlin", importance: 0.9 });
     const r = await s.search({ query: "Berlin", namespace: NS, explain: true, threshold: 0, k: 3 });
     const e = r.memories[0].explain!;
-    const sum = e.weighted.vector + e.weighted.bm25 + e.weighted.recency + e.weighted.strength + e.pinBoost;
+    // P4 (ADR-0046): `weighted.entity` joined the sum. The weight defaults to 0, so
+    // the identity holds here unchanged — but the term is part of the sum now, and
+    // leaving it out would let a future weight drift break this test's meaning.
+    const sum =
+      e.weighted.vector + e.weighted.bm25 + e.weighted.recency + e.weighted.strength + e.weighted.entity + e.pinBoost;
     expect(sum).toBeCloseTo(e.final, 10);
     expect(e.final).toBeCloseTo(r.memories[0].score, 10);
+    // The entity term is reported at weight 0: visible in the breakdown, silent in
+    // the score. If this ever reads non-zero by default, the P4 flag decision moved.
+    expect(e.weighted.entity).toBe(0);
   });
 
   it("is absent unless asked, so the default payload is unchanged", async () => {

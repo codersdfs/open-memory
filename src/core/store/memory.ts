@@ -5,11 +5,21 @@ import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CA
 import { cosineSimilarity } from "../embedding/provider.js";
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { deriveKind } from "../write/kind.js";
+import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
 import { median } from "../stats.js";
 
 export class InMemoryVectorStore implements VectorStore {
   private map = new Map<string, Memory>();
+  /**
+   * The facet postings (P4, ADR-0046), mirror of the SQL `memory_facets` table keyed
+   * the way its `memory_id` index reads it: one memory -> its facet values, lowercased
+   * exactly as `indexFacetsSync` stores them. Maintained by the same call sites the
+   * SQL store reindexes on, so a drift bug in one backend fails the same test on both.
+   * Tombstones keep their postings, like the SQL rows do — visibility is the read's
+   * job (`isDeleted` in the candidate filter), not the index's.
+   */
+  private facetsByMemory = new Map<string, string[]>();
   /** Store-level KV, mirror of the SQL `store_meta` table (P2, ADR-0016 amendment). */
   private meta = new Map<string, string>();
   /**
@@ -53,6 +63,10 @@ export class InMemoryVectorStore implements VectorStore {
 
   async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
     const now = Date.now();
+    // Facet postings commit with the row (P4, ADR-0046) — here the "transaction" is
+    // two map writes in one synchronous block, which is the same guarantee in a
+    // smaller material.
+    const facets = facetTagsOf(input.tags).map((t) => t.toLowerCase());
     const mem: Memory = {
       id: randomUUID(),
       namespace: input.namespace,
@@ -84,6 +98,7 @@ export class InMemoryVectorStore implements VectorStore {
       updatedAt: now
     };
     this.map.set(mem.id, mem);
+    this.facetsByMemory.set(mem.id, facets);
     this.logEvent(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
     return mem;
   }
@@ -298,7 +313,19 @@ export class InMemoryVectorStore implements VectorStore {
     const m = this.map.get(id);
     // The text changed, so the clocks that describe it follow — same as the SQL
     // store's transaction: hash is derived per read here, valid_at recomputed.
-    if (m) { m.embedding = embedding; m.text = text; m.validAt = extractValidAt(text); m.updatedAt = Date.now(); }
+    // P4 (ADR-0046): the facets follow the text the same way — `rederiveTags` keeps
+    // the caller's plain tags and re-derives the facets from what the row now says,
+    // and the postings are rewritten from those tags, which is what keeps the
+    // invariant (facet postings == the row's facet tags) true on this path.
+    if (m) {
+      const tags = rederiveTags(m.tags, text);
+      m.embedding = embedding;
+      m.text = text;
+      m.tags = tags;
+      m.validAt = extractValidAt(text);
+      m.updatedAt = Date.now();
+      this.facetsByMemory.set(id, facetTagsOf(tags).map((t) => t.toLowerCase()));
+    }
   }
 
   async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null }, meta?: WriteEventMeta): Promise<Memory | null> {
@@ -321,7 +348,12 @@ export class InMemoryVectorStore implements VectorStore {
     if (patch.visibility !== undefined) m.visibility = patch.visibility as Memory["visibility"];
     if (patch.isDeleted !== undefined) m.isDeleted = patch.isDeleted;
     if (patch.importance !== undefined) m.importance = patch.importance;
-    if (patch.tags !== undefined) m.tags = patch.tags;
+    if (patch.tags !== undefined) {
+      // A tags patch rewrites the row's join keys (P4, ADR-0046) — the same bargain
+      // as the SQL branch: the column and the postings move together, in one block.
+      m.tags = patch.tags;
+      this.facetsByMemory.set(id, facetTagsOf(patch.tags).map((t) => t.toLowerCase()));
+    }
     if (patch.knowledgeId !== undefined) m.knowledgeId = patch.knowledgeId;
     if (patch.knowledgeSection !== undefined) m.knowledgeSection = patch.knowledgeSection;
     m.updatedAt = Date.now();
@@ -454,6 +486,38 @@ export class InMemoryVectorStore implements VectorStore {
       }
     }
     return df;
+  }
+
+  /**
+   * Mirror of the SQL facet read (P4, ADR-0046): rows whose tags share at least one
+   * of the given facets, most shared first, id as the tie-break — the same ranking
+   * the GROUP BY orders by, over the same lowercased postings the write paths keep.
+   * The visibility filter is `candidates`, the same pool `vectorSearch` works over,
+   * exactly as the SQL JOIN applies `candidateWhere`.
+   */
+  async facetCandidates(opts: {
+    namespace: string;
+    facets: string[];
+    limit: number;
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
+  }): Promise<{ memory: Memory; sharedFacets: string[] }[]> {
+    const wanted = new Set(
+      [...new Set(opts.facets)].map((f) => String(f ?? "").toLowerCase()).filter((f) => f.length > 0)
+    );
+    if (wanted.size === 0 || opts.limit <= 0) return [];
+    const scored = this.candidates(opts).flatMap((memory) => {
+      const shared = [...new Set((this.facetsByMemory.get(memory.id) ?? []).filter((f) => wanted.has(f)))];
+      return shared.length === 0 ? [] : [{ memory, sharedFacets: shared, shared: shared.length }];
+    });
+    scored.sort((a, b) => b.shared - a.shared || (a.memory.id < b.memory.id ? -1 : a.memory.id > b.memory.id ? 1 : 0));
+    return scored.slice(0, opts.limit).map(({ memory, sharedFacets }) => ({ memory, sharedFacets }));
   }
 
   /**
