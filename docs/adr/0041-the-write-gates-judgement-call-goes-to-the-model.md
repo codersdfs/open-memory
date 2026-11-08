@@ -2,9 +2,10 @@
 
 Date: 2026-10-31
 
-Status: Accepted
+Status: Accepted (amended 2026-11-08 — the relation judge's failure is a tagged outcome now; see the amendment at the bottom)
 
 Amends: ADR-0040 (writes are curated), ADR-0015 (write-time reconcile)
+Amended by: ADR-0047 (the conflict window)
 
 ## Context
 
@@ -108,3 +109,36 @@ console-writable settings, applied per call like every judge knob.
   (`saveMany`), for the same reason it bypasses reconcile and curation: an
   import is a deliberate act, and a 5,000-row file that fails on row 3 is a
   hostile gate.
+
+## Amendment (2026-11-08, with ADR-0047): the pending item is decided — a judge failure reports only itself
+
+This ADR left one item pending: the research plan's P5 asked whether a *failed*
+relation judgement should leave a tag on the row, and the plan marked it
+"⚖️ 待决" (§4 item 6). Decided, on the ladder this ADR already built:
+
+- **A failed call (model unavailable, request dead after retries) tags the row
+  `judged:failed`, counts on stderr, and never mints a conflict marker.** The
+  failure admits nothing about the pair except that it could not be read —
+  tagging a contradiction onto it would invent a fact at the moment the system
+  knows least. This is fail-open made visible rather than fail-open made
+  silent: the write still stores (the contract above), but "the judge was
+  asked and answered nothing" is now a queryable tag in the `judged:*`
+  vocabulary and a counted line on stderr, not a reason code shared with
+  "no judge was ever configured".
+- **No judge configured (or no key) is *absence*, not failure** — the same
+  reading the ladder already gives this gate's "no key" branch ("stores
+  unjudged, untagged"). Absence is the case ADR-0047's conflict window answers:
+  a pair the floors admitted, sharing one `entity:` subject, stating different
+  predicates, stores with a `conflict:<entity>` facet instead of a silent
+  double write.
+- **A judge that answered but cleared no label (the margin held it back) stays
+  untagged** — the model spoke; the store does not second-guess a cautious
+  verdict by calling it a failure, and does not over-read it as a conflict.
+
+So the three outcomes the reconcile wire can produce are distinguishable by
+construction now: `conflict-unjudged` (absent judge, marker on both rows),
+`judge-failed` + `judged:failed` (asked, nothing came back, stderr count),
+`model-unrelated` (answered, no label won). The wire that makes the split
+mechanical — rejections for "no answer at all", a resolved `null` for "answered
+but undecided" — lives in `MemoryService.relationJudge`, which no longer
+swallows failures into the same `null` a cautious verdict produces.

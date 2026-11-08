@@ -8,7 +8,7 @@ import { Histogram } from '../components/Histogram';
 import { Panel } from '../components/Panel';
 import { StatCard } from '../components/StatCard';
 import { api } from '../lib/api';
-import type { DecayCandidate, EmbeddingInfo, EmbeddingPreset, ReembedJob, StatsResponse } from '../lib/api';
+import type { DecayCandidate, EmbeddingInfo, EmbeddingPreset, PendingConflict, ReembedJob, StatsResponse } from '../lib/api';
 import { absTime, bytes, relTime, score3, truncate } from '../lib/format';
 
 /**
@@ -633,6 +633,60 @@ export default function StatsView({ namespace }: { namespace: string }) {
   if (stats === null) return null;
 
   const candidates = stats.decayCandidates;
+  const conflicts = stats.pendingConflictRows;
+
+  const conflictColumns: Column<PendingConflict>[] = [
+    {
+      key: 'conflicts',
+      header: 'conflict',
+      width: '1%',
+      mono: true,
+      render: (row) => (
+        <span title={row.conflicts.join(' · ')} style={{ fontSize: 11, color: 'var(--warn)' }}>
+          {truncate(row.conflicts.join(' · '), 22)}
+        </span>
+      ),
+    },
+    {
+      key: 'text',
+      header: 'text',
+      render: (row) => (
+        <span title={row.text} style={{ fontSize: 12, color: 'var(--fg)' }}>
+          {truncate(row.text, 88)}
+        </span>
+      ),
+    },
+    {
+      key: 'type',
+      header: 'type',
+      width: '1%',
+      render: (row) => (
+        <span style={{ fontSize: 11, color: 'var(--dim)' }}>{row.type}</span>
+      ),
+    },
+    {
+      key: 'created',
+      header: 'created',
+      width: '1%',
+      mono: true,
+      render: (row) => (
+        <span title={absTime(row.createdAt)} style={{ fontSize: 11, color: 'var(--dim)' }}>
+          {relTime(row.createdAt)}
+        </span>
+      ),
+    },
+    {
+      key: 'id',
+      header: 'id',
+      mono: true,
+      width: '1%',
+      render: (row) => (
+        <span title={row.id} style={{ fontSize: 10, color: 'var(--dim)' }}>
+          {truncate(row.id, 14)}
+        </span>
+      ),
+    },
+  ];
 
   const columns: Column<DecayCandidate>[] = [
     {
@@ -723,6 +777,11 @@ export default function StatsView({ namespace }: { namespace: string }) {
         <StatCard label="reinforced" value={stats.reinforced} sub="retrieved, or stronger than written" />
         <StatCard label="never used" value={stats.neverUsed} />
         <StatCard
+          label="pending conflicts"
+          value={stats.pendingConflicts}
+          sub="stored while the judge was away — P5"
+        />
+        <StatCard
           label="supersedes links / heads"
           value={`${stats.supersedesLinks} / ${stats.supersedeHeads}`}
           sub="replaced rows / current answers"
@@ -755,6 +814,27 @@ export default function StatsView({ namespace }: { namespace: string }) {
       </Panel>
 
       <EmbeddingsCard />
+
+      {/* P5 (ADR-0047): writes stored while the relation judge was absent, wearing a
+          `conflict:<entity>` facet on both sides of the pair. Read-only on purpose — the
+          adjudication itself is a supersede or a tag strip, and both of those stay in the
+          memories view where the whole row is visible. */}
+      <Panel
+        title="pending conflicts"
+        subtitle={`${stats.pendingConflicts} row${stats.pendingConflicts === 1 ? '' : 's'} in ${stats.namespace} — same entity, different claim, never judged`}
+      >
+        <DataTable
+          rows={conflicts}
+          columns={conflictColumns}
+          rowKey={(row) => row.id}
+          empty={
+            <Empty
+              title="nothing awaiting adjudication"
+              body="no row carries a conflict:* facet right now — pairs the write path could not judge either superseded, coexisted unmarked, or were judged."
+            />
+          }
+        />
+      </Panel>
 
       <Panel
         title="decay"

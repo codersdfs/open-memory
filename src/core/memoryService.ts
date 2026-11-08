@@ -15,10 +15,11 @@ import { assembleBrief } from "./retrieval/brief.js";
 import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, type KnowledgePageView } from "./knowledge/view.js";
 import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
 import type { BriefOptions, BriefResult } from "./types.js";
-import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
+import { reconcile, unionNeighbours, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
 import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, renderVerdict, type CurationVerdict } from "./write/curation.js";
 import { textHash } from "./write/text.js";
-import { jevEnabled, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
+import { appendTag, buildTags, facetTagsOf } from "./write/facets.js";
+import { jevEnabled, jevApiKey, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
 
 export type SaveInput = Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope };
 
@@ -113,9 +114,12 @@ export class MemoryService {
    * `<agent>:<user>`. Reconciling happens inside one partition only, so the same
    * sentence may legitimately exist as a private note and a shared fact.
    *
-   * The neighbour query below is the one the old dedup loop already ran: the five
-   * nearest rows in this partition and type. It was thrown away after an exact-string
-   * compare; `reconcile` is the only thing that changed about it.
+   * The neighbour query below grew arms in P5 (ADR-0047): the same-type vector top-5 the
+   * old dedup loop already ran — thrown away after an exact-string compare until
+   * `reconcile` made it the decision — plus the rows sharing the write's `entity:` facets
+   * (P4's `facetCandidates`) and the same partition without the type wall, deduped and
+   * capped at ten. Every arm feeds the same guarded decision; none of them admits a row
+   * on its own.
    *
    * `opts.raw` is the bulk escape hatch (ADR-0018 amendment), honoured on the
    * per-row path too so `{ reconcile: true, raw: true }` means exactly what the
@@ -245,7 +249,13 @@ export class MemoryService {
       return { memory, decision: { action: "insert", reason: "disabled", text: memory.text, tags: memory.tags ?? [], lexical: 0 } };
     }
 
-    const neighbours = await this.store.vectorSearch({
+    // P5 (ADR-0047): the conflict window. The write used to reconcile against one arm —
+    // the five nearest rows of its own partition and type — which is exactly the window
+    // gap3 named: a contradiction filed under another type, or joined by an entity the
+    // embedder ranks outside the top-5, never reached the decision. Three arms now feed
+    // one deduped, capped list; reaching is still not admitting, because every neighbour
+    // faces the same `nearest()` floors as before.
+    const vectorArm = await this.store.vectorSearch({
       namespace,
       // Reconcile stays inside one project: the same sentence filed under two
       // repositories is two facts with two lifetimes, and reinforcing one into the
@@ -258,6 +268,49 @@ export class MemoryService {
       limit: 5,
       includeDeleted: false
     });
+    // Arm 2 — same entity, this partition (P4's `facetCandidates`, ADR-0046): the rows
+    // sharing an `entity:` facet with the text being written, any type. The facets are
+    // the ones the incoming row itself will carry (the same `buildTags` the decision
+    // stores), because a join key only joins if both sides hold it. vectorScore 0 — a
+    // facet row is reached, not scored; it still clears the lexical/containment floors
+    // to win anything, the no-free-channel rule the facet arm already answers to.
+    const incomingTags = buildTags(input.text, curationTag ? [...(input.tags ?? []), curationTag] : input.tags);
+    const entityFacets = [...new Set(facetTagsOf(incomingTags).map((t) => t.toLowerCase()))].filter(
+      (t) => t.startsWith("entity:")
+    );
+    const facetArm =
+      entityFacets.length > 0 && this.store.facetCandidates
+        ? await this.store.facetCandidates({
+            namespace,
+            project: target.project,
+            facets: entityFacets,
+            knowledge: null,
+            includeDeleted: false,
+            limit: 5
+          })
+        : [];
+    // Arm 3 — the type wall comes down: the same vector query without `type`, so a
+    // contradiction filed as an event or a procedure can reach a semantic write (and
+    // vice versa). Skipped when arm 1 already ran unfiltered — the same query twice
+    // would be a second scan buying nothing.
+    const crossTypeArm = target.type
+      ? await this.store.vectorSearch({
+          namespace,
+          project: target.project,
+          knowledge: null,
+          queryEmbedding: embedding,
+          limit: 5,
+          includeDeleted: false
+        })
+      : [];
+    const neighbours = unionNeighbours(
+      [
+        vectorArm,
+        facetArm.map(({ memory }) => ({ memory, vectorScore: 0 })),
+        crossTypeArm
+      ],
+      10
+    );
     const decision = await reconcile({
       text: input.text,
       type: target.type,
@@ -313,6 +366,20 @@ export class MemoryService {
     }
 
     const memory = await this.store.insert({ ...target, tags: decision.tags }, embedding);
+    // P5 (ADR-0047): the marker lands on both sides of the pair. The incoming row carried
+    // `conflict:<entity>` in decision.tags through the insert above, which indexes its
+    // postings; the *existing* row can only take a new tag through `updateMeta`'s tags
+    // patch — the P4-maintained path (ADR-0046) that rewrites the postings in the same
+    // transaction as the column. Patching the column any other way would leave the
+    // postings describing the old tags, and the invariant test would catch it as drift.
+    // Only a readable-live row takes the marker: a row tombstoned between the neighbour
+    // query and now is not a pair to adjudicate.
+    if (decision.conflictFacet && decision.oldId) {
+      const conflicted = await this.store.getById(decision.oldId);
+      if (conflicted && conflicted.isDeleted !== 1) {
+        await this.store.updateMeta(conflicted.id, { tags: appendTag(conflicted.tags, decision.conflictFacet) });
+      }
+    }
     return {
       memory,
       // A decision that named an action this service could not carry out keeps its
@@ -326,18 +393,29 @@ export class MemoryService {
    * The relation judge for this call.
    *
    * Injected judges win (tests). Otherwise jev answers, and only when a judge is actually
-   * configured: no key means no call, not a call that fails. The margin is read per call
-   * so a value saved in the console applies to the next write without a restart.
+   * configured: no key means no judge, not a call that fails — the same reading ADR-0041's
+   * trust ladder gives the write gate ("no key → stores unjudged, untagged"), and since P5
+   * it is also what makes the judge *absent* (conflict marking eligible, ADR-0047) rather
+   * than *failed*. The margin is read per call so a value saved in the console applies to
+   * the next write without a restart.
+   *
+   * The wire distinguishes the two unjudged outcomes the reconciler must tell apart: a
+   * judge that answered but cleared no label resolves `null` (undecided, untagged), while
+   * one that returned no answer at all — request failed after retries, endpoint down —
+   * *rejects*, which is what makes the reconciler's `judge-failed` branch reachable. The
+   * old shape swallowed both into `null`, and a broken judge then looked exactly like a
+   * cautious one.
    */
   private relationJudge(): RelationJudge | undefined {
     if (this.relation) return this.relation;
-    if (!jevEnabled()) return undefined;
+    if (!jevEnabled() || !jevApiKey()) return undefined;
     return (oldText: string, newText: string) =>
       jevRelation(oldText, newText, {
         margin: envNumber(runtimeEnv().MEMORY_RECONCILE_MARGIN, DEFAULT_RELATION_MARGIN)
-      })
-        .then((r) => r?.relation ?? null)
-        .catch(() => null);
+      }).then((r) => {
+        if (!r) throw new Error("relation judge returned no answer");
+        return r.relation;
+      });
   }
 
   /** The old entry point, unchanged for every existing caller: the memory, no decision. */

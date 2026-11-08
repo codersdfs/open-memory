@@ -228,14 +228,22 @@ This is a deliberate divergence, not drift. The agent is answering questions it 
 
 ## Write reconcile
 
-Every save reconciles before it inserts. The five nearest memories in the same partition
-and type — the query the old exact-text dedup already ran — decide one of three things:
+Every save reconciles before it inserts. Since P5 the candidate window is a three-arm
+union, deduped and capped at ten: the five nearest memories of the same partition **and
+type** — the query the old exact-text dedup already ran — plus the rows sharing the
+write's `entity:` facets (P4's `facetCandidates`, any type), plus the same partition with
+the type wall down, so a contradiction filed as an event can reach a semantic write.
+Reaching is still not admitting: every neighbour clears the same floors as before, and a
+facet-sourced row carries `vectorScore = 0`, so it earns its way in on its own words. The
+guards below outrank everything the window adds.
 
 | Outcome | When | What happens |
 |---|---|---|
 | `reinforce` | the same claim, reworded (punctuation and case do not matter; a reordering does) | the existing row gains strength and its use clock resets; nothing is inserted |
 | `supersede` | the new memory adds detail, contradicts the old one, or the judge says so | the new row is stored, the old one is soft-deleted and linked by `supersedes_id`, and the old claim is appended as `(previously: …)` when it carried something the new one does not |
-| `insert` | nothing near enough, or the neighbour is pinned, `episodic`, or written by `extractor` | a new row, exactly like before |
+| `insert` (`conflict-unjudged`) | the judge is **absent** — not configured or no key — and the surviving pair names one `entity:` subject while stating different claims | a new row, exactly like before — but both rows now carry a `conflict:<entity>` facet, and `/stats?full=1` counts them (`pendingConflicts`) with a **pending conflicts** panel in the console Stats view. The marker moves through the P4-maintained paths only: the new row's tags through the insert, the existing row's through `updateMeta`'s tags patch, so its facet postings follow the column |
+| `insert` (`judge-failed`) | the judge was **asked and failed** — the wire returned nothing | a new row tagged `judged:failed`, and the failure counted on stderr; never a conflict marker — a failed call admits nothing about the pair ([ADR-0041 amendment](docs/adr/0041-the-write-gates-judgement-call-goes-to-the-model.md)) |
+| `insert` | nothing near enough, or the neighbour is pinned, `episodic`, or written by `extractor` — those four guards answer before the judge or the marker ever could | a new row, exactly like before |
 
 `memory_remember` says which happened: `stored`, `already known`, or
 `superseded <oldId>: <newId>`. `MEMORY_RECONCILE=off` restores the old exact-text dedup
@@ -245,9 +253,14 @@ Knobs, all env-only and read per write: `MEMORY_RECONCILE_LEX` (`0.80`, token ov
 `MEMORY_RECONCILE_COS` (`0.85`, only when a real embedder is configured — the hash
 embedder returns ~0.9 cosine to everything), `MEMORY_RECONCILE_MARGIN` (`0.15`, how far
 the top judgement must lead the runner-up before it may delete a row). Tags written by
-this path carry facets: `entity:`, `topic:`, `path:`, inherited across a supersede. Since
-P4 they are also indexed — `memory_facets`, a posting list committed with the row and
-kept equal to the row's own facet tags by construction ([ADR-0046](docs/adr/0046-facet-index-and-third-candidate-arm.md)).
+this path carry facets: `entity:`, `topic:`, `path:` — and, since P5, `conflict:`,
+minted only by the marker, never derived from text. All of them are indexed —
+`memory_facets`, a posting list committed with the row and kept equal to the row's own
+facet tags by construction ([ADR-0046](docs/adr/0046-facet-index-and-third-candidate-arm.md)) —
+and `conflict:*` facets are what the pending-conflict count, the console panel and the
+`facet:` filter on `list`/`vectorSearch`/`lexicalCandidates` read. A judge that answered
+but cleared no label (`MEMORY_RECONCILE_MARGIN` held it back) stores unjudged and
+untagged: cautious is not broken ([ADR-0047](docs/adr/0047-conflict-window-and-pending-conflicts.md)).
 
 No benchmark claim is made for this stage: it changes what gets stored, not how multi-hop
 is assembled. The read-time stage is a separate change (v0.4, [ADR-0012](docs/adr/0012-candidate-union-over-term-index.md))
@@ -491,7 +504,7 @@ A store that only grows is not a memory, it is a log. Two passes share the same 
 - **Automatic maintenance (`MEMORY_MAINTAIN_HOURS`, default 24, `0` off).** The daemon — the server main entry, which is what `ai-memory daemon` runs — sweeps the reversible pass on that interval. Its entry point `runScheduledDecay(store)` takes no options bag at all, so the hard pass is unreachable from the scheduler *by signature*, not by convention: an unattended run can only ever archive. `last_maintenance_at` and the pass's result live in a small `store_meta` KV, so opening an overdue store (a daemon that was down for a week) fires a catch-up pass in the background — no request waits on a sweep — and every pass logs `ai-memory maintenance: archived N cold rows` to stderr ([ADR-0016 amendment](docs/adr/0016-archive-first-decay.md)).
 - **Retroactive curation (`ai-memory triage`, diff first).** Decay handles rows that went cold; it does nothing for the junk admitted before the gates existed — 89% of the audited store had never been retrieved, and ADR-0040 originally refused to rewrite the stock. That decision was reversed on 2026-11-08 ([ADR-0040 amendment](docs/adr/0040-writes-are-curated.md)): `ai-memory triage` sweeps the whole store — every partition, archived rows and tombstones included — and runs the same zero-network `curate` verdict per row. The default run **writes nothing**: it reports `would archive N / would demote N / merge candidates M` with ids, classes and reasons, and `--apply` is the only mode that touches rows. Applying archives the hard junk classes by a status flip (never a hard delete — the row stays readable and restorable) and sinks the weak classes (`progress`, self-narration) to importance 0.35, the write-time demotion floor. The contracts outrank the regexes: durable kinds (`decision`/`convention`/`gotcha`), pinned rows, drafts, knowledge rows and tombstones are never touched; live rows sharing an `entity:*` facet and the same normalized text are **listed** as merge candidates and never merged — picking a survivor is reconcile's guarded decision (ADR-0015). Rows carrying no `judged:*` tag are counted (`unjudged`) but not tagged — whether that becomes one is ADR-0041's pending amendment.
 
-`memory_stats` (and the console's Stats view) reports `archived`, `archivedRatio`, `neverRetrieved` and `neverRetrievedRatio`; the decay preview lists each candidate with the action it would take and its retrieval count, and the panel says when the automatic pass last ran and what it did. Before v0.4 the store had 308 of 335 rows never retrieved and a decay rule that pruned one row in its whole history ([ADR-0016](docs/adr/0016-archive-first-decay.md)).
+`memory_stats` (and the console's Stats view) reports `archived`, `archivedRatio`, `neverRetrieved` and `neverRetrievedRatio`; the decay preview lists each candidate with the action it would take and its retrieval count, and the panel says when the automatic pass last ran and what it did. Since P5 it also reports `pendingConflicts` — live rows wearing a `conflict:<entity>` facet from a write whose judge was absent, listed with their pairs in the Stats view's pending-conflicts panel ([ADR-0047](docs/adr/0047-conflict-window-and-pending-conflicts.md)). Before v0.4 the store had 308 of 335 rows never retrieved and a decay rule that pruned one row in its whole history ([ADR-0016](docs/adr/0016-archive-first-decay.md)).
 
 Seeding is isolated: `npm run seed` writes to a fresh temp directory unless `MEMORY_DB_PATH` is set explicitly, so demo fixtures can no longer land in your real store (`tests/seed-isolation.test.ts`).
 
@@ -646,3 +659,4 @@ See `CONTEXT.md`. Canonical terms: **Memory**, **Episodic/Semantic/Procedural/Wo
 - `0044-vault-graph-in-the-console`
 - `0045-write-history-and-two-clocks`
 - `0046-facet-index-and-third-candidate-arm`
+- `0047-conflict-window-and-pending-conflicts`

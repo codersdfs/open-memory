@@ -44,6 +44,17 @@ export interface MemoryFilter {
    * chat memory must never merge into (or supersede) one.
    */
   knowledge?: string | null;
+  /**
+   * Facet slice (P5, ADR-0047). `undefined` → do not filter; a facet value → only
+   * rows whose tags carry it, matched case-insensitively the way the postings store
+   * them (`indexFacetsSync` lowercases). Read from the `memory_facets` postings on the
+   * SQL store and from the in-memory mirror, the same derived state `facetCandidates`
+   * ranks over — never from a scan of the tags column. This is the read side of the
+   * conflict window: the pair a `conflict:<entity>` marker names is one filtered read
+   * away. No `null` arm: "rows with no facet" is not a question P5 asks, and a tri-state
+   * nobody passes is a branch nobody tests.
+   */
+  facet?: string;
 }
 
 /**
@@ -151,6 +162,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
     /**
      * Skip the vector join. The knowledge index reads thousands of rows to build a
      * page tree and never looks at an embedding; attaching them is about 150 MB of
@@ -206,6 +218,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; vectorScore: number }[]>;
 
   /**
@@ -236,6 +249,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; lexicalScore: number }[]>;
 
   /**
@@ -277,6 +291,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; sharedFacets: string[] }[]>;
 
   /**
@@ -300,6 +315,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ median: number; count: number }>;
   /**
    * Retrieval reinforcement (R2): every id that came back above threshold gets a

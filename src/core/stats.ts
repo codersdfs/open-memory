@@ -10,6 +10,7 @@
 import type { Memory, MemoryStatus, MemoryType } from "./types.js";
 import { KINDS, STATUSES, TYPES } from "./types.js";
 import { isDurableKind, KIND_RETENTION_MS } from "./write/kind.js";
+import { facetTagsOf } from "./write/facets.js";
 
 /** Median of the values, 0 when there are none. Even counts average the middle pair. */
 export function median(values: number[]): number {
@@ -70,6 +71,16 @@ export interface DecayCandidate {
   action: "archive" | "prune";
 }
 
+/** One side of an unjudged contradiction pair (P5, ADR-0047), as the console reads it. */
+export interface PendingConflict {
+  id: string;
+  type: MemoryType;
+  createdAt: number;
+  text: string;
+  /** The `conflict:*` facets the row carries — the entity(ies) the pair was named after. */
+  conflicts: string[];
+}
+
 export interface StatsSummary {
   total: number;
   byType: Record<string, number>;
@@ -89,6 +100,15 @@ export interface StatsSummary {
   strength: StatsBucket[];
   age: StatsBucket[];
   decayCandidates: DecayCandidate[];
+  /**
+   * P5 (ADR-0047): readable-live rows wearing a `conflict:*` facet — writes stored while
+   * the relation judge was absent, waiting on an adjudication. Counted over the
+   * population `list()` shows by default (active, not tombstoned): a marker on a
+   * tombstone names a pair that no longer exists. The rows themselves follow so the
+   * console's pending panel groups the pairs without a second read.
+   */
+  pendingConflicts: number;
+  pendingConflictRows: PendingConflict[];
   textChars: number;
   /** `length / 4`, the same heuristic the budget uses. A size, never a "saving". */
   textTokensEstimate: number;
@@ -111,6 +131,7 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
   const strength = STRENGTH_BUCKETS.map((label) => ({ label, count: 0 }));
   const age = AGE_BUCKETS.map((label) => ({ label, count: 0 }));
   const decayCandidates: DecayCandidate[] = [];
+  const pendingConflictRows: PendingConflict[] = [];
   const byVectorDim: Record<string, number> = {};
   const heads = new Set<string>();
   let pins = 0, deleted = 0, active = 0, reinforced = 0, neverUsed = 0, supersedesLinks = 0, textChars = 0;
@@ -143,6 +164,17 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
     age[aIdx]!.count++;
 
     if (m.isDeleted) continue;
+    // P5 (ADR-0047): the pending-conflict queue. Only active rows count — an archived
+    // row is out of every read the panel could adjudicate through, and a tombstone
+    // already left above. The facet values come from the row's own tags through the
+    // same `facetTagsOf` the invariant and the postings read, so the count, the panel
+    // and the index cannot disagree about what a marker is.
+    const conflicts = facetTagsOf(m.tags)
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.startsWith("conflict:"));
+    if (conflicts.length > 0 && m.status === "active") {
+      pendingConflictRows.push({ id: m.id, type: m.type, createdAt: m.createdAt, text: m.text, conflicts });
+    }
     // Mirrors src/core/lifecycle/decay.ts in its own order: the hard pass prunes, the
     // default pass archives. A row both would touch is listed once, as a prune, because
     // that is the stronger claim an operator has to opt into.
@@ -173,6 +205,7 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
   return {
     total: memories.length, byType, byStatus, byKind, byProject, active, deleted, pinned: pins,
     reinforced, neverUsed, supersedesLinks, supersedeHeads: heads.size,
-    strength, age, decayCandidates, textChars, textTokensEstimate: Math.round(textChars / 4), byVectorDim
+    strength, age, decayCandidates, pendingConflicts: pendingConflictRows.length, pendingConflictRows,
+    textChars, textTokensEstimate: Math.round(textChars / 4), byVectorDim
   };
 }

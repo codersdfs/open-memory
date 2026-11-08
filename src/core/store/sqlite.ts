@@ -27,6 +27,7 @@ function candidateWhere(
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   },
   alias = "memories"
 ): { whereSql: string; params: (string | number)[] } {
@@ -61,6 +62,17 @@ function candidateWhere(
   if (opts.type) {
     where.push(`${col("type")} = ?`);
     params.push(opts.type);
+  }
+  // P5 (ADR-0047): the facet slice reads the postings, not the tags column — the same
+  // derived state `facetCandidates` ranks over, and the state the self-heal repairs on
+  // open. `indexFacetsSync` lowercases, so the filter does too; a value with no postings
+  // answers empty, which is information (the marker was resolved or never written), not
+  // an error.
+  if (opts.facet) {
+    where.push(
+      `EXISTS (SELECT 1 FROM memory_facets f WHERE f.memory_id = ${col("id")} AND f.facet = ?)`
+    );
+    params.push(String(opts.facet).toLowerCase());
   }
   if (opts.status) {
     where.push(`${col("status")} = ?`);
@@ -1484,6 +1496,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
     withVectors?: boolean;
   }): Promise<{ memories: Memory[]; total: number }> {
     this.ensure();
@@ -1511,6 +1524,15 @@ export class SqliteVectorStore implements VectorStore {
         where.push("knowledge_id = ?");
         params.push(opts.knowledge);
       }
+    }
+    // P5 (ADR-0047): the facet slice, over the postings — the identical EXISTS the
+    // candidate reads use through `candidateWhere`, so a filtered page and a filtered
+    // search can never disagree about what carries a facet.
+    if (opts.facet) {
+      where.push(
+        `EXISTS (SELECT 1 FROM memory_facets f WHERE f.memory_id = memories.id AND f.facet = ?)`
+      );
+      params.push(String(opts.facet).toLowerCase());
     }
     // governance-lite status filter (ADR-0006)
     if (opts.status) {
@@ -1552,6 +1574,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ median: number; count: number }> {
     this.ensure();
     const { whereSql, params } = candidateWhere(opts, "m");
@@ -1889,6 +1912,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
     this.ensure();
     const { whereSql, params } = candidateWhere(opts, "m");
@@ -2218,6 +2242,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; lexicalScore: number }[]> {
     this.ensure();
     const tokens = [...new Set(queryTerms(opts.query))].slice(0, LEXICAL_TOKEN_LIMIT);
@@ -2310,6 +2335,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; sharedFacets: string[] }[]> {
     this.ensure();
     const facets = [...new Set(opts.facets.map((f) => String(f ?? "").toLowerCase()).filter((f) => f.length > 0))];

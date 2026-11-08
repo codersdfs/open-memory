@@ -93,6 +93,16 @@ export interface DecayCandidate {
   action: 'archive' | 'prune';
 }
 
+/** src/core/stats.ts:63-75 PendingConflict — one side of an unjudged contradiction pair (P5). */
+export interface PendingConflict {
+  id: string;
+  type: MemoryType;
+  createdAt: number;
+  text: string;
+  /** The `conflict:*` facets the row carries — the entity(ies) the pair was named after. */
+  conflicts: string[];
+}
+
 /** src/core/stats.ts:73-97 StatsSummary. */
 export interface StatsSummary {
   total: number;
@@ -108,6 +118,9 @@ export interface StatsSummary {
   strength: StatsBucket[];
   age: StatsBucket[];
   decayCandidates: DecayCandidate[];
+  /** P5 (ADR-0047): live rows wearing a `conflict:*` facet, waiting on an adjudication. */
+  pendingConflicts: number;
+  pendingConflictRows: PendingConflict[];
   textChars: number;
   textTokensEstimate: number;
 }

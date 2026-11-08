@@ -156,6 +156,7 @@ export class InMemoryVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Memory[] {
     let arr = [...this.map.values()].filter((m) => m.namespace === opts.namespace);
     if (!opts.includeDeleted) arr = arr.filter((m) => m.isDeleted === 0);
@@ -170,6 +171,12 @@ export class InMemoryVectorStore implements VectorStore {
       );
     }
     if (opts.type) arr = arr.filter((m) => m.type === opts.type);
+    // P5 (ADR-0047): the facet slice over the postings mirror, lowercased exactly as
+    // `indexFacetsSync` stores them — the same derived state `facetCandidates` ranks.
+    if (opts.facet) {
+      const wanted = String(opts.facet).toLowerCase();
+      arr = arr.filter((m) => (this.facetsByMemory.get(m.id) ?? []).includes(wanted));
+    }
     if (opts.status) arr = arr.filter((m) => m.status === opts.status);
     else {
       if (!opts.includeArchived) arr = arr.filter((m) => m.status !== "archived");
@@ -189,6 +196,7 @@ export class InMemoryVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ median: number; count: number }> {
     const cosines = this.candidates(opts)
       .filter((m) => m.embedding.length === opts.queryEmbedding.length)
@@ -272,6 +280,7 @@ export class InMemoryVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memories: Memory[]; total: number }> {
     let arr = [...this.map.values()].filter((m) => m.namespace === opts.namespace);
     if (!opts.includeDeleted) arr = arr.filter((m) => m.isDeleted === 0);
@@ -285,6 +294,12 @@ export class InMemoryVectorStore implements VectorStore {
       );
     }
     if (opts.type) arr = arr.filter((m) => m.type === opts.type);
+    // P5 (ADR-0047): the same postings-mirror filter the candidate reads apply, so a
+    // filtered page and a filtered search agree about what carries a facet.
+    if (opts.facet) {
+      const wanted = String(opts.facet).toLowerCase();
+      arr = arr.filter((m) => (this.facetsByMemory.get(m.id) ?? []).includes(wanted));
+    }
     if (opts.status) arr = arr.filter((m) => m.status === opts.status);
     else {
       if (!opts.includeArchived) arr = arr.filter((m) => m.status !== "archived");
@@ -407,6 +422,7 @@ export class InMemoryVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
     const scored = this.candidates(opts).flatMap((memory) =>
       memory.embedding.length !== opts.queryEmbedding.length
@@ -435,6 +451,7 @@ export class InMemoryVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; lexicalScore: number }[]> {
     const queryTokens = queryTerms(opts.query).slice(0, LEXICAL_TOKEN_LIMIT);
     if (queryTokens.length === 0) return [];
@@ -507,6 +524,7 @@ export class InMemoryVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; sharedFacets: string[] }[]> {
     const wanted = new Set(
       [...new Set(opts.facets)].map((f) => String(f ?? "").toLowerCase()).filter((f) => f.length > 0)

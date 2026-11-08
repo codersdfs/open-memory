@@ -347,6 +347,10 @@ describe("the third candidate arm", () => {
         importance: 0.5
       });
       store.hiddenId = hit.id;
+      // P5 (ADR-0047): the WRITE path now consults the capability for its conflict
+      // window, flag or no flag — the flag owns retrieval, not the table. The counter
+      // resets here so what the search is measured against is retrieval's own reads.
+      calls.armQueries = 0;
       const r = await svc.search({ query: QUERY, namespace: NS, threshold: 0, k: 5 });
       expect(calls.armQueries).toBe(0);
       // The row is in the store but the two arms it is hidden from cannot surface it.
@@ -376,6 +380,7 @@ describe("the third candidate arm", () => {
           importance: 0.5
         });
         store.hiddenId = target.id;
+        calls.armQueries = 0; // count only retrieval's reads (P5's window also consults at write time)
         const r = await svc.search({ query: QUERY, namespace: NS, threshold: 0, k: 5, explain: true });
         expect(calls.armQueries).toBeGreaterThan(0);
         const item = r.memories.find((m) => m.id === target.id);
@@ -410,6 +415,7 @@ describe("the third candidate arm", () => {
           importance: 0.5
         });
         store.hiddenId = stranger.id;
+        calls.armQueries = 0; // count only retrieval's reads (P5's window also consults at write time)
         const r = await svc.search({ query: QUERY, namespace: NS, threshold: 0, k: 5 });
         expect(calls.armQueries).toBeGreaterThan(0); // the arm ran and proposed it
         expect(r.memories.map((m) => m.id)).not.toContain(stranger.id);

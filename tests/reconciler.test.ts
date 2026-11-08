@@ -93,12 +93,15 @@ describe("reconcile", () => {
     expect(untyped).toMatchObject({ action: "insert", reason: "typed-no-delete" });
   });
 
-  it("treats a throwing judge as insert", async () => {
+  it("tags a throwing judge as judge-failed, not model-unavailable (P5)", async () => {
     const d = await reconcile({
       ...base, embedderKind: "nim", text: "unrelated wording",
       neighbours: [{ memory: mem(), vectorScore: 0.9 }],
       relation: async () => { throw new Error("down"); }
     });
-    expect(d).toMatchObject({ action: "insert", reason: "model-unavailable" });
+    expect(d).toMatchObject({ action: "insert", reason: "judge-failed" });
+    expect(d.tags).toContain("judged:failed");
+    expect(d.conflictFacet).toBeUndefined();
+    expect(d.tags.every((t) => !t.startsWith("conflict:"))).toBe(true);
   });
 });
