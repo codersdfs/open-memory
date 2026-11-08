@@ -1,6 +1,6 @@
-import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
+import type { ChainView, KnowledgeEdge, Memory, MemoryEvent, MemoryInput, WriteEventMeta } from "../types.js";
 
-export type { KnowledgeEdge };
+export type { ChainView, KnowledgeEdge, MemoryEvent };
 
 /**
  * Lexical candidate hygiene at scale (ADR-0019), shared by both stores so their
@@ -185,8 +185,14 @@ export interface VectorStore {
     tags?: string[];
     knowledgeId?: string | null;
     knowledgeSection?: string | null;
-  }): Promise<Memory | null>;
-  supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[]): Promise<Memory>;
+  }, meta?: WriteEventMeta): Promise<Memory | null>;
+  /**
+   * Retire `oldId` and store `newInput` in its place. `meta` is what the history row
+   * records about the decision (P6, ADR-0045): the reconcile reason and the judge
+   * that made the call. The invalidation (`is_deleted = 1`, `invalid_at = now`) and
+   * the supersede event land in one transaction with the successor's insert.
+   */
+  supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[], meta?: WriteEventMeta): Promise<Memory>;
   // brute-force vector scan over namespace partition
   vectorSearch(opts: {
     namespace: string;
@@ -303,6 +309,26 @@ export interface VectorStore {
    * Optional in the same way `insertMany` is: a v0.3 store still compiles.
    */
   purgeDeleted?(opts: { olderThanMs: number }): Promise<number>;
+
+  /**
+   * The write history of one memory (P6, ADR-0045): the append-only `memory_events`
+   * rows for that id, oldest first. Events survive the row itself — `purgeDeleted`
+   * removes the memory and never its history, so a purged id still answers with the
+   * story of what happened to it. Optional like every late capability: a third-party
+   * store written before it keeps compiling, and `MemoryService.drill` then reports
+   * the chain without the events instead of pretending there were none.
+   */
+  history?(id: string): Promise<MemoryEvent[]>;
+
+  /**
+   * The live rows whose `supersedes_id` names this id — the forward half of the
+   * chain. Tombstones included on purpose: the rows that superseded this one are
+   * themselves retired the moment something supersedes them, so an includeDeleted
+   * filter would cut the chain off one hop in. Optional: without it, `drill` falls
+   * back to paging the partition and filtering (correct at any size, only slow —
+   * the same trade `listProjects` accepts).
+   */
+  successorsOf?(id: string): Promise<Memory[]>;
   /**
    * Knowledge index (ADR-0023). Optional: the capability arrived in v0.7 and a
    * v0.6 store must keep compiling. `MemoryService.syncKnowledge` reports the

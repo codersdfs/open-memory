@@ -166,7 +166,10 @@ export async function archiveStale(store: VectorStore, opts: ArchiveStaleOptions
       // row the write-time judge rated highly is never demoted by the clock alone
       // (ADR-0021). Reviewers of the P2 change check this line on purpose.
       if (memory.importance >= importanceBelow) return;
-      await store.updateMeta(memory.id, { status: "archived" });
+      // The history row (P6, ADR-0045) names the rule that archived the row, so the
+      // event is readable as "the hotness rule did this" and not as an unexplained
+      // status flip.
+      await store.updateMeta(memory.id, { status: "archived" }, { reason: "decay:hotness" });
       archived++;
     });
   }

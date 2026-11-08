@@ -58,6 +58,25 @@ export function textHash(text: string): string {
 }
 
 /**
+ * The event-time clock (`valid_at`, P6/ADR-0045) read back out of the text: the last
+ * `(at:YYYY-MM-DD)` stamp ADR-0015 put there. Last, not first — a merged supersede
+ * row (` (previously: …)`) can carry two stamps, and the one at the end is the
+ * writer's. Parsed on the local calendar, exactly the calendar `formatLocalDate`
+ * wrote it in (extractor.ts:90), so the round trip is the same day it stamped.
+ * NULL when the text names no date: a column that guessed would be worse than one
+ * that admits it does not know.
+ */
+export function extractValidAt(text: string): number | null {
+  const stamps = text.match(/\(at:(\d{4})-(\d{2})-(\d{2})\)/g);
+  if (!stamps || stamps.length === 0) return null;
+  const last = stamps[stamps.length - 1]!;
+  const m = /\(at:(\d{4})-(\d{2})-(\d{2})\)/.exec(last);
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isNaN(d.getTime()) ? null : d.getTime();
+}
+
+/**
  * Word tokens. A CJK run contributes character bigrams instead of one token, because
  * Chinese has no spaces: one token per sentence would make every Chinese pair score 0
  * or 1 and nothing in between.

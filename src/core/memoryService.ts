@@ -3,7 +3,7 @@ import type { EmbeddingProvider } from "./embedding/provider.js";
 import { createEmbeddingProvider } from "./embedding/index.js";
 import type { ProjectSummary, VectorStore } from "./store/interface.js";
 import { HybridRetriever } from "./retrieval/hybrid.js";
-import type { Memory, MemoryInput, SearchOptions, SearchResult } from "./types.js";
+import type { ChainView, Memory, MemoryInput, SearchOptions, SearchResult } from "./types.js";
 import { Extractor } from "./extraction/extractor.js";
 import { InMemoryVectorStore } from "./store/memory.js";
 import { resolveDbPath } from "./dbPath.js";
@@ -293,12 +293,16 @@ export class MemoryService {
       const storedEmbedding = decision.text === input.text
         ? embedding
         : await this.embedder.embed(decision.text, { inputType: "passage" });
+      // The supersede history row (P6, ADR-0045) records the decision that retired the
+      // old row: the reconcile reason, and which judge made it when a model did — the
+      // gap this closes is exactly "the verdict used to be one console.warn line".
+      const model = decision.reason.startsWith("model-") ? (this.relation ? "injected-relation-judge" : "jev") : null;
       const memory = await this.store.supersede(decision.oldId, {
         ...target,
         text: decision.text,
         tags: decision.tags,
         importance: Math.max(old?.importance ?? 0, input.importance ?? 0.5)
-      }, storedEmbedding);
+      }, storedEmbedding, { reason: decision.reason, model });
       // A model decision that deleted a row is the one event a user cannot reconstruct
       // from the store afterwards, so it leaves a line behind.
       if (decision.reason.startsWith("model-")) {
@@ -520,6 +524,95 @@ export class MemoryService {
 
   async get(id: string): Promise<Memory | null> {
     return this.store.getById(id);
+  }
+
+  /**
+   * The whole supersede chain of one row, walked only when the caller asks
+   * (P6, ADR-0045): `GET /memories/:id?drill=1`, `ai-memory get <id> --history`.
+   *
+   * Explicitly not part of any search: retrieval carries the one-hop predecessor
+   * pointer inside the budget (hybrid.ts), never this walk — adding a chain to the
+   * candidate pool is the PRF mistake again (ADR-0028: merged rows crowd a fixed
+   * budget, evidence-any fell 76% → 72%), and a chain the caller did not ask for is
+   * context the caller must pay for reading.
+   *
+   * A purged id still answers: `memory` null, `events` holding whatever the
+   * append-only log kept — that is the audit half of the write-history table.
+   */
+  async drill(id: string): Promise<ChainView> {
+    const memory = await this.store.getById(id);
+    const events = (await this.store.history?.(id)) ?? [];
+    if (!memory) return { memory: null, ancestors: [], successors: [], events };
+
+    // Backward along `supersedesId`, nearest first. A cycle (or a self-supersede)
+    // terminates on the seen-set, the same guard the console walk uses.
+    const seen = new Set<string>([id]);
+    const ancestors: Memory[] = [];
+    let cursor = memory.supersedesId ?? null;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const row = await this.store.getById(cursor);
+      if (!row) break;
+      ancestors.push(row);
+      cursor = row.supersedesId ?? null;
+    }
+
+    // Forward: breadth-first over rows whose `supersedes_id` names a chain member.
+    // The store capability is one indexed query per level; without it, the fallback
+    // pages the origin's own partition — supersede never crosses a namespace (the
+    // replacement is written into the old row's partition), so the sweep is bounded
+    // by that partition, correct at any size and only slow, the trade `listProjects`
+    // already accepts.
+    const successors: Memory[] = [];
+    let queue = [id];
+    if (this.store.successorsOf) {
+      while (queue.length > 0) {
+        const next: string[] = [];
+        for (const parent of queue) {
+          for (const child of await this.store.successorsOf(parent)) {
+            if (seen.has(child.id)) continue;
+            seen.add(child.id);
+            successors.push(child);
+            next.push(child.id);
+          }
+        }
+        queue = next;
+      }
+    } else {
+      const byParent = new Map<string, Memory[]>();
+      for (let offset = 0; ; offset += 500) {
+        const page = await this.store.list({
+          namespace: memory.namespace,
+          includeDeleted: true,
+          includeArchived: true,
+          includeDraft: true,
+          limit: 500,
+          offset,
+          withVectors: false
+        });
+        for (const row of page.memories) {
+          if (!row.supersedesId) continue;
+          const held = byParent.get(row.supersedesId);
+          if (held) held.push(row);
+          else byParent.set(row.supersedesId, [row]);
+        }
+        if (page.memories.length === 0 || offset + page.memories.length >= page.total) break;
+      }
+      while (queue.length > 0) {
+        const next: string[] = [];
+        for (const parent of queue) {
+          for (const child of byParent.get(parent) ?? []) {
+            if (seen.has(child.id)) continue;
+            seen.add(child.id);
+            successors.push(child);
+            next.push(child.id);
+          }
+        }
+        queue = next;
+      }
+    }
+
+    return { memory, ancestors, successors, events };
   }
 
   /**

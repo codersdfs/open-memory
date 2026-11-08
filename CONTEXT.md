@@ -115,8 +115,14 @@ _Avoid_: index, ANN (it is neither — nothing is approximated and no structure 
 **Bulk write**: `insertMany` / `saveMany` / `POST /memories/bulk` — one transaction and one embed batch for up to 5000 rows, with write-time reconcile **off** by default because a five-neighbour search per row is quadratic on an import. A bulk import is new material; a history replay that must reconcile passes the flag. The cheap gates do run here (ADR-0018 amendment, 2026-11-07): the curation verdict per row — a rejected line skips with a `skipDetails` reason rather than killing the batch, and `secret` plus empty text are refused even under `raw` — plus exact-text folding on the derived `text_hash` column within one partition (namespace, project, type), against readable live rows only.
 _Avoid_: batch insert (it undersells the reconcile decision), import (that is the CLI verb)
 
-**Purge / compact**: `purgeDeleted` hard-deletes tombstones (and their postings and vectors) and cannot be undone; `compact` VACUUMs the file and reports footprint (db + WAL + shm). Soft delete keeps bytes, so without the pair the file only grows.
+**Purge / compact**: `purgeDeleted` hard-deletes tombstones (and their postings and vectors) and cannot be undone; `compact` VACUUMs the file and reports footprint (db + WAL + shm). Soft delete keeps bytes, so without the pair the file only grows. What it never touches is the write history: the row goes, its events stay.
 _Avoid_: cleanup, vacuum (one is a policy, the other is a command)
+
+**Write history (memory_events)**: The append-only log every write point commits in the same transaction as its write — insert, reinforce, supersede, archive, each with old/new/reason/model/at (mem0's history-table shape). Nothing updates or deletes it, which is the whole point: `purgeDeleted` removes the row and not the story, and a purged id still answers. Read it through the explicit walk — `ai-memory get <id> --history` or `GET /memories/:id?drill=1` — which returns the whole supersede chain plus the row's events; search itself carries only the one-hop `前身(日期): 摘要` pointer inside the budget leftover, never the chain (a chain in the candidate pool is the ADR-0028 PRF trade, measured at −4 evidence points) (ADR-0045).
+_Avoid_: audit trail (that says who touched what; this says what happened to the fact), changelog, event sourcing (rows are not derived by replay)
+
+**Two clocks**: `valid_at` — when the fact became true, read from the row's own `(at:YYYY-MM-DD)` stamp and NULL when the text names no date — and `invalid_at` — when a supersede retired it, written in the same UPDATE as the tombstone. `created_at` is when the store learned it and answers neither question. A plain forget leaves `invalid_at` NULL: removed is not the same as no longer true (ADR-0045, dates per ADR-0015).
+_Avoid_: bi-temporal (only two of the five axes exist here), timestamps (that hides which clock answered what)
 
 **Console**: The one browser UI (`ui/`, built to `dist/src/ui-next`, served at `/`). It is a client of the store, not part of it — distinct from the store, the CLI and the MCP server.
 _Avoid_: inspector, dashboard, front-end

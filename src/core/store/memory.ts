@@ -1,17 +1,25 @@
 import { randomUUID } from "crypto";
-import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
+import type { KnowledgeEdge, Memory, MemoryEvent, MemoryEventKind, MemoryInput, WriteEventMeta } from "../types.js";
 import type { KnowledgeCapability, ProjectSummary, VectorStore } from "./interface.js";
 import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CAP } from "./interface.js";
 import { cosineSimilarity } from "../embedding/provider.js";
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { deriveKind } from "../write/kind.js";
-import { textHash } from "../write/text.js";
+import { extractValidAt, textHash } from "../write/text.js";
 import { median } from "../stats.js";
 
 export class InMemoryVectorStore implements VectorStore {
   private map = new Map<string, Memory>();
   /** Store-level KV, mirror of the SQL `store_meta` table (P2, ADR-0016 amendment). */
   private meta = new Map<string, string>();
+  /**
+   * The write history (P6, ADR-0045), mirror of the SQL `memory_events` table: an
+   * append-only array with a monotonic id, so `history(id)` reads the same shape both
+   * stores answer and a test that passes on one proves the other. Nothing here ever
+   * removes an entry — not even a purge.
+   */
+  private events: MemoryEvent[] = [];
+  private eventSeq = 0;
 
   async init(): Promise<void> {}
   close(): void {}
@@ -22,6 +30,25 @@ export class InMemoryVectorStore implements VectorStore {
 
   async setMeta(key: string, value: string): Promise<void> {
     this.meta.set(key, value);
+  }
+
+  /** Append one history row; the caller owns "same instant as the write". */
+  private logEvent(
+    memoryId: string,
+    event: MemoryEventKind,
+    at: number,
+    fields: { oldValue?: string | null; newValue?: string | null; reason?: string | null; model?: string | null } = {}
+  ): void {
+    this.events.push({
+      id: ++this.eventSeq,
+      memoryId,
+      event,
+      oldValue: fields.oldValue ?? null,
+      newValue: fields.newValue ?? null,
+      reason: fields.reason ?? null,
+      model: fields.model ?? null,
+      at
+    });
   }
 
   async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
@@ -49,10 +76,15 @@ export class InMemoryVectorStore implements VectorStore {
       visibility: input.visibility ?? "private",
       status: input.status ?? "active",
       pin: input.pin ?? 0,
+      // P6: event-time clock from the text's own stamp, same derivation as the SQL
+      // buildRow — the two stores must agree by construction.
+      validAt: extractValidAt(input.text),
+      invalidAt: null,
       createdAt: now,
       updatedAt: now
     };
     this.map.set(mem.id, mem);
+    this.logEvent(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
     return mem;
   }
 
@@ -256,19 +288,35 @@ export class InMemoryVectorStore implements VectorStore {
   }
 
   async deleteSoft(id: string): Promise<void> {
+    // No history row, `invalid_at` stays NULL — same contract as the SQL store: a
+    // plain forget is a tombstone, not one of the four write points.
     const m = this.map.get(id);
     if (m) { m.isDeleted = 1; m.updatedAt = Date.now(); }
   }
 
   async updateEmbedding(id: string, embedding: number[], text: string): Promise<void> {
     const m = this.map.get(id);
-    if (m) { m.embedding = embedding; m.text = text; m.updatedAt = Date.now(); }
+    // The text changed, so the clocks that describe it follow — same as the SQL
+    // store's transaction: hash is derived per read here, valid_at recomputed.
+    if (m) { m.embedding = embedding; m.text = text; m.validAt = extractValidAt(text); m.updatedAt = Date.now(); }
   }
 
-  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null }): Promise<Memory | null> {
+  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null }, meta?: WriteEventMeta): Promise<Memory | null> {
     const m = this.map.get(id);
     if (!m) return null;
-    if (patch.status !== undefined) m.status = patch.status as Memory["status"];
+    if (patch.status !== undefined) {
+      // The archive write point (P6, ADR-0045), mirror of the SQL transaction: the
+      // prior status read before the flip, the event written with it, a re-archive
+      // a no-op, a restore unrecorded.
+      if (patch.status === "archived" && m.status !== "archived") {
+        this.logEvent(id, "archive", Date.now(), {
+          oldValue: m.status,
+          newValue: "archived",
+          reason: meta?.reason ?? null
+        });
+      }
+      m.status = patch.status as Memory["status"];
+    }
     if (patch.pin !== undefined) m.pin = patch.pin;
     if (patch.visibility !== undefined) m.visibility = patch.visibility as Memory["visibility"];
     if (patch.isDeleted !== undefined) m.isDeleted = patch.isDeleted;
@@ -280,12 +328,39 @@ export class InMemoryVectorStore implements VectorStore {
     return m;
   }
 
-  async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[]): Promise<Memory> {
+  /**
+   * Mirror of the SQL supersede (P6, ADR-0045): successor's insert event, the old
+   * row's invalidation with `invalidAt = now` in the same mutation, the supersede
+   * event carrying the decision. There is no transaction to wrap here — the map
+   * mutations below are the same three writes the SQL version commits atomically.
+   */
+  async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[], meta?: WriteEventMeta): Promise<Memory> {
     const old = this.map.get(oldId);
     if (!old) throw new Error(`old memory ${oldId} not found`);
     const created = await this.insert({ ...newInput, supersedesId: oldId }, newEmbedding);
-    await this.deleteSoft(oldId);
+    const now = Date.now();
+    old.isDeleted = 1;
+    old.invalidAt = now;
+    old.updatedAt = now;
+    this.logEvent(oldId, "supersede", now, {
+      oldValue: old.text,
+      newValue: created.text,
+      reason: meta?.reason ?? null,
+      model: meta?.model ?? null
+    });
     return created;
+  }
+
+  /** The append-only history of one id (P6, ADR-0045), oldest first — purge-proof by construction. */
+  async history(id: string): Promise<MemoryEvent[]> {
+    return this.events.filter((e) => e.memoryId === id).sort((a, b) => a.id - b.id);
+  }
+
+  /** Forward half of the chain: every row whose `supersedesId` names this id, tombstones included. */
+  async successorsOf(id: string): Promise<Memory[]> {
+    return [...this.map.values()]
+      .filter((m) => m.supersedesId === id)
+      .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   }
 
   async vectorSearch(opts: {
@@ -390,11 +465,15 @@ export class InMemoryVectorStore implements VectorStore {
     let n = 0;
     for (const id of new Set(ids)) {
       const m = this.map.get(id);
-      if (!m) continue;
+      // Tombstones skip, exactly as the SQL WHERE's `is_deleted = 0` — and so does
+      // their history row: the event is written inside the branch that moved.
+      if (!m || m.isDeleted !== 0) continue;
       m.strength = Math.min(0.95, m.strength + 0.02);
       m.useCount = (m.useCount ?? 0) + 1;
       m.lastUsedAt = now;
       m.updatedAt = now;
+      // The text did not change, so old/new stay NULL (see MemoryEvent in types.ts).
+      this.logEvent(id, "reinforce", now);
       n++;
     }
     return n;

@@ -89,6 +89,20 @@ export interface Memory {
   visibility: MemoryVisibility; // always 'private' for solo (ADR-0006)
   status: MemoryStatus; // governance-lite
   pin: number; // 0/1 — pinned memories rank first
+  /**
+   * The event-time clock (P6, ADR-0045): epoch ms parsed from the row's own
+   * `(at:YYYY-MM-DD)` stamp (ADR-0015) — when the fact became true, as the text
+   * states it. `created_at` is when the store learned it; the two differ by however
+   * long the agent waited to write. NULL when the text carries no stamp — a column
+   * that guessed would be worse than one that admits it does not know.
+   */
+  validAt: number | null;
+  /**
+   * The invalidation clock (P6, ADR-0045): epoch ms of the supersede that retired
+   * this row, written in the same UPDATE that sets `is_deleted = 1`. A plain forget
+   * leaves it NULL — a tombstone means "removed", not "stopped being true".
+   */
+  invalidAt: number | null;
   createdAt: number; // epoch ms
   updatedAt: number;
 }
@@ -322,4 +336,64 @@ export interface KnowledgeEdge {
   to: string | null;
   /** The link exactly as written (`[[x|alias]]` → `x|alias`), for editing. */
   target: string;
+}
+
+/**
+ * The four write points that get a history row (P6, ADR-0045). Shape follows mem0's
+ * history table (bench/.venv-mem0/.../storage.py:108-119: id/memory_id/old_memory/
+ * new_memory/event) — the one thing that file measured is that an append-only log
+ * keyed by memory id is enough to answer "what happened to this fact".
+ */
+export type MemoryEventKind = "insert" | "reinforce" | "supersede" | "archive";
+
+/**
+ * One append-only history row. Never updated, never deleted — not even by
+ * `purgeDeleted`, whose whole point is removing rows while keeping the story of
+ * what happened to them.
+ *
+ * `oldValue`/`newValue` mean a different thing per event kind, because the four
+ * write points change different things:
+ *   - `insert`    — old NULL, new = the stored text; `reason` = the row's `source`.
+ *   - `reinforce` — both NULL: the text did not change, and the single-UPDATE shape
+ *     (no read-modify-write race, ADR-0028's lesson) is worth more than two copies
+ *     of an unchanged string. The event itself is the record of the retrieval.
+ *   - `supersede` — old = the replaced text, new = the successor's text;
+ *     `reason` = the reconcile reason, `model` = the judge that made the call.
+ *   - `archive`   — old = the previous status, new = `archived`;
+ *     `reason` = the rule that archived (e.g. `decay:hotness`).
+ */
+export interface MemoryEvent {
+  id: number;
+  memoryId: string;
+  event: MemoryEventKind;
+  oldValue: string | null;
+  newValue: string | null;
+  reason: string | null;
+  model: string | null;
+  /** Epoch ms — when the write happened, not when anyone read about it. */
+  at: number;
+}
+
+/**
+ * What a caller hands a store write so the history row can name the decision that
+ * caused it. Optional everywhere: a caller that does not know says nothing, and the
+ * event still lands with the fields it does know.
+ */
+export interface WriteEventMeta {
+  reason?: string | null;
+  model?: string | null;
+}
+
+/**
+ * The full supersede chain of one row, walked only when asked (`?drill=1` /
+ * `ai-memory get <id> --history`; ADR-0045). `ancestors` is nearest-first along
+ * `supersedesId`, `successors` is breadth-first over the rows that supersede this
+ * one, `events` is the origin row's write history. A purged id still answers —
+ * `memory` null with whatever events survived it, which is the audit half of P6.
+ */
+export interface ChainView {
+  memory: Memory | null;
+  ancestors: Memory[];
+  successors: Memory[];
+  events: MemoryEvent[];
 }

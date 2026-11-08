@@ -1,13 +1,13 @@
 // @ts-nocheck
 import { randomUUID } from "crypto";
 import { statSync } from "node:fs";
-import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
+import type { KnowledgeEdge, Memory, MemoryEvent, MemoryEventKind, MemoryInput, WriteEventMeta } from "../types.js";
 import type { KnowledgeCapability, ProjectSummary, VectorStore } from "./interface.js";
 import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CAP, PINNED_ORDER_DF } from "./interface.js";
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { PartitionCache, type PartitionRow, type PartitionVectors } from "./partitionCache.js";
 import { deriveKind } from "../write/kind.js";
-import { textHash } from "../write/text.js";
+import { extractValidAt, textHash } from "../write/text.js";
 import { median } from "../stats.js";
 
 /**
@@ -366,6 +366,8 @@ export class SqliteVectorStore implements VectorStore {
   private changeSeq = 0;
   /** Trim the log at twice this, so one slice amortises over many writes. */
   private static readonly CHANGE_LOG = 4096;
+  /** Prepared once; `node:sqlite` statements are cheap to hold, expensive to rebuild per write. */
+  private _eventStmt: any;
 
   constructor(dbPath = process.env.MEMORY_DB_PATH ?? "memory.db") {
     this.dbPath = dbPath;
@@ -515,6 +517,37 @@ export class SqliteVectorStore implements VectorStore {
         this.db.exec(`UPDATE memories SET use_count = 0 WHERE use_count IS NULL`)
       );
     }
+    // P6 (ADR-0045): the event-time clock. `valid_at` is parsed from the row's own
+    // `(at:YYYY-MM-DD)` stamp (ADR-0015) — a column for the date that used to be
+    // buried in the text, because a timeline you can only reach with LIKE is not a
+    // timeline. Same single-transaction shape as `text_hash`/`use_count` above:
+    // ALTER and the backfill commit together or not at all, so a crash rolls the
+    // column back and the next open re-runs the whole migration. Rows whose text
+    // carries no stamp keep NULL — "no match does not move" is the contract; a
+    // guessed date would be worse than an admitted unknown.
+    if (!cols.has("valid_at")) {
+      await this.runMigrationTxn(`ALTER TABLE memories ADD COLUMN valid_at INTEGER`, () => this.backfillValidAt());
+    }
+    // P6: the invalidation clock, the other half of the pair. Forward writes come
+    // only from a supersede (the one UPDATE that flips `is_deleted` also stamps
+    // `invalid_at`); the backfill recovers the supersede half for rows already in
+    // that state — a superseded row retired at its successor's `created_at` — and
+    // deliberately leaves plain tombstones NULL: a forget means "removed", and
+    // writing a guess there would corrupt the one honest reading.
+    if (!cols.has("invalid_at")) {
+      await this.runMigrationTxn(
+        `ALTER TABLE memories ADD COLUMN invalid_at INTEGER`,
+        () =>
+          this.db.exec(`
+            UPDATE memories SET invalid_at = (
+              SELECT succ.created_at FROM memories succ WHERE succ.supersedes_id = memories.id
+              ORDER BY succ.created_at ASC LIMIT 1
+            )
+            WHERE is_deleted = 1 AND invalid_at IS NULL
+              AND EXISTS (SELECT 1 FROM memories succ WHERE succ.supersedes_id = memories.id)
+          `)
+      );
+    }
     // 3. create indexes (after columns guaranteed to exist)
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_memories_ns_type ON memories(namespace, type);
@@ -581,6 +614,26 @@ export class SqliteVectorStore implements VectorStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+    `);
+    // P6 (ADR-0045): the write history. Append-only by construction — nothing in
+    // this file ever UPDATEs or DELETEs from it, and that is the point: the row a
+    // hard delete removes is exactly the row whose story has to keep answering.
+    // Shape follows mem0's history table (id/memory_id/old_memory/new_memory/event,
+    // bench/.venv-mem0/.../storage.py:108-119), minus its `is_deleted` flag — the
+    // log here is never soft-deleted, so the flag would always read 0. One row per
+    // write point, written in the same transaction as the write it describes.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id TEXT NOT NULL,
+        event TEXT NOT NULL CHECK (event IN ('insert','reinforce','supersede','archive')),
+        old_value TEXT,
+        new_value TEXT,
+        reason TEXT,
+        model TEXT,
+        at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events(memory_id);
     `);
     this.backfillTerms();
     this.rebuildTermDfIfEmpty();
@@ -752,6 +805,37 @@ export class SqliteVectorStore implements VectorStore {
       .run(id, embedding.length, packVector(embedding), Math.sqrt(norm), q8, scale);
   }
 
+  /**
+   * One history row (P6, ADR-0045). Caller owns the transaction — an event is only
+   * truthful when it commits with the write it describes; an event that lands after
+   * a rollback would report a write the store never accepted.
+   */
+  private insertEventSync(
+    memoryId: string,
+    event: MemoryEventKind,
+    at: number,
+    fields: { oldValue?: string | null; newValue?: string | null; reason?: string | null; model?: string | null } = {}
+  ): void {
+    this.eventStmt().run(
+      memoryId,
+      event,
+      fields.oldValue ?? null,
+      fields.newValue ?? null,
+      fields.reason ?? null,
+      fields.model ?? null,
+      at
+    );
+  }
+
+  private eventStmt(): any {
+    if (!this._eventStmt) {
+      this._eventStmt = this.db.prepare(
+        `INSERT INTO memory_events (memory_id, event, old_value, new_value, reason, model, at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+    }
+    return this._eventStmt;
+  }
+
   /** Full rows for a set of ids, one query. Missing ids are simply absent. */
   private fetchByIds(ids: string[]): Map<string, Row> {
     const out = new Map<string, Row>();
@@ -910,6 +994,54 @@ export class SqliteVectorStore implements VectorStore {
     }
   }
 
+  /**
+   * One-time derivation of `valid_at` for rows that predate the column
+   * (P6, ADR-0045). Same shape as `backfillTextHashes`: the caller's transaction
+   * holds the ALTER, chunked SELECTs bound the memory, and the loop runs to empty —
+   * a store is never big enough to silently keep NULLs on rows that do carry a
+   * stamp. Rows with no `(at:…)` in the text are left NULL on purpose: the column
+   * records what the text states, and inventing a date from `created_at` would
+   * blur the two clocks the column exists to separate.
+   *
+   * Unlike `backfillTextHashes` (whose `textHash` has a value for every text, so
+   * every selected row leaves the set the same pass), this loop can select a row it
+   * then refuses to update — and a row that stays selected forever means the loop
+   * never ends, inside `init()`'s migration write lock. Two independent guards
+   * close that (the 2026-11-08 review reproduced the hang with a literal
+   * `(at:YYYY-MM-DD)` template in an old store):
+   *   - the pre-filter demands the *numeric* shape (GLOB `[0-9]` classes, not LIKE
+   *     `_`, which matches any character and let `(at:abcd-ef-gh)` through);
+   *   - a pass that updated nothing ends the loop — selected-but-rejected rows are
+   *     exactly the "no match does not move" population, so leaving them NULL is
+   *     the contract, not a failure to retry.
+   */
+  private backfillValidAt(): void {
+    const stmt = this.db.prepare(`UPDATE memories SET valid_at = ? WHERE id = ?`);
+    for (;;) {
+      const rows = this.db
+        .prepare(
+          `SELECT id, text FROM memories
+            WHERE valid_at IS NULL
+              AND text GLOB '*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
+            LIMIT 5000`
+        )
+        .all() as { id: string; text: string }[];
+      if (rows.length === 0) break;
+      let updated = 0;
+      for (const row of rows) {
+        const at = extractValidAt(row.text);
+        if (at !== null) {
+          stmt.run(at, row.id);
+          updated++;
+        }
+      }
+      // The termination guarantee: a pass with zero updates can never make progress
+      // on the next one — the same rows would be selected again. Break instead of
+      // holding the migration's write lock forever.
+      if (updated === 0) break;
+    }
+  }
+
   private ensure() {
     if (!this.ready || !this.db) throw new Error("store not initialized — call init()");
   }
@@ -1000,12 +1132,17 @@ export class SqliteVectorStore implements VectorStore {
     // Row + posting list + vector in one transaction: a memory whose terms never
     // landed would be invisible to lexical search while looking perfectly healthy,
     // and a row whose vector is missing is invisible to every search at once.
+    // The insert event rides the same transaction (P6, ADR-0045) — an event that
+    // committed without its write, or a write without its event, would both be a
+    // history that lies.
+    const now = mem.createdAt;
     await this.retryWrite(() => {
       this.db.exec("BEGIN IMMEDIATE");
       try {
         this.runInsert(stmt, mem);
         this.indexTermsSync(mem.id, mem.text);
         this.writeVectorSync(mem.id, embedding);
+        this.insertEventSync(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
         this.db.exec("COMMIT");
       } catch (err) {
         try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
@@ -1038,6 +1175,12 @@ export class SqliteVectorStore implements VectorStore {
           this.runInsert(stmt, made[i]);
           this.indexTermsSync(made[i].id, made[i].text);
           this.writeVectorSync(made[i].id, items[i].embedding);
+          // One event per row, same transaction as the batch (P6, ADR-0045): a bulk
+          // import that left no history would be the one write nobody could audit.
+          this.insertEventSync(made[i].id, "insert", made[i].createdAt, {
+            newValue: made[i].text,
+            reason: items[i].input.source ?? null
+          });
         }
         this.db.exec("COMMIT");
       } catch (err) {
@@ -1126,6 +1269,11 @@ export class SqliteVectorStore implements VectorStore {
       visibility: input.visibility ?? "private",
       status: input.status ?? "active",
       pin: input.pin ?? 0,
+      // P6 (ADR-0045): the event-time clock comes from the text's own stamp, or
+      // stays NULL when the text names no date. Derived here, at the one INSERT
+      // every write path shares, for the same reason `text_hash` is.
+      validAt: extractValidAt(input.text),
+      invalidAt: null,
       createdAt: now,
       updatedAt: now
     };
@@ -1133,8 +1281,8 @@ export class SqliteVectorStore implements VectorStore {
 
   private insertStmt(): any {
     return this.db.prepare(
-      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at, text_hash, use_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at, text_hash, use_count, valid_at, invalid_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
   }
 
@@ -1167,7 +1315,9 @@ export class SqliteVectorStore implements VectorStore {
       // supersede): a hash computed anywhere else is a hash that can drift from its
       // row and silence the wrong insert (ADR-0018 amendment).
       textHash(mem.text),
-      mem.useCount
+      mem.useCount,
+      mem.validAt,
+      mem.invalidAt
     );
   }
 
@@ -1176,6 +1326,41 @@ export class SqliteVectorStore implements VectorStore {
     const stmt = this.db.prepare(`SELECT * FROM memories WHERE id = ?`);
     const row = stmt.get(id) as Row | undefined;
     return row ? this.attachVectors([memoryFromRow(row)])[0] : null;
+  }
+
+  /**
+   * The write history of one row (P6, ADR-0045), oldest first. Reads `memory_events`
+   * and nothing else, so a purged id still answers with the events that survived it.
+   */
+  async history(id: string): Promise<MemoryEvent[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT id, memory_id, event, old_value, new_value, reason, model, at FROM memory_events WHERE memory_id = ? ORDER BY id ASC`)
+      .all(id) as { id: number; memory_id: string; event: MemoryEventKind; old_value: string | null; new_value: string | null; reason: string | null; model: string | null; at: number }[];
+    return rows.map((r) => ({
+      id: r.id,
+      memoryId: r.memory_id,
+      event: r.event,
+      oldValue: r.old_value,
+      newValue: r.new_value,
+      reason: r.reason,
+      model: r.model,
+      at: r.at
+    }));
+  }
+
+  /**
+   * Rows whose `supersedes_id` names this id — the forward half of the chain. The
+   * partial index `idx_memories_supersedes` makes it a seek. Tombstones included on
+   * purpose (see interface.ts): a chain that stops at the first retired row is not
+   * the chain.
+   */
+  async successorsOf(id: string): Promise<Memory[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT * FROM memories WHERE supersedes_id = ? ORDER BY created_at ASC, id ASC`)
+      .all(id) as Row[];
+    return rows.map(memoryFromRow);
   }
 
   async storedDim(): Promise<number | null> {
@@ -1390,6 +1575,10 @@ export class SqliteVectorStore implements VectorStore {
 
   async deleteSoft(id: string): Promise<void> {
     this.ensure();
+    // No history row here on purpose (P6, ADR-0045): a plain forget is a tombstone,
+    // not one of the four write points, and it deliberately leaves `invalid_at` NULL
+    // — "removed" and "stopped being true" are different facts, and only supersede
+    // claims the latter.
     const stmt = this.db.prepare(`UPDATE memories SET is_deleted = 1, updated_at = ? WHERE id = ?`);
     await this.retryWrite(() => stmt.run(Date.now(), id));
     // `is_deleted` is part of the candidate WHERE, so the row leaves every partition
@@ -1401,15 +1590,19 @@ export class SqliteVectorStore implements VectorStore {
 
   async updateEmbedding(id: string, embedding: number[], text: string): Promise<void> {
     this.ensure();
-    const stmt = this.db.prepare(`UPDATE memories SET embedding = '', text = ?, text_hash = ?, updated_at = ? WHERE id = ?`);
+    const stmt = this.db.prepare(
+      `UPDATE memories SET embedding = '', text = ?, text_hash = ?, valid_at = ?, updated_at = ? WHERE id = ?`
+    );
     // `reembed` can arrive with different text; the posting list has to follow or
     // lexical search keeps matching the words the row used to have. The vector row
-    // is rewritten in the same transaction for the same reason — and so is the
-    // duplicate hash, which describes this row's text now, not the one it had.
+    // is rewritten in the same transaction for the same reason — and so are the
+    // duplicate hash and the event-time clock, which both describe this row's text
+    // now, not the one it had (valid_at recomputes from the new text; no match
+    // leaves it NULL — a date the text no longer states is a date it no longer has).
     await this.retryWrite(() => {
       this.db.exec("BEGIN IMMEDIATE");
       try {
-        stmt.run(text, textHash(text), Date.now(), id);
+        stmt.run(text, textHash(text), extractValidAt(text), Date.now(), id);
         const row = this.db.prepare(`SELECT rowid AS r FROM memories WHERE id = ?`).get(id) as { r: number } | undefined;
         this.indexTermsSync(id, text);
         this.writeVectorSync(id, embedding);
@@ -1427,7 +1620,11 @@ export class SqliteVectorStore implements VectorStore {
     this.noteRewrite(id, embedding);
   }
 
-  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number }): Promise<Memory | null> {
+  async updateMeta(
+    id: string,
+    patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null },
+    meta?: WriteEventMeta
+  ): Promise<Memory | null> {
     this.ensure();
     const fields: string[] = [];
     const vals: (string | number)[] = [];
@@ -1447,7 +1644,35 @@ export class SqliteVectorStore implements VectorStore {
     if (fields.length === 0) return this.getById(id);
     fields.push("updated_at = ?"); vals.push(Date.now());
     const stmt = this.db.prepare(`UPDATE memories SET ${fields.join(", ")} WHERE id = ?`);
-    await this.retryWrite(() => stmt.run(...vals, id));
+    if (patch.status === "archived") {
+      // The archive write point (P6, ADR-0045): the flip and its history row commit
+      // together. The prior status has to be read inside the same transaction — an
+      // event recording `active` for a row that was already archived would be a
+      // second lie of the same kind as an event without its write. A re-archive is
+      // a no-op and writes nothing; a restore (`status` moving anywhere else) is
+      // not one of the four write points and records no event.
+      const now = Date.now();
+      await this.retryWrite(() => {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          const row = this.db.prepare(`SELECT status FROM memories WHERE id = ?`).get(id) as { status: string | null } | undefined;
+          stmt.run(...vals, id);
+          if (row && row.status !== null && row.status !== "archived") {
+            this.insertEventSync(id, "archive", now, {
+              oldValue: row.status,
+              newValue: "archived",
+              reason: meta?.reason ?? null
+            });
+          }
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+          throw err;
+        }
+      });
+    } else {
+      await this.retryWrite(() => stmt.run(...vals, id));
+    }
     // Every patchable field here is either part of the candidate WHERE (status,
     // is_deleted, knowledge_id) or content a caller may read back, so a partition
     // holding the row is no longer a correct snapshot of it. This used to touch no
@@ -1457,12 +1682,47 @@ export class SqliteVectorStore implements VectorStore {
     return this.getById(id);
   }
 
-  async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[]): Promise<Memory> {
+  /**
+   * The supersede write point (P6, ADR-0045), all in one transaction: the successor's
+   * insert (row, postings, vector, its own insert event), the old row's invalidation
+   * — `is_deleted = 1` **and `invalid_at = now` in the same UPDATE** — and the
+   * supersede event naming the decision (`reason`) and the judge that made it
+   * (`model`). Both halves of the chain move atomically; the previous two-call shape
+   * (insert, then `deleteSoft`) left a window where the successor existed but the
+   * old row was still live with no history of why.
+   */
+  async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[], meta?: WriteEventMeta): Promise<Memory> {
     this.ensure();
     const old = await this.getById(oldId);
     if (!old) throw new Error(`old memory ${oldId} not found`);
-    const created = await this.insert({ ...newInput, supersedesId: oldId }, newEmbedding);
-    await this.deleteSoft(oldId);
+    const created = this.buildRow({ ...newInput, supersedesId: oldId }, newEmbedding);
+    const stmt = this.insertStmt();
+    const now = Date.now();
+    await this.retryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.runInsert(stmt, created);
+        this.indexTermsSync(created.id, created.text);
+        this.writeVectorSync(created.id, newEmbedding);
+        this.insertEventSync(created.id, "insert", now, { newValue: created.text, reason: newInput.source ?? null });
+        this.db.prepare(`UPDATE memories SET is_deleted = 1, invalid_at = ?, updated_at = ? WHERE id = ?`).run(now, now, oldId);
+        this.insertEventSync(oldId, "supersede", now, {
+          oldValue: old.text,
+          newValue: created.text,
+          reason: meta?.reason ?? null,
+          model: meta?.model ?? null
+        });
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw err;
+      }
+    });
+    // After the commit, never inside — both rows changed membership in every decoded
+    // partition (one joined, one left): skipping either is how the cache serves a
+    // dead row, the exact regression ADR-0034/0035 were measured on.
+    this.noteChange(created.id);
+    this.noteChange(oldId);
     return created;
   }
 
@@ -1959,18 +2219,39 @@ export class SqliteVectorStore implements VectorStore {
     // once both land, because SQLite does the arithmetic. Batched into a single
     // UPDATE because a search reinforces what it returns, and one commit per hit put
     // five fsyncs on the read path.
-    const res = await this.retryWrite(() =>
-      this.db
-        .prepare(
-          // P2 (ADR-0016 amendment): `use_count` is the third number a retrieval moves,
-          // next to strength and the use clock. COALESCE because a NULL can only come
-          // from a foreign writer — the migration backfilled every row it saw — and a
-          // NULL must count as "used once from zero", not as a poisoned NULL forever.
-          `UPDATE memories SET strength = MIN(0.95, strength + 0.02), use_count = COALESCE(use_count, 0) + 1, last_used_at = ?, updated_at = ?
+    const res = await this.retryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        // The ids that actually move. The UPDATE's WHERE excludes tombstones, and an
+        // event naming a row the write skipped would be a history that lies — one
+        // indexed SELECT inside the transaction is what buys the accurate log without
+        // opening a read-modify-write race on the numbers (the arithmetic above is
+        // still SQLite's, not ours).
+        const live = this.db
+          .prepare(`SELECT id FROM memories WHERE id IN (${unique.map(() => "?").join(", ")}) AND is_deleted = 0`)
+          .all(...(unique as any)) as { id: string }[];
+        const out = this.db
+          .prepare(
+            // P2 (ADR-0016 amendment): `use_count` is the third number a retrieval moves,
+            // next to strength and the use clock. COALESCE because a NULL can only come
+            // from a foreign writer — the migration backfilled every row it saw — and a
+            // NULL must count as "used once from zero", not as a poisoned NULL forever.
+            `UPDATE memories SET strength = MIN(0.95, strength + 0.02), use_count = COALESCE(use_count, 0) + 1, last_used_at = ?, updated_at = ?
             WHERE id IN (${unique.map(() => "?").join(", ")}) AND is_deleted = 0`
-        )
-        .run(now, now, ...(unique as any))
-    );
+          )
+          .run(now, now, ...(unique as any));
+        for (const row of live) {
+          // The text did not change, so old/new stay NULL — the event itself is the
+          // record of the retrieval (semantics per MemoryEvent in types.ts).
+          this.insertEventSync(row.id, "reinforce", now);
+        }
+        this.db.exec("COMMIT");
+        return out;
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw err;
+      }
+    });
     return (res as unknown as { changes: number }).changes ?? 0;
   }
 
@@ -2046,6 +2327,11 @@ export class SqliteVectorStore implements VectorStore {
           this.db.prepare(`DELETE FROM memory_terms WHERE memory_id IN (${marks})`).run(...(ids as any));
           this.db.prepare(`DELETE FROM memory_vectors WHERE memory_id IN (${marks})`).run(...(ids as any));
           this.db.prepare(`DELETE FROM memories WHERE id IN (${marks})`).run(...(ids as any));
+          // `memory_events` is deliberately not in this list (P6, ADR-0045): the
+          // purge exists to reclaim a row, and the story of what happened to it —
+          // inserts, reinforcements, the supersede that retired it — is the audit
+          // half the row cannot take with it. Nothing in this file ever deletes
+          // from that table.
           this.db.exec("COMMIT");
         } catch (err) {
           try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
@@ -2215,6 +2501,8 @@ type Row = {
   visibility: string | null;
   status: string | null;
   pin: number | null;
+  valid_at: number | null;
+  invalid_at: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -2249,6 +2537,10 @@ function memoryFromRow(r: Row): Memory {
     visibility: (r.visibility as Memory["visibility"]) ?? "private",
     status: (r.status as Memory["status"]) ?? "active",
     pin: r.pin ?? 0,
+    // P6 (ADR-0045): columns a pre-migration or foreign row can answer NULL for,
+    // like `strength` above — NULL here is the honest "unknown", never a guess.
+    validAt: r.valid_at ?? null,
+    invalidAt: r.invalid_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at
   };

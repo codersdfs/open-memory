@@ -657,6 +657,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       return updated ? send(res, 200, updated) : send(res, 404, { error: "not found" });
     }
     if (id && !mem[2] && method === "GET") {
+      // The chain walk (P6, ADR-0045) is explicit: `?drill=1` returns the whole
+      // supersede chain plus the row's write history. A bare GET keeps answering
+      // with the row alone — a chain nobody asked for is context the caller must
+      // pay for, and the search path carries only the one-hop predecessor pointer.
+      if (boolish(q.drill)) {
+        const view = await service.drill(id);
+        return send(res, 200, wantsEmbedding(q) ? view : {
+          ...view,
+          ...(view.memory ? { memory: stripEmbedding(view.memory) } : {}),
+          ancestors: view.ancestors.map(stripEmbedding),
+          successors: view.successors.map(stripEmbedding)
+        });
+      }
       const found = await service.get(id);
       if (!found) return send(res, 404, { error: "not found" });
       return send(res, 200, wantsEmbedding(q) ? found : stripEmbedding(found));

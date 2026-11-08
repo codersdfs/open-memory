@@ -7,7 +7,7 @@
  */
 export { MemoryService } from "./core/memoryService.js";
 export { createMemoryTool, autoInject } from "./api/tool.js";
-export type { Memory, MemoryInput, MemoryType, SearchOptions, SearchResult } from "./core/types.js";
+export type { Memory, MemoryInput, MemoryType, SearchOptions, SearchResult, MemoryEvent, MemoryEventKind, ChainView } from "./core/types.js";
 export { resolveDbPath, resolveHome } from "./core/dbPath.js";
 export { createEmbeddingProvider } from "./core/embedding/index.js";
 export { createRegistry, defaultAdapters, type Adapter, type AdapterRegistry } from "./adapters/index.js";

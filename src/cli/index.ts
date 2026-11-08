@@ -10,7 +10,7 @@ import { createEmbeddingProvider } from "../core/embedding/index.js";
 import { runtimeEnv } from "../core/settings.js";
 import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
-import type { BriefResult, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
+import type { BriefResult, ChainView, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import type { ProjectSummary } from "../core/store/interface.js";
 import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/view.js";
 import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
@@ -40,7 +40,8 @@ Memory
   search <query>         --k 5 --threshold 0.35 --budget 800 --scope private|shared --type t --kind k --project p
   brief                  what this project already decided: conventions, decisions, gotchas, open, recent
                          --budget 600 --since 14 --project p
-  get <id>               print one memory
+  get <id>               print one memory; --history walks the whole supersede chain
+                         plus the write history (ADR-0045) — never part of search
   list                   --limit 20 --type t --kind k --project p --status active
   forget <id...>         soft delete (kept, restorable)
   restore <id...>        undo a forget
@@ -365,11 +366,24 @@ async function cmdGet(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pro
     ctx.err("get: id required");
     return 2;
   }
+  // P6 (ADR-0045): --history walks the whole supersede chain and prints the row's
+  // write history. Explicit, never a search side effect — a chain the caller did
+  // not ask for is context the caller must pay for reading.
+  const history = flagBool(a, "history");
   if (await r.useDaemon()) {
-    const res = await r.client().get<unknown>(`/memories/${encodeURIComponent(id)}`);
+    const res = await r.client().get<unknown>(`/memories/${encodeURIComponent(id)}${history ? "?drill=1" : ""}`);
     if (!res.ok) {
       ctx.err(`get: ${res.error}`);
       return 1;
+    }
+    if (history) {
+      const view = unwrapChainView(res.data);
+      if (!view.memory && view.events.length === 0) {
+        ctx.err(`get: no memory ${id}`);
+        return 1;
+      }
+      ctx.out(ctx.json ? JSON.stringify(view, null, 2) : renderChainView(view, ctx));
+      return 0;
     }
     let mem: Memory;
     try {
@@ -382,6 +396,15 @@ async function cmdGet(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pro
     return 0;
   }
   const svc = await r.service();
+  if (history) {
+    const view = await svc.drill(id);
+    if (!view.memory && view.events.length === 0) {
+      ctx.err(`get: no memory ${id}`);
+      return 1;
+    }
+    ctx.out(ctx.json ? JSON.stringify(view, null, 2) : renderChainView(view, ctx));
+    return 0;
+  }
   const mem = (await svc.get(id)) ?? null;
   if (!mem) {
     ctx.err(`get: no memory ${id}`);
@@ -389,6 +412,36 @@ async function cmdGet(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pro
   }
   ctx.out(ctx.json ? JSON.stringify(mem, null, 2) : renderOne(mem));
   return 0;
+}
+
+/** The drill payload over the wire is the ChainView itself (no envelope to unwrap). */
+function unwrapChainView(data: unknown): ChainView {
+  const v = data as ChainView;
+  if (!v || typeof v !== "object" || !Array.isArray(v.ancestors) || !Array.isArray(v.events)) {
+    throw new Error("unexpected drill response");
+  }
+  return v;
+}
+
+function renderChainView(view: ChainView, ctx: Ctx): string {
+  const lines: string[] = [];
+  if (view.memory) lines.push(renderOne(view.memory));
+  else lines.push(`${"(purged)"}: the row is gone; its history survived it (ADR-0045)`);
+  const brief = (m: Memory, role: string) =>
+    `${role} ${m.id} [${m.isDeleted ? "tombstone" : m.status}] ${m.text.replace(/\s+/g, " ").slice(0, 100)}${m.text.length > 100 ? "…" : ""}`;
+  for (const a of view.ancestors) lines.push(`  ← ${brief(a, "superseded by this row:")}`);
+  for (const s of view.successors) lines.push(`  → ${brief(s, "supersedes this row:")}`);
+  if (view.events.length > 0) {
+    lines.push("  events:");
+    for (const e of view.events) {
+      const what = [e.reason, e.model].filter(Boolean).join(" / ");
+      lines.push(
+        `    ${new Date(e.at).toISOString()} ${e.event}${what ? ` (${what})` : ""}${e.newValue ? ` — ${e.newValue.replace(/\s+/g, " ").slice(0, 80)}` : ""}`
+      );
+    }
+  }
+  void ctx;
+  return lines.join("\n");
 }
 
 function renderOne(m: Memory): string {

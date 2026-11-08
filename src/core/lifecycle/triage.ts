@@ -185,7 +185,9 @@ export async function runTriage(store: VectorStore, opts: TriageOptions = {}): P
             action: "archive",
             reason: verdict.junk,
           });
-          if (apply) await store.updateMeta(memory.id, { status: "archived" });
+          // The history row (P6, ADR-0045) names the triage verdict, so the archive
+          // event reads as "the stock sweep did this, class <junk>".
+          if (apply) await store.updateMeta(memory.id, { status: "archived" }, { reason: `triage:${verdict.junk}` });
         }
       }
       if (memories.length === 0 || offset + memories.length >= total) break;

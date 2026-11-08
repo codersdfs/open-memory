@@ -14,7 +14,7 @@ import { bm25Score, tokenize, type Bm25CorpusStats } from "./bm25.js";
 import { coverage, coverageWeighted, indexTerms, queryTerms } from "./terms.js";
 import { assembleFragment } from "./assemble.js";
 import { mmr } from "./mmr.js";
-import { budgetEnforce } from "./tokens.js";
+import { budgetEnforce, countTokens } from "./tokens.js";
 import { allPartitions, LEGACY_NAMESPACE } from "../scope.js";
 
 /**
@@ -63,6 +63,41 @@ const NEAR_MISS_TEXT_CHARS = 200;
 const PRF_SEED_DOCS = 2;
 const PRF_MAX_TERMS = 5;
 const PRF_MIN_DF = 2;
+
+/**
+ * The predecessor pointer a search hit may carry (Stage C chain half, P6/ADR-0045).
+ *
+ * Shape: `前身(2026-10-18): the claim this row replaced…` — the event date the
+ * predecessor itself states (`valid_at`, falling back to `created_at` when the text
+ * names no date) plus at most 80 characters of its text on one line. The full chain
+ * is deliberately *not* here: that is the explicit walk (`?drill=1`,
+ * `ai-memory get <id> --history`), because a chain the caller did not ask for is
+ * context the caller must pay for reading.
+ */
+const PREDECESSOR_SUMMARY_CHARS = 80;
+/** Below this the clipped summary is a stub, not a pointer — leave the space unspent. */
+const PREDECESSOR_MIN_SUMMARY_CHARS = 12;
+
+/** The local calendar, the same one `formatLocalDate` wrote the `at:` stamp in. */
+function localDate(ms: number): string {
+  const d = new Date(ms);
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${month}-${day}`;
+}
+
+/** The longest prefix (≤ `max` chars) of `text` that fits `tokens` — `countTokens` is monotonic in length. */
+function clipToTokens(text: string, max: number, tokens: number): string {
+  if (countTokens(text) <= tokens) return text;
+  let lo = 0;
+  let hi = Math.min(max, text.length);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi + 1) / 2);
+    if (countTokens(text.slice(0, mid)) <= tokens) lo = mid;
+    else hi = mid - 1;
+  }
+  return text.slice(0, lo);
+}
 
 export interface RetrievalConfig {
   weights?: { vector: number; bm25: number; recency: number; strength: number };
@@ -552,6 +587,63 @@ export class HybridRetriever {
         } satisfies SearchResultItem;
       })
       .filter((m): m is SearchResultItem => m !== null);
+
+    // Stage C chain half (P6, ADR-0045): a hit that replaced something carries one
+    // pointer line to its predecessor — the direct `supersedesId` hop only, never
+    // the walk. Two rules it inherits from the budget's own projection
+    // (tokens.ts:41-114): it spends ONLY the space nothing else could have used
+    // (the budget leftover after every kept row has taken its whole text — it can
+    // never displace or shrink a row), and it adds NO row to the candidate pool.
+    // The second rule is the PRF lesson, measured, not a preference: ADR-0028's
+    // second pass merged reachable rows into the pool and the fixed budget got
+    // crowded — evidence-any fell 76% → 72% — which is why PRF ships off by
+    // default. A chain is the same trade with worse odds (the predecessor is, by
+    // definition, the row that was just proven out of date), so the pointer is a
+    // line of text and nothing more. The full chain stays behind the explicit
+    // `?drill=1` / `--history` walk, where the caller asked to pay for it.
+    const usedAfterBudget = memories.reduce((s, m) => s + m.tokens, 0);
+    if (usedAfterBudget < budgetTokens) {
+      const predecessorIds = [
+        ...new Set(
+          memories
+            .map((m) => m.supersedesId)
+            .filter((v): v is string => typeof v === "string")
+        )
+      ];
+      const predecessors = new Map<string, Memory>();
+      for (const id of predecessorIds) {
+        try {
+          // getById sees tombstones, which is exactly the population here: the
+          // predecessor was retired by this very supersede.
+          const p = await this.store.getById(id);
+          if (p) predecessors.set(id, p);
+        } catch {
+          // A pointer is a nicety; a failed read costs nothing but its absence.
+        }
+      }
+      let used = usedAfterBudget;
+      for (const m of memories) {
+        if (!m.supersedesId) continue;
+        const p = predecessors.get(m.supersedesId);
+        if (!p) continue;
+        const remaining = budgetTokens - used;
+        if (remaining <= 0) break;
+        const at = localDate(p.validAt ?? p.createdAt);
+        const prefix = `前身(${at}): `;
+        const summary = clipToTokens(
+          p.text.replace(/\s+/g, " ").trim(),
+          PREDECESSOR_SUMMARY_CHARS,
+          remaining - countTokens(prefix)
+        );
+        if (summary.length < PREDECESSOR_MIN_SUMMARY_CHARS) continue;
+        const pointer = `${prefix}${summary}`;
+        const cost = countTokens(pointer);
+        if (used + cost > budgetTokens) continue;
+        m.text = `${m.text}\n${pointer}`;
+        m.tokens += cost;
+        used += cost;
+      }
+    }
 
     // R2. Reinforce what survived the budget, not what merely scored: the
     // memories that got injected into a prompt are the ones with evidence of
