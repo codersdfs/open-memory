@@ -267,3 +267,36 @@ export function bucketScanOrder<K>(
 export function boundCanReachFloor(bound: number, floor: number): boolean {
   return bound > floor - BUCKET_BOUND_EPS;
 }
+
+/**
+ * The pending count a refresh leaves behind, given what the refresh planned against
+ * and what the summary row holds at write time.
+ *
+ * The geometry a refresh computes is a snapshot taken at the moment it reads the
+ * bucket's rows; any write that commits AFTER that read must leave the bucket stale,
+ * because its direction is not inside the cap the summary just stored. Writes mark
+ * that by bumping `pending` — so the refresh may reset to zero only the drift that
+ * existed BEFORE its snapshot, never what accumulated since. Hence the subtraction:
+ * the plan-time pending is the baseline, and `current − plan` keeps every increment
+ * that landed between the geometry read and the summary write. That window is real:
+ * the write transaction can sit in a BUSY backoff (retryWrite) while a concurrent
+ * write commits and marks its bucket — an unconditional `pending = 0` there erased
+ * the marker and the bucket then trusted a cap that did not contain the new row
+ * (found by review, 2026-11-09).
+ *
+ * `current` is read INSIDE the write transaction (BEGIN IMMEDIATE), so no writer can
+ * slip between the read and the reset. Anything that does not identify as the same
+ * summary generation the plan was made against — the row dropped by a sweep and
+ * recreated as a placeholder, another refresher's write, the row vanished — is
+ * treated as drift and returns 1: one extra refresh is cheap, a trusted stale cap is
+ * not. A bucket with no summary at plan time (`plan` null) and none at write time
+ * (`current` null) had no writes to lose: 0.
+ */
+export function pendingAfterRefresh(
+  plan: { pending: number; updatedAt: number } | null,
+  current: { pending: number; updatedAt: number } | null
+): number {
+  if (!current) return plan === null ? 0 : 1; // no row now: drift only if the plan saw one
+  if (!plan || current.updatedAt !== plan.updatedAt || current.pending < plan.pending) return 1;
+  return Math.max(0, current.pending - plan.pending);
+}

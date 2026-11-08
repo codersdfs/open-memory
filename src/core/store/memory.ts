@@ -19,6 +19,7 @@ import {
   bucketPrefilterEnabled,
   BUCKET_RADIUS_SLACK,
   finishCentroid,
+  pendingAfterRefresh,
   planBucketRefresh,
   queryToCentroid,
   type BucketRefreshReport,
@@ -178,6 +179,18 @@ export class InMemoryVectorStore implements VectorStore {
       const geo = finishCentroid(acc, 1);
       let cosTheta = 1;
       for (const v of usable) cosTheta = Math.min(cosTheta, queryToCentroid(v, geo.centroid, geo.norm));
+      // The pending baseline, read in the same synchronous block as the geometry —
+      // the mirror of the SQL store's conditional reset. This store has no
+      // interleaving (the read-to-write span is one synchronous block), so the
+      // arithmetic below always lands on 0 here; it goes through the shared
+      // `pendingAfterRefresh` anyway, so the two backends cannot drift on the rule.
+      const planRow = this.buckets.get(key);
+      const plan = planRow ? { pending: planRow.pending, updatedAt: planRow.updatedAt } : null;
+      const cur = this.buckets.get(key);
+      const newPending = pendingAfterRefresh(
+        plan,
+        cur ? { pending: cur.pending, updatedAt: cur.updatedAt } : null
+      );
       this.buckets.set(key, {
         namespace: bucket.namespace,
         projectKey: bucket.projectKey,
@@ -187,7 +200,7 @@ export class InMemoryVectorStore implements VectorStore {
         norm: geo.norm,
         cosTheta: Math.max(-1, cosTheta - BUCKET_RADIUS_SLACK),
         total: bucket.total,
-        pending: 0,
+        pending: newPending,
         updatedAt: now
       });
       refreshed++;

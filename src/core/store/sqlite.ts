@@ -17,6 +17,7 @@ import {
   bucketPrefilterEnabled,
   BUCKET_RADIUS_SLACK,
   finishCentroid,
+  pendingAfterRefresh,
   planBucketRefresh,
   queryToCentroid,
   type BucketRefreshReport,
@@ -899,28 +900,58 @@ export class SqliteVectorStore implements VectorStore {
    * callers mostly hold only the id. One primary-key seek plus one upsert, the same
    * order of cost as the history event a write already records; a purged id finds no
    * row and marks nothing (nothing of it remains to scan).
+   *
+   * The statement stays synchronous on purpose: `noteChange` runs inline after every
+   * write, and a fire-and-forget marker would let a search that immediately follows
+   * its own save read the bucket table before the marker lands. Lock contention is
+   * what busy_timeout (5 s) is set for, so a held write lock makes the marker WAIT,
+   * not fail; the failure this catch exists for is the immediate-BUSY corner retryWrite
+   * documents (a WAL checkpoint racing a commit). There the fallback is not a warn
+   * alone: a lost marker with a surviving summary would make the search TRUST a cap
+   * that does not contain the just-written row — the silent-stale shape the prefilter
+   * exists to make impossible — so the summary row itself is dropped, which forces
+   * full scans for that bucket until the next refresh rebuilds it. When even the drop
+   * cannot land, the warning says exactly what is at stake instead of the old, wrong
+   * "search falls back to full scans" (which was true only while no summary existed).
    */
   private markBucketPending(id: string): void {
+    let bucket: { namespace: string; projectKey: string } | undefined;
     try {
       const row = this.db.prepare(`SELECT namespace, project FROM memories WHERE id = ?`).get(id) as
         | { namespace: string; project: string | null }
         | undefined;
       if (!row) return;
+      bucket = { namespace: row.namespace, projectKey: SqliteVectorStore.bucketKeyOf(row.project) };
       this.db
         .prepare(
           `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, total, pending, updated_at)
            VALUES (?, ?, '', 0, NULL, 0, 0, 1, 0)
            ON CONFLICT(namespace, project) DO UPDATE SET pending = pending + 1`
         )
-        .run(row.namespace, SqliteVectorStore.bucketKeyOf(row.project));
+        .run(bucket.namespace, bucket.projectKey);
     } catch (err) {
-      // A pending marker must never fail a write that already committed. The marker
-      // only costs freshness (the bucket scans in full until it lands), and warnOnce
-      // keeps a broken marker from flooding an import's output.
-      warnOnce(
-        "bucket-pending",
-        `bucket pending marker failed (search falls back to full scans): ${err instanceof Error ? err.message : String(err)}`
-      );
+      // A pending marker must never fail a write that already committed.
+      const reason = err instanceof Error ? err.message : String(err);
+      if (bucket) {
+        try {
+          this.db
+            .prepare(`DELETE FROM memory_buckets WHERE namespace = ? AND project = ?`)
+            .run(bucket.namespace, bucket.projectKey);
+          warnOnce(
+            "bucket-pending-drop",
+            `bucket pending marker failed (${reason}); dropped the bucket summary so its bucket scans in full until the next refresh`
+          );
+          return;
+        } catch (dropErr) {
+          warnOnce(
+            "bucket-pending",
+            `bucket pending marker failed and the stale summary could not be dropped — the bucket may be served ` +
+            `from its previous summary until the next refresh: ${dropErr instanceof Error ? dropErr.message : String(dropErr)}`
+          );
+          return;
+        }
+      }
+      warnOnce("bucket-pending-seek", `bucket pending marker skipped, row unreadable: ${reason}`);
     }
   }
 
@@ -1390,8 +1421,14 @@ export class SqliteVectorStore implements VectorStore {
    * and the abstract is `buildAbstract` over the newest live rows. No embedder: a
    * refresh never makes a network call, and the geometry is in the same space the
    * rows are by construction.
+   *
+   * `beforeWrite` is a test seam (not part of the store interface) invoked after a
+   * target's geometry is read and before that target's summary is written — the exact
+   * per-bucket window the pending-reset race lives in — with the target handed in so
+   * a test can put a concurrent write inside ONE bucket's window and pin that the
+   * write's drift marker survives the refresh.
    */
-  async refreshBucketSummaries(opts: { now?: number } = {}): Promise<BucketRefreshReport> {
+  async refreshBucketSummaries(opts: { now?: number; beforeWrite?: (target: { namespace: string; project: string | null }) => void | Promise<void> } = {}): Promise<BucketRefreshReport> {
     this.ensure();
     const now = opts.now ?? Date.now();
     const universe = this.db
@@ -1464,17 +1501,35 @@ export class SqliteVectorStore implements VectorStore {
       // centroid — the true cap the bound consumes.
       let cosTheta = 1;
       for (const vec of usable) cosTheta = Math.min(cosTheta, queryToCentroid(vec, geo.centroid, geo.norm));
-      await this.retryWrite(() =>
-        this.db
-          .prepare(
-            `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, cos_theta, total, pending, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-             ON CONFLICT(namespace, project) DO UPDATE SET
-               abstract = excluded.abstract, dim = excluded.dim, embedding = excluded.embedding,
-               norm = excluded.norm, cos_theta = excluded.cos_theta, total = excluded.total,
-               pending = 0, updated_at = excluded.updated_at`
-          )
-          .run(
+      // The pending baseline, read in the SAME synchronous block as the geometry: it
+      // is the drift count the cap about to be stored actually describes. Everything
+      // that marks pending from here on is post-snapshot drift the reset below must
+      // keep (review, 2026-11-09: an unconditional `pending = 0` inside the retry
+      // backoff erased a concurrent write's marker, and the bucket then trusted a
+      // cap that did not contain the new row).
+      const planKey = `${t.namespace}\u0000${SqliteVectorStore.bucketKeyOf(t.project)}`;
+      const planRow = this.db
+        .prepare(`SELECT pending, updated_at FROM memory_buckets WHERE namespace = ? AND project = ?`)
+        .get(t.namespace, SqliteVectorStore.bucketKeyOf(t.project)) as
+        | { pending: number; updated_at: number }
+        | undefined;
+      const plan = planRow ? { pending: planRow.pending, updatedAt: planRow.updated_at } : null;
+      if (opts.beforeWrite) await opts.beforeWrite({ namespace: t.namespace, project: t.project });
+      await this.retryWrite(() => {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          // Re-read inside the lock: no writer can commit between this read and the
+          // reset, so `pendingAfterRefresh`'s subtraction is atomic against writes.
+          const cur = this.db
+            .prepare(`SELECT pending, updated_at FROM memory_buckets WHERE namespace = ? AND project = ?`)
+            .get(t.namespace, SqliteVectorStore.bucketKeyOf(t.project)) as
+            | { pending: number; updated_at: number }
+            | undefined;
+          const newPending = pendingAfterRefresh(
+            plan,
+            cur ? { pending: cur.pending, updatedAt: cur.updated_at } : null
+          );
+          const values = [
             t.namespace,
             SqliteVectorStore.bucketKeyOf(t.project),
             buildAbstract(rows.map((r) => r.text)),
@@ -1483,9 +1538,33 @@ export class SqliteVectorStore implements VectorStore {
             geo.norm,
             Math.max(-1, cosTheta - BUCKET_RADIUS_SLACK),
             t.total,
+            newPending,
             now
-          )
-      );
+          ];
+          if (cur) {
+            this.db
+              .prepare(
+                `UPDATE memory_buckets SET abstract = ?, dim = ?, embedding = ?, norm = ?, cos_theta = ?,
+                   total = ?, pending = ?, updated_at = ? WHERE namespace = ? AND project = ?`
+              )
+              .run(
+                values[2], values[3], values[4], values[5], values[6],
+                values[7], values[8], values[9], values[0], values[1]
+              );
+          } else {
+            this.db
+              .prepare(
+                `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, cos_theta, total, pending, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              )
+              .run(...(values as any));
+          }
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+          throw err;
+        }
+      });
       refreshed++;
     }
     return { refreshed, skipped: planned.skipped, dropped: planned.dropped.length, total: universe.length };

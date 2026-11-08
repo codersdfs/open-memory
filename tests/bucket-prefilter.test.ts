@@ -14,6 +14,7 @@ import {
   BUCKET_REFRESH_RATIO,
   BUCKET_SMALL_TOTAL,
   bucketScanBound,
+  pendingAfterRefresh,
   queryToCentroid,
 } from "../src/core/store/buckets.js";
 import { cosineSimilarity } from "../src/core/embedding/provider.js";
@@ -547,6 +548,102 @@ describe("bucket refresh wiring — the P2 maintenance pass", () => {
       service.close();
       restore(prev);
     }
+  });
+});
+
+describe("the refresh's pending reset (review 2026-11-09)", () => {
+  it("keeps the drift that accumulated between the geometry read and the summary write", async () => {
+    const prev = process.env.MEMORY_BUCKET_PREFILTER;
+    withPrefilterOn();
+    const dir = tmpDir();
+    const store = new SqliteVectorStore(join(dir, "race.db"));
+    try {
+      await store.init();
+      const embedder = clusterEmbedder();
+      await seedClusteredStore(store, embedder);
+      await store.refreshBucketSummaries!();
+      expect((await summariesOf(store)).every((s) => s.pending === 0)).toBe(true);
+
+      // One write, then a refresh whose geometry for proj-3 is read BEFORE a second
+      // write lands and whose summary write lands AFTER it — the retry-backoff window
+      // the review found. The unconditional `pending = 0` the first cut used erased
+      // the second write's marker here, and the bucket then trusted a cap without the
+      // row. (The seam hands in the target: the window is per bucket.)
+      const w1 = "cluster:3 fact written before the refresh pass about topic 3";
+      await store.insert({ namespace: NS, type: "semantic", text: w1, project: "proj-3", source: "t" }, await embedder.embed(w1));
+      const w2 = "cluster:3 fact written inside the race window about topic 3";
+      const report = await store.refreshBucketSummaries!({
+        beforeWrite: async (t) => {
+          if (t.project === "proj-3") {
+            await store.insert({ namespace: NS, type: "semantic", text: w2, project: "proj-3", source: "t" }, await embedder.embed(w2));
+          }
+        }
+      });
+      expect(report.refreshed).toBe(CLUSTERS);
+
+      // The in-window write's marker SURVIVED the reset: the bucket is stale, not
+      // freshly-trusted.
+      const proj3 = (await summariesOf(store)).find((s) => s.project === "proj-3")!;
+      expect(proj3.pending).toBe(1);
+      // ...and the row the old cap cannot contain is still returned by the bucketed
+      // search (stale bucket → full scan).
+      const hits = await store.vectorSearch({ namespace: NS, queryEmbedding: await embedder.embed(w2), limit: 20, includeDeleted: false });
+      expect(hits[0]!.memory.text).toBe(w2);
+      // A pass with nothing in the window settles the drift back to zero.
+      await store.refreshBucketSummaries!();
+      expect((await summariesOf(store)).find((s) => s.project === "proj-3")!.pending).toBe(0);
+    } finally {
+      await store.close();
+      restore(prev);
+    }
+  });
+
+  it("writes in OTHER buckets' windows do not leak into this bucket's reset", async () => {
+    const prev = process.env.MEMORY_BUCKET_PREFILTER;
+    withPrefilterOn();
+    const store = new SqliteVectorStore(join(tmpDir(), "race-scoped.db"));
+    try {
+      await store.init();
+      const embedder = clusterEmbedder();
+      await seedClusteredStore(store, embedder);
+      await store.refreshBucketSummaries!();
+      let n = 0;
+      await store.refreshBucketSummaries!({
+        beforeWrite: async (t) => {
+          // One write inside each bucket's own window: each bucket's reset must
+          // subtract only its own baseline, so every bucket ends at 1 (its own
+          // in-window write), not at the total number of writes.
+          const p = n++;
+          const text = `cluster:${p} fact in-window ${p} about topic ${p}`;
+          await store.insert({ namespace: NS, type: "semantic", text, project: t.project, source: "t" }, await embedder.embed(text));
+        }
+      });
+      const sums = await summariesOf(store);
+      expect(sums.every((s) => s.pending === 1)).toBe(true);
+      expect(sums.reduce((acc, s) => acc + s.pending, 0)).toBe(CLUSTERS);
+    } finally {
+      await store.close();
+      restore(prev);
+    }
+  });
+});
+
+describe("pendingAfterRefresh (the reset arithmetic the write transaction applies)", () => {
+  it("subtracts the plan baseline, and treats any generation anomaly as drift", () => {
+    // Same generation, no post-plan writes: reset to zero.
+    expect(pendingAfterRefresh({ pending: 5, updatedAt: 100 }, { pending: 5, updatedAt: 100 })).toBe(0);
+    // Same generation, three post-plan writes: keep exactly three.
+    expect(pendingAfterRefresh({ pending: 5, updatedAt: 100 }, { pending: 8, updatedAt: 100 })).toBe(3);
+    // No summary at plan time and none at write time: nothing to lose.
+    expect(pendingAfterRefresh(null, null)).toBe(0);
+    // No summary at plan time but a placeholder at write time: a post-plan write — drift.
+    expect(pendingAfterRefresh(null, { pending: 1, updatedAt: 0 })).toBe(1);
+    // The row vanished or was swept mid-refresh: drift, never trust the snapshot.
+    expect(pendingAfterRefresh({ pending: 5, updatedAt: 100 }, null)).toBe(1);
+    // Another refresher wrote the row (generation moved): drift.
+    expect(pendingAfterRefresh({ pending: 5, updatedAt: 100 }, { pending: 9, updatedAt: 200 })).toBe(1);
+    // Counter below the plan baseline can only mean drop-and-recreate: drift.
+    expect(pendingAfterRefresh({ pending: 5, updatedAt: 100 }, { pending: 2, updatedAt: 100 })).toBe(1);
   });
 });
 
