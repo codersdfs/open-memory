@@ -18,7 +18,7 @@ import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, t
 import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
 import type { BriefOptions, BriefResult } from "./types.js";
 import { reconcile, unionNeighbours, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
-import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, renderVerdict, type CurationVerdict } from "./write/curation.js";
+import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, renderVerdict, redactSecrets, DROP_PREVIEW_CHARS, type CurationDrop, type CurationDropInput, type CurationVerdict } from "./write/curation.js";
 import { textHash } from "./write/text.js";
 import { appendTag, buildTags, facetTagsOf } from "./write/facets.js";
 import { jevEnabled, jevApiKey, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
@@ -108,6 +108,60 @@ export class MemoryService {
     this.store.close();
   }
 
+/**
+   * Shape one refused write for the drop ledger. Keyed on `textHash` so repeats fold,
+   * and previewed through `redactSecrets` before anything else touches it: the note the
+   * filter refused for holding a key must not be the note the ledger keeps a key in.
+   * Whitespace collapses because the ledger line is a one-line trace, not an archive.
+   */
+  private dropOf(
+    input: SaveInput,
+    verdict: CurationVerdict,
+    path: "save" | "bulk",
+    namespace: string,
+    project: string | null
+  ): CurationDropInput {
+    const preview = redactSecrets(input.text).replace(/\s+/g, " ").trim().slice(0, DROP_PREVIEW_CHARS);
+    return {
+      hash: textHash(input.text),
+      preview,
+      junk: verdict.junk ?? "low-value",
+      advice: verdict.advice,
+      origin: input.source === "extractor" ? "extracted" : "explicit",
+      path,
+      namespace,
+      project,
+      at: Date.now()
+    };
+  }
+
+  /**
+   * Leave the trace, then let the refusal proceed. A store that predates the ledger
+   * records nothing and nothing breaks; a store that throws while recording must not
+   * turn a refused write into a failed one, so the error is swallowed on purpose —
+   * losing a diagnostic is allowed, losing the caller's command is not.
+   */
+  private async logDrop(drop: CurationDropInput): Promise<void> {
+    try {
+      await this.store.recordCurationDrop?.(drop);
+    } catch {
+      // Observability only: never a second reason to fail.
+    }
+  }
+
+  /**
+   * Why a note is missing, after the response that said so has been thrown away: the
+   * drop ledger. Pass `text` to ask about one exact note (folded on its hash, so the
+   * answer is "refused 3 times, first on Tuesday" rather than "nothing found"), or
+   * nothing to see what the filter has been eating. Empty means no refusals, not a
+   * store that dropped silently — every built-in store records.
+   */
+  async curationDrops(opts: { text?: string; namespace?: string; junk?: string; since?: number; limit?: number } = {}): Promise<CurationDrop[]> {
+    const hash = opts.text ? textHash(opts.text) : undefined;
+    if (opts.text && !hash) return [];
+    return (await this.store.curationDrops?.({ ...opts, hash })) ?? [];
+  }
+
   /**
    * Save one memory and report what it did to the store.
    *
@@ -162,6 +216,9 @@ export class MemoryService {
       // caller's own act: demotion is skipped too, second-guessing a declared "raw"
       // batch's importance is how a memory system stops being trusted.
       if (verdict.action === "reject" && !(opts.raw && verdict.junk !== "secret" && input.text.trim())) {
+        // The trace the feedback asked for: the throw is the answer only while the
+        // caller is still holding the response. Log first, then refuse.
+        await this.logDrop(this.dropOf(input, verdict, "save", namespace, project));
         throw new CurationRejected(verdict);
       }
       if (verdict.action === "demote" && !opts.raw && input.kind === undefined && input.importance === undefined) {
@@ -186,7 +243,9 @@ export class MemoryService {
         const callerSetValues = input.kind === undefined && input.importance === undefined;
         if (verdict.keep < WRITE_GATE_MIN() || verdict.scaffold >= 0.5) {
           if (origin === "extracted") {
-            throw new CurationRejected({ action: "reject", junk: "low-value", advice: ADVICE["low-value"] });
+            const gateVerdict: CurationVerdict = { action: "reject", junk: "low-value", advice: ADVICE["low-value"] };
+            await this.logDrop(this.dropOf(input, gateVerdict, "save", namespace, project));
+            throw new CurationRejected(gateVerdict);
           }
           if (callerSetValues) {
             // An explicit write is the caller's ask: priced, not refused — the same
@@ -496,6 +555,10 @@ export class MemoryService {
     //    sink — a caller that named a kind or an importance made its own judgement.
     const gated: { index: number; target: MemoryInput }[] = [];
     const skipDetails: { index: number; reason: string }[] = [];
+    // The verdict inside a synchronous `forEach` cannot await its own trace, so the
+    // drops queue up and land before the next step embeds anything — a failed import
+    // still leaves the list of what it refused and why.
+    const pendingDrops: CurationDropInput[] = [];
     inputs.forEach((input, index) => {
       const namespace = input.namespace?.trim()
         ? input.namespace
@@ -524,6 +587,7 @@ export class MemoryService {
         const verdict = curate(input.text, { origin });
         if (verdict.action === "reject" && !(opts.raw && verdict.junk !== "secret" && input.text.trim())) {
           skipDetails.push({ index, reason: renderVerdict(verdict) });
+          pendingDrops.push(this.dropOf(input, verdict, "bulk", namespace, project));
           return;
         }
         if (verdict.action === "demote" && !opts.raw && input.kind === undefined && input.importance === undefined) {
@@ -534,6 +598,7 @@ export class MemoryService {
       }
       gated.push({ index, target });
     });
+    for (const drop of pendingDrops) await this.logDrop(drop);
 
     // 2. Collapse exact duplicates before anything is embedded: a skipped row must
     //    not cost a vector round trip either. Keyed on the partition (namespace,
@@ -928,9 +993,12 @@ export class MemoryService {
    *
    * Curation rejections are the expected outcome here, not errors: an extractor that
    * slices three candidates out of every turn and keeps none of them did its job
-   * (Mem0's `{"facts": []}` is a success). `rejected` says how many were refused and
-   * why-shaped, so a caller can tell "the turn held nothing durable" apart from
-   * "the extractor was off".
+   * (Mem0's `{"facts": []}` is a success). `rejected` says how many were refused,
+   * so a caller can tell "the turn held nothing durable" apart from "the extractor
+   * was off" — and since every refusal went through `save`, the *which* and the *why*
+   * of each one sit in the drop ledger (`curationDrops`) instead of vanishing with the
+   * count. A turn whose note "seems useless until the next run hits the same error"
+   * is therefore traceable across runs, not just counted within one.
    */
   async extractAndSave(turnText: string, namespace: string, referenceDate?: number): Promise<{ memories: Memory[]; rejected: number }> {
     const extracted = await this.extractor.extract(turnText, referenceDate ?? Date.now());

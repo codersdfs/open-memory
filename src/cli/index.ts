@@ -14,6 +14,7 @@ import type { BriefResult, ChainView, Memory, MemoryKind, MemoryType, SearchResu
 import type { ProjectSummary } from "../core/store/interface.js";
 import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/view.js";
 import type { TriageReport } from "../core/lifecycle/triage.js";
+import type { CurationDrop } from "../core/write/curation.js";
 import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
 import { isKind, KINDS, stripEmbedding } from "../core/types.js";
 import { renderEmptySearch } from "../core/retrieval/explain.js";
@@ -54,6 +55,9 @@ Memory
                          dry-run diff by default — would archive / would demote /
                          merge candidates; --apply writes. Never deletes.
   extract <text>         pull candidate memories out of free text and save them
+  drops                  why writes got refused: the curation drop ledger (ADR-0040)
+                         --text "<the note>" narrows to one note (with repeat count);
+                         --junk <class> --limit N --json
   reembed                rewrite every stored vector with the current embedder
   knowledge              ls | show <id> | neighbors <id> | sync | link <from> <to>
                          markdown pages as linked knowledge: --dir <vault> --depth 1 --dry-run
@@ -205,7 +209,10 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   if (await r.useDaemon()) {
     const res = await r.client().post<unknown>("/memories", payload);
     if (!res.ok) {
-      ctx.err(`save: ${res.error}`);
+      // A curation refusal arrives as its verdict text. The ledger keeps it, so point
+      // at the place that can show it again after the caller has dropped the answer.
+      const refused = res.error.startsWith("not stored ");
+      ctx.err(`save: ${res.error}${refused ? " (logged: ai-memory drops)" : ""}`);
       return 1;
     }
     const mem = unwrapMemory<Memory>(res.data);
@@ -230,7 +237,9 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
     // The advice is the output: "not stored (table-row): store the fact the row
     // states, in a sentence" is a usable answer, "Error: ..." is not.
     if (e instanceof CurationRejected) {
-      ctx.err(`save: ${renderVerdict(e.verdict)}`);
+      // The refusal is only an answer while the caller is holding it; the ledger keeps
+      // it, so point at the place that can show it again on the next run.
+      ctx.err(`save: ${renderVerdict(e.verdict)} (logged: ai-memory drops)`);
       return 1;
     }
     throw e;
@@ -786,6 +795,63 @@ async function cmdExtract(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>):
   return 0;
 }
 
+/**
+ * `ai-memory drops` — the write-time filter's side of the ledger (ADR-0040
+ * observability amendment). Answers the question a refused save cannot: the 422 told
+ * you WHY this note was not stored, and by the next run that response is gone. With
+ * `--text` it answers about one exact note, folded on its hash, so "seems useless until
+ * the next run hits the same error" reads as `x3 since <date>` instead of nothing.
+ * Fetched one partition at a time because the store keys drops by namespace.
+ */
+async function cmdDrops(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const text = flagString(a, "text");
+  const junk = flagString(a, "junk");
+  const limit = flagNumber(a, "limit");
+  const { namespaces } = await resolveNamespaces(r, a);
+  const drops: CurationDrop[] = [];
+
+  if (!flagBool(a, "all") && (await r.useDaemon())) {
+    const client = r.client();
+    for (const ns of namespaces) {
+      const res = await client.get<{ drops: CurationDrop[] }>(
+        "/drops" + MemoryClient.query({ namespace: ns, text, junk, limit })
+      );
+      if (!res.ok) {
+        ctx.err(`drops: ${res.error}`);
+        return 1;
+      }
+      drops.push(...(res.data.drops ?? []));
+    }
+  } else {
+    const svc = await r.service();
+    for (const ns of namespaces) {
+      drops.push(...(await svc.curationDrops({ namespace: ns, text, junk, limit })));
+    }
+  }
+
+  // One page per partition, so re-order across them into the scope-wide newest-first
+  // sequence the caller asked for and apply their cap after the merge, not before.
+  drops.sort((x, y) => y.at - x.at || x.namespace.localeCompare(y.namespace));
+  const page = limit ? drops.slice(0, limit) : drops;
+  if (ctx.json) {
+    ctx.out(JSON.stringify({ drops: page, scopes: namespaces }, null, 2));
+    return 0;
+  }
+  if (page.length === 0) {
+    ctx.out(text ? `no drops recorded for that note in ${namespaces.join(", ")}` : `no drops recorded in ${namespaces.join(", ")}`);
+    return 0;
+  }
+  const showNs = namespaces.length > 1;
+  ctx.out(`drops: ${page.length} refused note(s) in ${namespaces.join(", ")}`);
+  for (const d of page) {
+    const when = new Date(d.at).toISOString().slice(0, 16).replace("T", " ");
+    const repeat = d.count > 1 ? ` x${d.count} since ${new Date(d.firstAt).toISOString().slice(0, 10)}` : "";
+    const where = showNs ? ` [${d.namespace}]` : "";
+    ctx.out(`  ${when} ${d.junk}${repeat}${where}: ${d.preview}${d.advice ? ` — ${d.advice}` : ""}`);
+  }
+  return 0;
+}
+
 async function cmdSetup(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   const home = resolveHome(flagString(a, "home"));
   const target = resolveDbPath(flagString(a, "db"));
@@ -1247,6 +1313,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdTriage(runner, ctx, a);
       case "extract":
         return await cmdExtract(runner, ctx, a);
+      case "drops":
+      case "dropped":
+        return await cmdDrops(runner, ctx, a);
       case "reembed":
         return await cmdReembed(runner, ctx, a);
       case "setup":

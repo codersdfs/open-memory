@@ -7,6 +7,7 @@ import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { deriveKind } from "../write/kind.js";
 import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
+import { DROP_LEDGER_CAP, type CurationDrop, type CurationDropInput } from "../write/curation.js";
 import { median } from "../stats.js";
 import {
   BUCKET_ABSTRACT_ROWS,
@@ -68,6 +69,9 @@ export class InMemoryVectorStore implements VectorStore {
    */
   private events: MemoryEvent[] = [];
   private eventSeq = 0;
+  /** The drop ledger mirror (ADR-0040 observability) — refusals never become rows here either. */
+  private drops: CurationDropInput[] = [];
+  private dropSeq = 0;
 
   async init(): Promise<void> {}
   close(): void {}
@@ -628,6 +632,44 @@ export class InMemoryVectorStore implements VectorStore {
   async history(id: string): Promise<MemoryEvent[]> {
     return this.events.filter((e) => e.memoryId === id).sort((a, b) => a.id - b.id);
   }
+
+/**
+   * Append one refused write (ADR-0040 observability). Mirrors SQLite exactly: bounded
+   * to DROP_LEDGER_CAP by dropping the oldest, so a retry loop traces without growing.
+   */
+  async recordCurationDrop(drop: CurationDropInput): Promise<void> {
+    this.drops.push(drop);
+    if (this.drops.length > DROP_LEDGER_CAP) this.drops.splice(0, this.drops.length - DROP_LEDGER_CAP);
+  }
+
+  /**
+   * The drop ledger, folded one row per distinct refused note — the same shape the
+   * SQLite window query returns, because "why is this note missing, and how many times
+   * have I been told" must not read differently depending on which store is configured.
+   */
+  async curationDrops(opts: { hash?: string; namespace?: string; junk?: string; since?: number; limit?: number }): Promise<CurationDrop[]> {
+    const groups = new Map<string, CurationDrop>();
+    for (const d of this.drops) {
+      if (opts.hash && d.hash !== opts.hash) continue;
+      if (opts.namespace && d.namespace !== opts.namespace) continue;
+      if (opts.junk && d.junk !== opts.junk) continue;
+      if (opts.since !== undefined && d.at < opts.since) continue;
+      const seen = groups.get(d.hash);
+      if (!seen) {
+        groups.set(d.hash, { ...d, id: ++this.dropSeq, count: 1, firstAt: d.at });
+      } else {
+        seen.count += 1;
+        seen.firstAt = Math.min(seen.firstAt, d.at);
+        // Newest instance wins the preview/advice shown, matching the SQL ROW_NUMBER fold.
+        if (d.at >= seen.at) Object.assign(seen, { ...d, id: seen.id, count: seen.count, firstAt: seen.firstAt });
+      }
+    }
+    const limit = Math.max(1, Math.min(500, opts.limit ?? 50));
+    return [...groups.values()]
+      .sort((a, b) => b.at - a.at || b.id - a.id)
+      .slice(0, limit);
+  }
+
 
   /** Forward half of the chain: every row whose `supersedesId` names this id, tombstones included. */
   async successorsOf(id: string): Promise<Memory[]> {

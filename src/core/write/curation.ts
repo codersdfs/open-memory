@@ -251,6 +251,55 @@ export class CurationRejected extends Error {
   }
 }
 
+/**
+ * Mask every span a secret pattern matches, for the places that must *describe* a
+ * text rather than keep it — the drop ledger above all. ADR-0040 refuses to store a
+ * credential; a ledger that saved the refused line verbatim would put it straight
+ * back in through the side door, and the same file that first motivated this rule
+ * (settings rows holding live keys) is the one that would leak.
+ */
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const p of SECRET_PATTERNS) out = out.replace(new RegExp(p.source, p.flags + "g"), "[redacted]");
+  return out;
+}
+
+/**
+ * Rows the drop ledger keeps per store. A failing loop should leave a trace, not
+ * grow a table nobody reads: a retry that re-sends the same junk line every run is
+ * bounded here. Drops are diagnostics, never facts, so losing the oldest is safe.
+ */
+export const DROP_LEDGER_CAP = 1000;
+
+/** How much of a refused note the ledger keeps: enough to recognise it, never a text dump. */
+export const DROP_PREVIEW_CHARS = 160;
+
+/**
+ * One refused write, as recorded. `hash` is the identity a repeat is matched on, so
+ * the ledger can answer "third time this week" without holding the words; `preview`
+ * is masked through `redactSecrets` and cut to `DROP_PREVIEW_CHARS`.
+ */
+export interface CurationDropInput {
+  hash: string;
+  preview: string;
+  junk: JunkClass;
+  advice: string;
+  origin: "explicit" | "extracted";
+  /** Which write path refused: one write (`save`, incl. the write gate and the extractor) or a bulk import. */
+  path: "save" | "bulk";
+  namespace: string;
+  project: string | null;
+  at: number;
+}
+
+export interface CurationDrop extends CurationDropInput {
+  id: number;
+  /** How many times this exact note has now been refused — the "next run hits the same error" number. */
+  count: number;
+  /** The first refusal of the same note. */
+  firstAt: number;
+}
+
 /** The one-line render shared by the CLI and the MCP text result. */
 export function renderVerdict(verdict: CurationVerdict): string {
   return `not stored (${verdict.junk}): ${verdict.advice}`;

@@ -1,4 +1,5 @@
 import type { ChainView, KnowledgeEdge, Memory, MemoryEvent, MemoryInput, WriteEventMeta } from "../types.js";
+import type { CurationDrop, CurationDropInput } from "../write/curation.js";
 import type { BucketRefreshReport } from "./buckets.js";
 
 export type { ChainView, KnowledgeEdge, MemoryEvent };
@@ -408,6 +409,20 @@ export interface VectorStore {
    * the chain without the events instead of pretending there were none.
    */
   history?(id: string): Promise<MemoryEvent[]>;
+  /**
+   * Record one write the curation filter refused (ADR-0040's observability amendment).
+   * Optional like every late capability: a store predating it compiles unchanged, and
+   * the drop simply leaves no trace — which is exactly the state the feedback named.
+   * The row is keyed by the text hash and carries a MASKED preview; it is never
+   * joined to a memory id, because a refused note has none.
+   */
+  recordCurationDrop?(drop: CurationDropInput): Promise<void>;
+
+  /**
+   * Read the drop ledger, one row per distinct refused note (newest preview, total
+   * refusal count, first-refusal time), newest first. Optional for the same reason.
+   */
+  curationDrops?(opts: { hash?: string; namespace?: string; junk?: string; since?: number; limit?: number }): Promise<CurationDrop[]>;
 
   /**
    * The live rows whose `supersedes_id` names this id — the forward half of the

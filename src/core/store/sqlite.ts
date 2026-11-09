@@ -25,6 +25,7 @@ import {
 import { deriveKind } from "../write/kind.js";
 import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
+import { DROP_LEDGER_CAP, type CurationDrop, type CurationDropInput } from "../write/curation.js";
 import { median } from "../stats.js";
 
 /**
@@ -397,6 +398,7 @@ export class SqliteVectorStore implements VectorStore {
   private static readonly CHANGE_LOG = 4096;
   /** Prepared once; `node:sqlite` statements are cheap to hold, expensive to rebuild per write. */
   private _eventStmt: any;
+  private _dropStmt: any;
   /**
    * P8 (ADR-0048): whether writes mark their bucket pending. Snapshotted in init()
    * because this sits on the hottest write path (`noteChange` runs for every row of
@@ -697,6 +699,30 @@ export class SqliteVectorStore implements VectorStore {
         at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events(memory_id);
+    `);
+    // The drop ledger (ADR-0040 observability amendment): every write the curation
+    // filter refused, with its class, its advice, and a MASKED preview. Its own table,
+    // deliberately NOT a memory_events row — an event is keyed by a memory id, and a
+    // refused note never gets one. That missing id is the whole reason a dropped note
+    // used to leave no trace: the write threw before embed/insert, so there was no row,
+    // no id, and nothing to answer "why is this note missing" on the next run.
+    // `hash` is normalizeText's sha256 (write/text.ts), so two runs that re-send the
+    // same note fold into one count without either having to keep the words.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS curation_drops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        junk TEXT NOT NULL,
+        advice TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        path TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        project TEXT,
+        at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_drops_hash ON curation_drops(hash);
+      CREATE INDEX IF NOT EXISTS idx_drops_namespace ON curation_drops(namespace, at);
     `);
     // P8 (ADR-0048): the bucket summaries — one row per (namespace, project), the
     // model-free abstract, the bucket's centroid geometry, and the drift counters.
@@ -1838,6 +1864,76 @@ export class SqliteVectorStore implements VectorStore {
       at: r.at
     }));
   }
+
+/**
+   * Append one refused write to the drop ledger (ADR-0040 observability). Awaiting
+   * signature over a synchronous statement, so the service can call it without a
+   * transaction to join: a drop is a diagnostic, not a memory, and never travels with
+   * one. Bounded by DROP_LEDGER_CAP — a loop that re-sends the same junk line keeps
+   * its trace without growing a table nobody reads. The oldest rows go; a drop carries
+   * no fact and no chain, so losing the tail is safe, and `count`/`firstAt` then
+   * describe the window still kept rather than all time.
+   */
+  async recordCurationDrop(drop: CurationDropInput): Promise<void> {
+    this.ensure();
+    if (!this._dropStmt) {
+      this._dropStmt = this.db.prepare(
+        `INSERT INTO curation_drops (hash, preview, junk, advice, origin, path, namespace, project, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+    }
+    this._dropStmt.run(
+      drop.hash, drop.preview, drop.junk, drop.advice, drop.origin, drop.path,
+      drop.namespace, drop.project, drop.at
+    );
+    this.db
+      .prepare(`DELETE FROM curation_drops WHERE id <= (SELECT MAX(id) - ? FROM curation_drops)`)
+      .run(DROP_LEDGER_CAP);
+  }
+
+  /**
+   * The drop ledger: ONE row per distinct refused note (folded on its text hash),
+   * newest first, each carrying how many times it has been refused and when the first
+   * refusal fell. Folding happens in SQL rather than in the service so both stores
+   * answer the question the same way, and so a repeat-heavy loop reads as one line —
+   * "conversational x4, first dropped Tuesday" — instead of four identical ones.
+   */
+  async curationDrops(opts: { hash?: string; namespace?: string; junk?: string; since?: number; limit?: number }): Promise<CurationDrop[]> {
+    this.ensure();
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (opts.hash) { where.push("hash = ?"); args.push(opts.hash); }
+    if (opts.namespace) { where.push("namespace = ?"); args.push(opts.namespace); }
+    if (opts.junk) { where.push("junk = ?"); args.push(opts.junk); }
+    if (opts.since !== undefined) { where.push("at >= ?"); args.push(opts.since); }
+    const limit = Math.max(1, Math.min(500, opts.limit ?? 50));
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM (
+          SELECT c.*, COUNT(*) OVER w AS dup_count, MIN(at) OVER w AS first_at,
+                 ROW_NUMBER() OVER (PARTITION BY hash ORDER BY id DESC) AS rn
+          FROM curation_drops c
+          ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          WINDOW w AS (PARTITION BY hash)
+        ) WHERE rn = 1 ORDER BY id DESC LIMIT ?
+      `)
+      .all(...args, limit) as any[];
+    return rows.map((r) => ({
+      id: r.id,
+      hash: r.hash,
+      preview: r.preview,
+      junk: r.junk,
+      advice: r.advice,
+      origin: r.origin,
+      path: r.path,
+      namespace: r.namespace,
+      project: r.project ?? null,
+      at: r.at,
+      count: r.dup_count,
+      firstAt: r.first_at
+    }));
+  }
+
 
   /**
    * Rows whose `supersedes_id` names this id — the forward half of the chain. The

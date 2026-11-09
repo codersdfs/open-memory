@@ -189,7 +189,22 @@ export const MEMORY_TOOLS: McpTool[] = [
       type: "object",
       properties: { scope: SCOPE_PROP, all: { type: "boolean" } }
     }
-  }
+  },
+  {
+    name: "memory_drops",
+    description:
+      "Read the curation drop ledger: every write the store refused, its junk class and its advice, plus how many times the same note has now been refused and when the first refusal fell. Call it when a note you expected is missing — a rejected save leaves a trace, so 'seems useless until the next run hits the same error' is a query, not a guess. Pass `text` to ask about one exact note.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: SCOPE_PROP,
+        all: { type: "boolean" },
+        text: { type: "string", description: "Only drops of this exact note (folded on its text hash, with the repeat count)." },
+        junk: { type: "string", description: "Only drops of this junk class, e.g. 'conversational' or 'secret'." },
+        limit: { type: "integer", description: "Default 20." }
+      }
+    }
+  },
 ];
 
 export interface McpToolResult {
@@ -309,7 +324,7 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           // advice is the whole point — "store the fact itself" is an instruction the
           // model can act on in its next call, which is why this is not isError.
           if (e instanceof CurationRejected) {
-            return { text: renderVerdict(e.verdict), structured: { stored: false, curation: e.verdict } };
+            return { text: `${renderVerdict(e.verdict)} (memory_drops re-reads this later)`, structured: { stored: false, curation: e.verdict } };
           }
           throw e;
         }
@@ -405,6 +420,51 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
         if (!memory) return { text: `no memory ${id}`, structured: null, isError: true };
         await ctx.service.delete(id);
         return { text: `forgot ${id}`, structured: { id, deleted: true } };
+      }
+
+      case "memory_drops": {
+        // Same read-scope resolution as memory_stats: the ledger is per partition, and
+        // another agent's refusals are not this agent's to read unless it asks for all.
+        const { namespaces } = await resolveReadScope(
+          {
+            agent: ctx.defaultAgent,
+            scope: asScope(args.scope) ?? ctx.defaultScope,
+            all: args.all === true
+          },
+          ctx.service.store
+        );
+        const rawLimit = args.limit === undefined ? 20 : Number(args.limit);
+        if (!Number.isFinite(rawLimit)) {
+          return { text: "memory_drops: limit must be a finite number", structured: null, isError: true };
+        }
+        const limit = Math.max(1, Math.min(1000, Math.floor(rawLimit)));
+        const drops: import("../core/write/curation.js").CurationDrop[] = [];
+        for (const ns of namespaces) {
+          drops.push(...(await ctx.service.curationDrops({
+            namespace: ns,
+            text: args.text === undefined ? undefined : String(args.text),
+            junk: args.junk === undefined ? undefined : String(args.junk),
+            limit
+          })));
+        }
+        // Merged across partitions, so re-order newest-first and apply the cap once here
+        // rather than handing back `limit` rows per scope.
+        drops.sort((a, b) => b.at - a.at || a.namespace.localeCompare(b.namespace));
+        const page = drops.slice(0, limit);
+        if (page.length === 0) {
+          return {
+            text: args.text
+              ? "no drops recorded for that note — either it was stored, or nothing was ever tried with that exact text"
+              : "the drop ledger is empty: no write has been refused by the curation filter",
+            structured: { drops: [] }
+          };
+        }
+        const lines = page.map((d) => {
+          const when = new Date(d.at).toISOString().slice(0, 16).replace("T", " ");
+          const repeat = d.count > 1 ? ` x${d.count} since ${new Date(d.firstAt).toISOString().slice(0, 10)}` : "";
+          return `- ${when} ${d.junk}${repeat} [${d.namespace}]: ${d.preview} — ${d.advice}`;
+        });
+        return { text: `drop ledger (${page.length}):\n${lines.join("\n")}`, structured: { drops: page } };
       }
 
       case "memory_stats": {

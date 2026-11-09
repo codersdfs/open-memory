@@ -229,3 +229,49 @@ archives inside the daemon's own process, a bare POST stays the dry run) and by
 writes; the machine shape is stable under `--json`; the in-process fallback
 carries the daemon caveat on stderr in both output modes; against a live server
 the CLI posts `/triage` and prints no caveat).
+
+## Amendment (2026-11-09): a refused write leaves a trace
+
+The original Decision made a rejection *explain itself* — the advice text, the
+422 body, the CLI exit — and stopped there. The in-band answer was the whole of
+it, so a note refused at 14:02 and never stored could not be found again: the
+operator asking "why was this dropped?" had to remember the exact text and
+re-type it, hoping the same regex fired. That is the feedback this amendment
+answers, and the gap was confirmed rather than assumed — `saveDetailed` throws
+before `embed`/`insert`, so the row never exists, and `memory_events`
+(ADR-0045) keys every event on `memory_id TEXT NOT NULL`. A dropped write has no
+id, so the write history cannot describe it. `extractAndSave` was worse: it
+counted refusions (`rejected += 1`) and threw the per-row reason away entirely.
+
+- **The trace is a separate ledger, not the chain.** `curation_drops` (SQLite
+  table, array mirror in the in-memory store) is written by the curation domain
+  in `MemoryService`, and the supersede/version-chain tables are untouched. The
+  temptation was one more `MemoryEventKind`, and that is a type error waiting to
+  happen: an event kind with no subject breaks the one constraint the history
+  table has, and it would let the chain's readers — `ChainView`, drill,
+  reconciler — see rows that are not memories. Refusals are not versioned, never
+  supersede, never archive, so they share no lifecycle with events.
+- **The secret class redacts its own evidence.** A drop's preview runs through
+  `redactSecrets()` (the same patterns that refused it) before storage. A ledger
+  that copies the refused key into a table to record that it refused a key has
+  done the thing the gate exists to prevent — and it is the one class where this
+  repo already prefers the false kill. The advice says which pattern fired, which
+  is all an operator needs.
+- **Repeats are one row with a count.** Reads fold on the note's
+  `textHash` — newest preview wins, `count` and `firstAt` keep the history —
+  because "the same error again" is the question, and the answer is a number on
+  one row rather than an index into N copies.
+- **A trace never breaks a write.** `logDrop` swallows store errors and no-ops
+  when a backend lacks the capability. Losing observability is bad; turning a
+  refused write into a crashed request is worse.
+- **Bounded by row count, not age.** `DROP_LEDGER_CAP = 1000` with an eviction
+  after each insert. A time window would hide the oldest drop of an error that
+  finally recurs — the exact case the feedback describes.
+
+Verified by `tests/drop-ledger.test.ts` on both stores: a note that reads as
+conversation is refused *and* queryable; the same note refused again in a new
+process comes back as one row with `count: 2` and the first refusal's timestamp;
+the trace survives a reopen (SQLite); a secret drop records the class and keeps
+no key; bulk and extract refusals land with their path and origin; curation
+off logs nothing. `GET /drops` and `memory_drops` are covered in the same file,
+and `tests/mcp.test.ts` now lists `memory_drops` in the advertised tools.

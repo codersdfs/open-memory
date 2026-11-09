@@ -81,7 +81,7 @@ describe("MCP tool listing", () => {
     const res = await call({ jsonrpc: "2.0", id: 3, method: "tools/list" });
     const tools = (res.result as { tools: typeof MEMORY_TOOLS }).tools;
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ["memory_brief", "memory_forget", "memory_get", "memory_knowledge", "memory_list", "memory_project", "memory_remember", "memory_search", "memory_stats"].sort()
+      ["memory_brief", "memory_drops", "memory_forget", "memory_get", "memory_knowledge", "memory_list", "memory_project", "memory_remember", "memory_search", "memory_stats"].sort()
     );
     for (const t of tools) {
       expect(t.description.length).toBeGreaterThan(20);
