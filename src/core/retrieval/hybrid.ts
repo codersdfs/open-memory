@@ -14,6 +14,7 @@ import { bm25Score, tokenize, type Bm25CorpusStats } from "./bm25.js";
 import { coverage, coverageWeighted, indexTerms, queryTerms } from "./terms.js";
 import { deriveFacets, facetTagsOf } from "../write/facets.js";
 import { assembleFragment } from "./assemble.js";
+import { MERGE_MARKER } from "../write/text.js";
 import { mmr } from "./mmr.js";
 import { budgetEnforce, countTokens } from "./tokens.js";
 import { allPartitions, LEGACY_NAMESPACE } from "../scope.js";
@@ -717,6 +718,7 @@ export class HybridRetriever {
         if (!m.supersedesId) continue;
         const p = predecessors.get(m.supersedesId);
         if (!p) continue;
+      if (m.text.includes(`${MERGE_MARKER}${p.text})`)) continue;
         const remaining = budgetTokens - used;
         if (remaining <= 0) break;
         const at = localDate(p.validAt ?? p.createdAt);

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, afterAll, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -435,6 +435,117 @@ describe("Stage C chain half: the predecessor pointer spends only leftover budge
     const hit = result.memories[0]!;
     expect(hit.text).toContain("\n前身(2026-04-10): ");
     expect(result.tokensUsed).toBeLessThanOrEqual(rowTokens + prefixTokens + 8);
+  });
+});
+
+describe("the retired value stays history, never the answer (Paris → Berlin)", () => {
+  const NS = "s:city";
+  const PARIS = "the user lives in Paris";
+  const BERLIN = "the user lives in Berlin";
+  const MADRID = "the user lives in Madrid";
+
+  /** Cosine 1 for every pair, so the reconciler's gate reaches the neighbour the way a
+   *  real embedding would. The hash provider's lexical floor cannot reach it here: two
+   *  rows that differ by one city word share 4 of 6 terms (0.667 < 0.8). */
+  const fixedVector = {
+    name: "nim",
+    dim: 4,
+    embed: async () => [1, 0, 0, 0],
+    embedBatch: async (texts: string[]) => texts.map(() => [1, 0, 0, 0])
+  } as unknown as EmbeddingProvider;
+
+  const savedReconcile = process.env.MEMORY_RECONCILE;
+  let open: MemoryService[] = [];
+  beforeEach(async () => {
+    process.env.MEMORY_RECONCILE = "on";
+  });
+  afterEach(() => {
+    if (savedReconcile === undefined) delete process.env.MEMORY_RECONCILE;
+    else process.env.MEMORY_RECONCILE = savedReconcile;
+  });
+
+  function judgedService(): MemoryService {
+    const svc = new MemoryService({
+      store: new InMemoryVectorStore(),
+      embedder: fixedVector,
+      relation: async () => "contradicts"
+    });
+    open.push(svc);
+    return svc;
+  }
+  async function init(svc: MemoryService): Promise<MemoryService> {
+    await svc.init();
+    return svc;
+  }
+  const remember = (svc: MemoryService, text: string) =>
+    svc.saveDetailed({ namespace: NS, type: "semantic", text });
+  const ask = (svc: MemoryService) =>
+    svc.search({ query: "where does the user live now", namespaces: [NS], k: 5, budgetTokens: 800, threshold: 0.35 });
+
+  it("the judged swap answers the new city and keeps the old one as labeled history", async () => {
+    const svc = await init(judgedService());
+    const paris = await remember(svc, PARIS);
+    const berlin = await remember(svc, BERLIN);
+
+    // Write side: one live row, the old one retired by link, not by silence.
+    expect(berlin.decision.action).toBe("supersede");
+    expect(berlin.memory.supersedesId).toBe(paris.memory.id);
+    expect((await svc.list({ namespace: NS })).memories.map((m) => m.id)).toEqual([berlin.memory.id]);
+    expect(await svc.getActive(paris.memory.id)).toBe(null);
+
+    // Read side: the question gets one row, and it leads with the city that is true now.
+    const result = await ask(svc);
+    expect(result.memories).toHaveLength(1);
+    const hit = result.memories[0]!;
+    expect(hit.text.startsWith(BERLIN)).toBe(true);
+    expect(hit.text).toContain(PARIS); // retired, but not deleted: still readable as history
+    // And it is recorded ONCE. mergeText already appended the retired claim, so the
+    // 前身 pointer would repeat it — a second copy of a value the store has proven out
+    // of date spends leftover budget and makes the dead city compete to be the answer.
+    expect(hit.text.match(/Paris/g)!.length).toBe(1);
+    expect(hit.tokens).toBe(countTokens(hit.text));
+    expect(result.tokensUsed).toBeLessThanOrEqual(800);
+  });
+
+  it("when the row has no room for the tail, the one-hop pointer is what keeps the history", async () => {
+    const svc = await init(judgedService());
+    const paris = await remember(svc, PARIS);
+    const berlin = await remember(svc, BERLIN);
+    const madrid = await remember(svc, MADRID);
+
+    // The merge tail is capped (old text > 2× new text is a different claim, not a
+    // detail), so by the third city the live row carries only its own words.
+    expect(madrid.memory.text).toBe(MADRID);
+    const hit = (await ask(svc)).memories[0]!;
+    expect(hit.text.startsWith(MADRID)).toBe(true);
+    expect(hit.text).toContain("\n前身(");
+    expect(hit.text).toContain("Berlin");
+    // Still one hop, never the walk: exactly two lines, the claim and its pointer.
+    const lines = hit.text.split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(MADRID);
+    expect(lines[1].startsWith("前身(")).toBe(true);
+
+    // The full chain is behind the explicit drill, which the caller pays for.
+    const chain = await svc.drill(madrid.memory.id);
+    expect(chain.ancestors.map((a) => a.text)).toEqual([berlin.memory.text, paris.memory.text]);
+  });
+
+  it("with no judge to call it a contradiction, nothing is retired and nothing pretends", async () => {
+    // The honest boundary of the guarantee above: an offline install (hash embeddings,
+    // no relation judge) never reaches the old row, so the swap is two inserts. The
+    // README's `insert` row documents this; the store does not fake a supersede.
+    const svc = await init(new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider() }));
+    const paris = await remember(svc, PARIS);
+    const berlin = await remember(svc, BERLIN);
+    expect(paris.decision.action).toBe("insert");
+    expect(berlin.decision.action).toBe("insert");
+    expect(berlin.memory.supersedesId).toBe(null);
+    expect(berlin.memory.text).toBe(BERLIN);
+    expect((await svc.list({ namespace: NS })).memories.map((m) => m.text).sort()).toEqual([BERLIN, PARIS]);
+    // Both cities are live, so both are candidates: the retired-value contract starts at
+    // the supersede, it does not invent one.
+    expect((await ask(svc)).memories).toHaveLength(2);
   });
 });
 

@@ -132,7 +132,7 @@ const MERGE_MAX_CHARS = 600;
  * grows to three times its size on every rewrite.
  */
 const MERGE_MAX_OLD_RATIO = 2;
-const MERGE_MARKER = " (previously: ";
+export const MERGE_MARKER = " (previously: ";
 
 /**
  * The text a superseding row stores: the new claim, plus the old claim when the old one
