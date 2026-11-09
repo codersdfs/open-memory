@@ -6,7 +6,6 @@ import { absTime, relTime, score3, truncate } from '../lib/format';
 import { chainOf } from '../lib/supersede';
 import { Badge } from '../components/Badge';
 import { Confirm } from '../components/Confirm';
-import { DataTable, type Column } from '../components/DataTable';
 import { Drawer } from '../components/Drawer';
 import { Empty } from '../components/Empty';
 import { IconPin } from '../components/Icons';
@@ -301,100 +300,33 @@ export default function MemoriesView({ namespace }: { namespace: string }) {
     await mutate(() => api.remove(row.id));
   }
 
-  const columns: Column<Memory>[] = [
-    {
-      key: 'text',
-      header: 'memory',
-      width: '42%',
-      render: (m) => (
-        <span title={truncate(m.text, 400)} style={{ color: 'var(--fg)' }}>
-          {truncate(m.text, 80)}
-        </span>
-      ),
-    },
-    {
-      key: 'type',
-      header: 'type',
-      render: (m) => (
-        <span className="mono" style={{ fontSize: 11, color: 'var(--dim)' }}>
-          {m.type}
-        </span>
-      ),
-    },
-    {
-      key: 'status',
-      header: 'status',
-      render: (m) => <Badge kind={STATUS_KIND[m.status]}>{m.status}</Badge>,
-    },
-    {
-      key: 'importance',
-      header: 'imp',
-      align: 'right',
-      mono: true,
-      render: (m) => <span style={{ fontSize: 12 }}>{score3(m.importance)}</span>,
-    },
-    {
-      key: 'strength',
-      header: 'str',
-      align: 'right',
-      mono: true,
-      render: (m) => <span style={{ fontSize: 12 }}>{score3(m.strength)}</span>,
-    },
-    {
-      key: 'lastUsedAt',
-      header: 'last used',
-      render: (m) => (
-        <span className="mono" title={absTime(m.lastUsedAt)} style={{ fontSize: 11, color: 'var(--dim)' }}>
-          {relTime(m.lastUsedAt)}
-        </span>
-      ),
-    },
-    {
-      key: 'pin',
-      header: 'pin',
-      width: '40px',
-      render: (m) =>
-        m.pin === 1 ? (
-          <span style={{ display: 'inline-flex', color: 'var(--accent)' }} title="pinned">
-            <IconPin size={13} />
-          </span>
-        ) : (
-          <span style={{ color: 'var(--faint)' }}>—</span>
-        ),
-    },
-    {
-      key: 'superseded',
-      header: 'supersedes',
-      width: '120px',
-      render: (m) =>
-        m.supersedesId ? (
-          <button
-            type="button"
-            className="mono"
-            title={`supersedes ${m.supersedesId}`}
-            onClick={(e) => {
-              // The row's own click would otherwise select this row and discard the jump.
-              e.stopPropagation();
-              setParams({ id: m.supersedesId ?? undefined });
-            }}
-            style={{
-              all: 'unset',
-              cursor: 'pointer',
-              fontSize: 10,
-              color: 'var(--accent)',
-            }}
-          >
-            {truncate(m.supersedesId, 14)}
-          </button>
-        ) : (
-          <span style={{ color: 'var(--faint)' }}>—</span>
-        ),
-    },
-  ];
-
   const chain = detail === null ? { ancestors: [], successors: [] } : chainOf(detail.id, rows);
   const ancestorMissing = detail !== null && detail.supersedesId != null && chain.ancestors.length === 0;
   const filtered = q !== '' || type !== '' || status !== '' || includeDeleted;
+
+  /**
+   * ADR-0042 presentation — group the page by `project` (a derived dimension; `null` is
+   * the ungrouped bucket). The store's own order is kept *inside* each group (the header
+   * filter card still runs the same query), groups sort by size with ungrouped last, and
+   * every count is a count of this page: `GET /memories` is paged at LIST_LIMIT, so a
+   * header that claimed store-wide totals would lie about what was read.
+   *
+   * The DataTable's j/k walk is retired here — grouping and a cursor model didn't mix;
+   * rows stay clickable into the same drawer as before.
+   */
+  const UNGROUPED = '\u0000ungrouped';
+  const groups = new Map<string, Memory[]>();
+  for (const m of rows) {
+    const key = m.project === null || m.project === undefined ? UNGROUPED : m.project;
+    const bucket = groups.get(key);
+    if (bucket === undefined) groups.set(key, [m]);
+    else bucket.push(m);
+  }
+  const groupKeys = [...groups.keys()].sort((a, b) => {
+    if (a === UNGROUPED) return 1;
+    if (b === UNGROUPED) return -1;
+    return (groups.get(b)?.length ?? 0) - (groups.get(a)?.length ?? 0);
+  });
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -496,45 +428,102 @@ export default function MemoriesView({ namespace }: { namespace: string }) {
 
       <div className="row" style={{ justifyContent: 'space-between', gap: 12 }}>
         <span style={{ fontSize: 11, color: 'var(--faint)' }}>
-          {namespace} · the store's order (pinned first, then newest)
+          {namespace} · grouped by project (ADR-0042) · counts are this page (≤ {LIST_LIMIT})
         </span>
-        <KeyboardHint keys={['/', 'j', 'k', 'Enter', 'Esc']} />
+        <KeyboardHint keys={['/']} />
       </div>
 
-      <DataTable
-        rows={rows}
-        columns={columns}
-        rowKey={(m) => m.id}
-        selectedKey={selectedId}
-        onSelect={(key) => setParams({ id: key })}
-        onActivate={(row) => setParams({ id: row.id })}
-        loading={loading}
-        empty={
-          <Empty
-            title={filtered ? 'Nothing matched' : `${namespace} is empty`}
-            body={
-              filtered
-                ? 'No row in this namespace matches the current q / type / status / tombstone filters. The store answered, and the answer is zero rows.'
-                : 'This namespace holds no memories yet. Create one here, or check the namespace in the header — the picker default is default:default.'
-            }
-            action={
-              filtered ? (
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={() => setParams({ q: undefined, type: undefined, status: undefined, deleted: undefined })}
-                >
-                  clear filters
-                </button>
-              ) : (
-                <button type="button" className="btn btn-primary" onClick={() => openForm('create')}>
-                  new memory
-                </button>
-              )
-            }
-          />
-        }
-      />
+      {loading && rows.length === 0 ? (
+        <div className="card" style={{ padding: 28, textAlign: 'center', fontSize: 13, color: 'var(--dim)' }}>
+          loading…
+        </div>
+      ) : rows.length === 0 ? (
+        <Empty
+          title={filtered ? 'Nothing matched' : `${namespace} is empty`}
+          body={
+            filtered
+              ? 'No row in this namespace matches the current q / type / status / tombstone filters. The store answered, and the answer is zero rows.'
+              : 'This namespace holds no memories yet. Create one here, or check the namespace in the header — the picker default is default:default.'
+          }
+          action={
+            filtered ? (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setParams({ q: undefined, type: undefined, status: undefined, deleted: undefined })}
+              >
+                clear filters
+              </button>
+            ) : (
+              <button type="button" className="btn btn-primary" onClick={() => openForm('create')}>
+                new memory
+              </button>
+            )
+          }
+        />
+      ) : (
+        groupKeys.map((key) => {
+          const bucket = groups.get(key) ?? [];
+          const label = key === UNGROUPED ? 'ungrouped · 未分组' : key;
+          const kinds: Record<string, number> = {};
+          for (const m of bucket) kinds[m.type] = (kinds[m.type] ?? 0) + 1;
+          const recent = bucket.reduce((acc, m) => (m.updatedAt > acc ? m.updatedAt : acc), 0);
+          return (
+            <section key={key} className="grp">
+              <header className="grp-head">
+                <span className={`tdot ${bucket[0]?.type ?? 'working'}`} aria-hidden="true" />
+                <span className="grp-name">{label}</span>
+                <span className="grp-sub">{bucket.length} rows</span>
+                {Object.entries(kinds).map(([t, n]) => (
+                  <span key={t} className="chip">
+                    {t} ×{n}
+                  </span>
+                ))}
+                <span className="spacer" style={{ flex: 1 }} />
+                <span className="grp-sub">最近 {relTime(recent)}</span>
+              </header>
+              <div className="list">
+                {bucket.map((m) => (
+                  <div
+                    key={m.id}
+                    className="hit"
+                    role="button"
+                    tabIndex={0}
+                    style={{ cursor: 'pointer', gap: 6 }}
+                    onClick={() => setParams({ id: m.id })}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') setParams({ id: m.id });
+                    }}
+                  >
+                    <div className="hit-head">
+                      <span className={`tdot ${m.type}`} aria-hidden="true" />
+                      <span className="mono" style={{ fontSize: 11, color: 'var(--dim)' }}>
+                        {m.type}
+                      </span>
+                      <Badge kind={STATUS_KIND[m.status]}>{m.status}</Badge>
+                      {m.pin === 1 ? (
+                        <span title="pinned" style={{ display: 'inline-flex', color: 'var(--accent)' }}>
+                          <IconPin size={13} />
+                        </span>
+                      ) : null}
+                      <span className="spacer" />
+                      <span className="hit-meta">{relTime(m.lastUsedAt)}</span>
+                      <span className="mono" style={{ fontSize: 11, color: 'var(--dim)' }}>
+                        imp {score3(m.importance)}
+                      </span>
+                    </div>
+                    <div className="hit-text">{truncate(m.text, 200)}</div>
+                    <div className="legend">
+                      <span>{truncate(m.id, 26)}</span>
+                      <span style={{ marginLeft: 'auto' }}>{m.project ?? '—'}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          );
+        })
+      )}
 
       <Drawer
         open={detail !== null && form === null}

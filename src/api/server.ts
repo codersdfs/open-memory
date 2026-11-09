@@ -6,6 +6,7 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import { MemoryService, CurationRejected, type SaveInput } from "../core/memoryService.js";
+import { ADVICE } from "../core/write/curation.js";
 import { stripEmbedding, TYPES, STATUSES, KINDS, type MemoryType, type MemoryKind, type MemoryStatus } from "../core/types.js";
 import { isScope, resolveReadScope, resolveScopeKeys, resolveWriteKey } from "../core/scope.js";
 import {
@@ -21,6 +22,7 @@ import {
 } from "../core/settings.js";
 import { envFilePath } from "../core/envFile.js";
 import { validateJevKey } from "../core/judgment/judge.js";
+import { agentStatus, agentChat, AgentNoModel } from "./agent.js";
 
 // Resolved relative to this file, so the built layout must keep `src/api/` next to
 // `src/ui/` — which is why the build copies the static UI into `dist/src/ui` rather
@@ -247,6 +249,9 @@ export async function buildServer(opts?: {
   dbPath?: string;
   service?: MemoryService;
   onShutdown?: () => void;
+  /** Env the agent routes read (ADR-0043). Defaults to the merged seam; tests inject a
+   *  fixed one so "no key" and "mock endpoint" are facts of the test, not of the machine. */
+  agentEnv?: NodeJS.ProcessEnv;
   /**
    * P7 (ADR-0049): the principal this server requires on every read/write route —
    * token in `PRINCIPAL_HEADER`, user segment owned server-side. The daemon main block
@@ -259,6 +264,7 @@ export async function buildServer(opts?: {
 }) {
   const service = opts?.service ?? new MemoryService({ dbPath: opts?.dbPath });
   await service.init();
+  const agentEnv = opts?.agentEnv ?? runtimeEnv();
   const principal = opts?.principal ?? null;
 
   // How the process stops, as a callback because a test has to prove the route reached
@@ -271,7 +277,7 @@ export async function buildServer(opts?: {
   });
 
   const app: Server = createServer((req, res) => {
-    void handle(req, res, service, shutdown, principal).catch((e) => {
+    void handle(req, res, service, shutdown, agentEnv, principal).catch((e) => {
       const status = e instanceof SyntaxError ? 400 : 500;
       send(res, status, { error: e instanceof Error ? e.message : String(e) });
     });
@@ -304,6 +310,7 @@ async function handle(
   res: ServerResponse,
   service: MemoryService,
   shutdown: () => void,
+  agentEnv: NodeJS.ProcessEnv,
   principal: PrincipalBinding | null
 ) {
   const url = new URL(req.url ?? "/", "http://localhost");
@@ -378,6 +385,24 @@ async function handle(
       dim: service.embedder.dim,
       version: await appVersion(),
     });
+  }
+  // ADR-0043 — the console agent. Same-origin only in practice (tier A gates the POST);
+  // the loop executes the store's own gates, and without a key it says so rather than
+  // pretending: 501 `no-model` is what the console's local mode keys off.
+  if (path === "/agent/status" && method === "GET") {
+    return send(res, 200, agentStatus(agentEnv));
+  }
+  if (path === "/agent/chat" && method === "POST") {
+    const body = await readJson(req);
+    if (!Array.isArray(body.messages)) return send(res, 400, { error: "messages required" });
+    try {
+      return send(res, 200, await agentChat(service, body, { env: agentEnv }));
+    } catch (e) {
+      if (e instanceof AgentNoModel) {
+        return send(res, 501, { error: "no-model", hint: "set OPENAI_API_KEY (Settings → credentials, or .env) and restart the daemon" });
+      }
+      return send(res, 502, { error: e instanceof Error ? e.message : String(e) });
+    }
   }
   if (path === "/stats" && method === "GET") {
     const ns = str(q.namespace, 200, 1) ?? "default:default";
@@ -897,6 +922,32 @@ async function handle(
     }
     const { memories, rejected } = await service.extractAndSave(text, namespace);
     return send(res, 200, { extracted: memories.length, rejected, memories });
+  }
+
+// The drop ledger (ADR-0040 observability): what the filter refused and why, after
+  // the 422 that said so has been discarded. Read-only, and `text` asks about one exact
+  // note — folded on its hash, so the answer to "did the next run hit the same error" is
+  // a count and a first-refusal time rather than a re-run of the write.
+  // Namespaces are principal-gated both ways: the query may not read another user's
+  // refusals, and the rows returned are filtered, because one bulk import can span
+  // partitions and a leaked preview is still a leak.
+  if (path === "/drops" && method === "GET") {
+    const ns = str(q.namespace, 200, 1);
+    if (ns && principal && !isPrincipalNamespace(ns, principal.user)) {
+      return send(res, 403, foreignNamespaceError(ns, principal));
+    }
+    const junk = q.junk === undefined ? undefined : enumOf(String(q.junk), Object.keys(ADVICE));
+    if (q.junk !== undefined && !junk) return send(res, 400, { error: `unknown junk class: ${String(q.junk)}` });
+    const drops = await service.curationDrops({
+      text: str(q.text, 5000, 1) ?? undefined,
+      namespace: ns ?? undefined,
+      junk,
+      since: num(q.since, 0, Number.MAX_SAFE_INTEGER),
+      limit: num(q.limit, 1, 500) ?? 50
+    });
+    return send(res, 200, {
+      drops: principal ? drops.filter((d) => isPrincipalNamespace(d.namespace, principal.user)) : drops
+    });
   }
 
   // pi's own session timeline. Read-only and unindexed: the files are the source of

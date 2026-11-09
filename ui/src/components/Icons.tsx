@@ -146,3 +146,103 @@ export function IconChart({ size = 16 }: IconProps) {
     </svg>
   );
 }
+
+/** A four-point star — the agent glyph (ADR-0043). One path, filled, so it reads at 14px. */
+export function IconSparkles({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path
+        d="M8 1.8c.9 3 1.9 4 4.9 4.9-3 .9-4 1.9-4.9 4.9-.9-3-1.9-4-4.9-4.9 3-.9 4-1.9 4.9-4.9Z"
+        fill="currentColor"
+        stroke="none"
+      />
+      <path d="M12.4 10.4c.45 1.5.95 2 2.45 2.45-1.5.45-2 .95-2.45 2.45-.45-1.5-.95-2-2.45-2.45 1.5-.45 2-.95 2.45-2.45Z" />
+    </svg>
+  );
+}
+
+/** The store: a cylinder, two ellipse arcs and sides. */
+export function IconDatabase({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <ellipse cx="8" cy="3.6" rx="5.5" ry="2.1" />
+      <path d="M2.5 3.6v8.8c0 1.16 2.46 2.1 5.5 2.1s5.5-.94 5.5-2.1V3.6" />
+      <path d="M2.5 8c0 1.16 2.46 2.1 5.5 2.1S13.5 9.16 13.5 8" />
+    </svg>
+  );
+}
+
+export function IconArrowUp({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M8 13V3" />
+      <path d="M3.8 7.2 8 3l4.2 4.2" />
+    </svg>
+  );
+}
+
+export function IconCheck({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M3 8.6 6.4 12 13 4.6" />
+    </svg>
+  );
+}
+
+export function IconX({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M4 4 12 12" />
+      <path d="M12 4 4 12" />
+    </svg>
+  );
+}
+
+/** Shield with a mark: the write gate, refusing or passing. */
+export function IconShield({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M8 1.8 13 3.6v4.2c0 3.1-2.1 5.3-5 6.4-2.9-1.1-5-3.3-5-6.4V3.6Z" />
+      <path d="M5.8 8h4.4" />
+    </svg>
+  );
+}
+
+export function IconPencil({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M11.3 2.6a1.7 1.7 0 0 1 2.4 2.4L5.4 13.3 2.5 14l.7-2.9Z" />
+      <path d="M10 3.9l2.1 2.1" />
+    </svg>
+  );
+}
+
+export function IconTrash2({ size = 16 }: IconProps) {
+  return <IconTrash size={size} />;
+}
+
+export function IconChevronDown({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M4 6.2 8 10.2 12 6.2" />
+    </svg>
+  );
+}
+
+export function IconChevronUp({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <path d="M4 9.8 8 5.8 12 9.8" />
+    </svg>
+  );
+}
+
+/** A gear: ring plus six teeth, centre dot solid. */
+export function IconSettings({ size = 16 }: IconProps) {
+  return (
+    <svg {...SVG} width={size} height={size}>
+      <circle cx="8" cy="8" r="2.6" />
+      <path d="M8 1.6v2M8 12.4v2M1.6 8h2M12.4 8h2M3.5 3.5l1.4 1.4M11.1 11.1l1.4 1.4M12.5 3.5l-1.4 1.4M4.9 11.1l-1.4 1.4" />
+    </svg>
+  );
+}
