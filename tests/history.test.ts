@@ -13,6 +13,7 @@ import { MemoryService } from "../src/core/memoryService.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
 import { buildServer } from "../src/api/server.js";
 import { countTokens } from "../src/core/retrieval/tokens.js";
+import type { Memory } from "../src/core/types.js";
 import type { VectorStore } from "../src/core/store/interface.js";
 
 /**
@@ -488,5 +489,35 @@ describe("visibility does not move (the tombstone contract, unchanged by P6)", (
     expect((await store.getById(a.id))!.invalidAt).toBe(null);
     expect((await store.history!(a.id)).map((e) => e.event)).toEqual(["insert"]);
     store.close();
+  });
+});
+
+describe("P6 review fix (2026-11-09): the in-memory supersede has no await boundary", () => {
+  it("the successor's writes and the old row's invalidation land in one synchronous block", async () => {
+    const store = new InMemoryVectorStore();
+    await store.init();
+    const old = await store.insert({ namespace: "a:1", type: "semantic", text: "old claim" }, [0.1]);
+    // Deliberately NOT awaited. Under the pre-fix shape (`await this.insert(...)`
+    // first) the call parked at that internal await boundary right here — successor
+    // already in the map, old row still live, no history — a state a concurrent
+    // reader interleaving at the boundary could observe. An async method runs
+    // synchronously to its first await, so reading the map NOW pins the fix: a
+    // supersede body without awaits is final the moment the call returns.
+    const pending = store.supersede(
+      old.id,
+      { namespace: "a:1", type: "semantic", text: "new claim", source: "explicit" },
+      [0.2],
+      { reason: "refinement" }
+    );
+    const map = (store as unknown as { map: Map<string, Memory> }).map;
+    expect(map.get(old.id)!.isDeleted).toBe(1);
+    expect(map.get(old.id)!.invalidAt).not.toBe(null);
+    const successor = [...map.values()].find((m) => m.id !== old.id)!;
+    expect(successor.supersedesId).toBe(old.id);
+    expect(successor.isDeleted).toBe(0);
+    // The history is complete the moment the call returned, not one microtask later.
+    expect((await store.history!(old.id)).map((e) => e.event)).toEqual(["insert", "supersede"]);
+    expect((await store.history!(successor.id)).map((e) => e.event)).toEqual(["insert"]);
+    await pending;
   });
 });

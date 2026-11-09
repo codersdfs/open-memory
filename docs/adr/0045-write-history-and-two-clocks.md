@@ -65,7 +65,7 @@ Shape follows mem0's history table (`id/memory_id/old_memory/new_memory/event`, 
 
 - `VectorStore` gains two optional capabilities (`history`, `successorsOf`) and two optional write parameters (`supersede(…, meta)`, `updateMeta(…, meta)`) — a third-party store written against v0.3 keeps compiling and `drill` degrades to the sweep fallback without events.
 - `Memory` gains `validAt`/`invalidAt` (NULL on stores/rows that predate the columns); the wire adds both fields everywhere a memory is serialized, plus the `drill` envelope.
-- Every supersede now lands one transaction instead of two — the two-call window (successor live, old row live, no event) is closed by construction.
+- Every supersede now lands one transaction instead of two — the two-call window (successor live, old row live, no event) is closed by construction. On SQLite that is the single `BEGIN IMMEDIATE`; on the in-memory store it is the supersede body containing **no `await`** — an async method runs synchronously to its first await, so the whole block is atomic on the runtime. The 2026-11-09 final review caught the earlier in-memory shape (`await this.insert(…)` first, then the old-row invalidation) as a real window at that await boundary; `tests/history.test.ts` pins the fix by reading the map synchronously at the call's return.
 
 ## Tests
 

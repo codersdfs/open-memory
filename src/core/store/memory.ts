@@ -246,11 +246,14 @@ export class InMemoryVectorStore implements VectorStore {
     });
   }
 
-  async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
+  /**
+   * Row construction, synchronous and side-effect-free — the InMemory mirror of the
+   * SQL store's `buildRow`. Both `insert` and `supersede` build through it, so the
+   * two write paths cannot drift, and `supersede` can build the successor without
+   * putting an `await` in the middle of its write block (see supersede).
+   */
+  private buildRow(input: MemoryInput, embedding: number[]): { mem: Memory; facets: string[] } {
     const now = Date.now();
-    // Facet postings commit with the row (P4, ADR-0046) — here the "transaction" is
-    // two map writes in one synchronous block, which is the same guarantee in a
-    // smaller material.
     const facets = facetTagsOf(input.tags).map((t) => t.toLowerCase());
     const mem: Memory = {
       id: randomUUID(),
@@ -282,9 +285,17 @@ export class InMemoryVectorStore implements VectorStore {
       createdAt: now,
       updatedAt: now
     };
+    return { mem, facets };
+  }
+
+  async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
+    // Facet postings commit with the row (P4, ADR-0046) — here the "transaction" is
+    // a few map writes in one synchronous block, which is the same guarantee in a
+    // smaller material.
+    const { mem, facets } = this.buildRow(input, embedding);
     this.map.set(mem.id, mem);
     this.facetsByMemory.set(mem.id, facets);
-    this.logEvent(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
+    this.logEvent(mem.id, "insert", mem.createdAt, { newValue: mem.text, reason: input.source ?? null });
     this.markBucketPending(mem);
     return mem;
   }
@@ -580,20 +591,30 @@ export class InMemoryVectorStore implements VectorStore {
   }
 
   /**
-   * Mirror of the SQL supersede (P6, ADR-0045): successor's insert event, the old
-   * row's invalidation with `invalidAt = now` in the same mutation, the supersede
-   * event carrying the decision. There is no transaction to wrap here — the map
-   * mutations below are the same three writes the SQL version commits atomically.
+   * Mirror of the SQL supersede (P6, ADR-0045): the successor's row + insert event,
+   * the old row's invalidation with `invalidAt = now`, and the supersede event
+   * carrying the decision — all in ONE await-free block. The guarantee the SQL
+   * version gets from a single BEGIN IMMEDIATE, this store gets from the runtime:
+   * an async method runs synchronously to its first `await`, and this body has
+   * none, so no concurrent reader can interleave between the successor's writes
+   * and the old row's. The 2026-11-09 final review caught the previous shape
+   * (`await this.insert(...)` first) as a real window — successor live,
+   * predecessor still live, no history — the exact state the SQL transaction
+   * makes impossible.
    */
   async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[], meta?: WriteEventMeta): Promise<Memory> {
     const old = this.map.get(oldId);
     if (!old) throw new Error(`old memory ${oldId} not found`);
-    const created = await this.insert({ ...newInput, supersedesId: oldId }, newEmbedding);
+    const { mem: created, facets } = this.buildRow({ ...newInput, supersedesId: oldId }, newEmbedding);
     const now = Date.now();
+    this.map.set(created.id, created);
+    this.facetsByMemory.set(created.id, facets);
+    this.logEvent(created.id, "insert", created.createdAt, { newValue: created.text, reason: newInput.source ?? null });
+    this.markBucketPending(created); // P8: the successor's bucket goes pending, like any insert
     old.isDeleted = 1;
     old.invalidAt = now;
     old.updatedAt = now;
-    this.markBucketPending(old); // P8: the predecessor left the pool (the successor marked via insert)
+    this.markBucketPending(old); // P8: the predecessor left the pool
     this.logEvent(oldId, "supersede", now, {
       oldValue: old.text,
       newValue: created.text,
