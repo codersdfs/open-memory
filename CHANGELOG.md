@@ -6,6 +6,86 @@ rejected by npm as too similar to the existing `openmemory`); the command stays 
 Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
 on-disk format is the part that does not.
 
+## 0.4.0-beta.3 — 2026-11-09
+
+The memory-systems research sprint (the survey in `docs/research/` drives every item): the bulk
+door gets the gates it was missing, forgetting gets a trigger, history survives the row, and the
+daemon stops trusting whoever knocks. Suite went 691 → 857 tests, all gated per proposal behind
+an independent review cycle.
+
+### Added
+
+- **The bulk path runs the write gates** ([ADR-0018](docs/adr/0018-batch-writes-and-purge.md),
+  [ADR-0040](docs/adr/0040-writes-are-curated.md) amendments). `saveMany` ran the curation
+  verdict per row at zero network cost; rejected lines skip with `skipDetails` (input index +
+  advice) instead of killing or half-committing the batch; `raw`/`--no-curate` excuses every
+  reject except `secret` and empty text. Exact-text duplicates fold on a derived `text_hash`
+  column within one partition — single-transaction migration, computed at the one shared INSERT,
+  kept true by `updateEmbedding`; `store.findExistingHashes` in both stores.
+- **Forgetting has a trigger** ([ADR-0016](docs/adr/0016-archive-first-decay.md) amendment).
+  `reinforce` ticks a real `use_count`; a row goes cold only when
+  `log1p(use_count) × exp(−ln2·age/window)` falls under the keep line (the kind's window doubles
+  as the half-life); durable kinds and the importance floor survive the swap (ADR-0021). The
+  daemon sweeps on `MEMORY_MAINTAIN_HOURS` (default 24, `0` off) through `runScheduledDecay` —
+  no options bag, so the hard pass is unreachable by signature; `store_meta` keeps
+  `last_maintenance_at` so an overdue store catches up at open without blocking a request.
+- **`ai-memory triage [--apply]`** — retroactive curation, diff first (ADR-0040 amendment).
+  Dry-run by default; junk→archive, low-value→demote, merge candidates listed only; never
+  hard-deletes; `--apply` writes through the daemon so its decoded partitions agree.
+- **A write history that survives the row** ([ADR-0045](docs/adr/0045-write-history-and-two-clocks.md)).
+  Append-only `memory_events` records insert/reinforce/supersede/archive with old/new/reason;
+  `purgeDeleted` no longer takes the history with the bytes; `valid_at` becomes a column
+  (backfilled from `(at:…)`); a hit whose row replaced something carries a one-line
+  `前身(日期): 摘要` pointer inside leftover budget, the full chain behind `?drill=1`/`--history`.
+- **An entity connection layer, measured before believed**
+  ([ADR-0046](docs/adr/0046-facet-index-and-third-candidate-arm.md)). `memory_facets` rides the
+  same transactions as the term postings across all five mutation paths; `searchOne` grows a
+  third candidate arm through the same relevance gate (`w.entity` defaults 0 and shows in the
+  breakdown). `MEMORY_LINKS` ships off with the A/B numbers in the ADR.
+- **The conflict window widens, and unjudged pairs stop hiding**
+  ([ADR-0047](docs/adr/0047-conflict-window-and-judge-failure-marking.md)). Supersede candidates
+  become a three-way union (vector top-5 ∪ same entity ∪ same project, cross-type); pairs the
+  judge never saw get a `conflict:<entity>` facet instead of silent coexistence; judge failures
+  are marked distinctly from judged-low; `/stats` and the console surface the pending set.
+- **A keyless local embedder, and a bucket prefilter behind a flag**
+  ([ADR-0048](docs/adr/0048-bucket-prefilter-and-local-embedder.md)). OpenAI-compatible presets
+  accept an empty key (no Authorization header) so Ollama/LM Studio endpoints work;
+  `MEMORY_BUCKET_PREFILTER` (default off) selects top buckets on per-partition summaries before
+  the vector arm scans — its exactness contract is tested, and the acceptance numbers live in
+  the ADR.
+- **One daemon, one principal** ([ADR-0049](docs/adr/0049-principal-and-machine-boundary.md)).
+  The daemon mints a principal key and every request must carry it; the server derives the
+  namespace's user segment from the key, so another local process cannot read a partition by
+  naming it (401/403). Multi-account machines use one db file and port per account. The threat
+  model — same-OS-account processes and at-rest encryption are out — is written down, not implied.
+- **Refused writes leave a trace** (ADR-0040 observability amendment). Every write the filter
+  refuses lands in `curation_drops` before the throw — hash, class, advice, path, origin — with
+  secrets redacted by the same patterns that refused them; repeats fold into one row with
+  `count`/`firstAt`. Reads: `ai-memory drops`, `GET /drops`, `memory_drops`; the refusal line
+  points at the ledger. Cap 1000, oldest evicted.
+- **The console can chat with the store** ([ADR-0043](docs/adr/0043-agent-chat-and-console-monochrome.md),
+  [ADR-0044](docs/adr/0044-vault-graph-in-the-console.md)): `/agent/chat` runs the tool loop
+  where every tool call executes the store's own gates; the vault graph renders partitions on a
+  canvas; Graph/Memories/Recall move to the monochrome token set. `501 no-model` keys the
+  console's local mode.
+
+### Fixed
+
+- `valid_at` backfill could hang `init()` forever on text that matches the stamp's LIKE shape
+  but not its digit regex, holding the migration write lock; the loop now converges by
+  construction.
+- The facet self-heal scan moved its `LIMIT 5000` to the write side: zero-facet rows (the
+  common case) no longer permanently occupy the window that injured rows wait behind.
+- `reembed` no longer silently drops `conflict:*` markers on tag-saturated rows.
+- The bucket prefilter no longer lets `status`/`includeArchived` searches skip buckets whose
+  summaries only cover the active population.
+- Unauthenticated `GET` of a console page no longer embeds the live principal token; `principal
+  recover` works without the embedder configured and the printed next step (`daemon restart`)
+  cannot deadlock on the old binding.
+- InMemory `supersede` closes the live-predecessor window the SQL store closes (no await between
+  the three writes); a Stage 2 pointer never repeats a claim the row already carries as
+  `(previously: …)`.
+
 ## 0.4.0-beta.2 — 2026-11-05
 
 A real-time retrieval pass plus a correctness fix, and the first build whose committed tree
