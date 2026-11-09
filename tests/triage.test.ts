@@ -121,12 +121,23 @@ describe.each(stores)("runTriage dry-run writes nothing (%s store)", (which) => 
 
     const report = await runTriage(store);
 
+    // The merge pair's reported order is the product's documented contract —
+    // oldest first, id tie-break (triage.ts, TriageMergeGroup.ids) — NOT insertion
+    // order: two inserts can land in the same millisecond, and then the id
+    // tie-break decides, so a test that assumes "seeded first is reported first"
+    // is a coin flip. Read the clocks back from the store and derive the expected
+    // order by the same rule the group sorts by.
+    const pairOldestFirst = [await store.getById(rows.mergeA.id), await store.getById(rows.mergeB.id)]
+      .map((m) => m!)
+      .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
+      .map((m) => m.id);
+
     // The diff is the product: counts and the ids behind them.
     expect(report.applied).toBe(false);
     expect(report.archives.map((c) => c.id).sort()).toEqual([rows.junkTable.id, rows.junkColon.id, rows.judgedJunk.id].sort());
     expect(report.demotions.map((c) => c.id).sort()).toEqual([rows.progress.id, rows.selfNarration.id].sort());
     expect(report.merges).toEqual([
-      { entity: "pnpm", text: normalizeText("Deploy uses pnpm run build."), ids: [rows.mergeA.id, rows.mergeB.id].sort() },
+      { entity: "pnpm", text: normalizeText("Deploy uses pnpm run build."), ids: pairOldestFirst },
     ]);
     // Unjudged: every live row without a judged:* tag. 17 rows in the gallery,
     // minus the knowledge row, the tombstone, the draft (the population the pass
@@ -150,7 +161,7 @@ describe.each(stores)("runTriage dry-run writes nothing (%s store)", (which) => 
     expect(text).toContain("unjudged");
     expect(text).toContain(`archive [${rows.junkTable.id}] (table-row)`);
     expect(text).toContain(`demote [${rows.progress.id}] (progress, importance 0.6 → 0.35)`);
-    expect(text).toContain(`merge candidate entity:pnpm ×2: [${rows.mergeA.id}] ↔ [${rows.mergeB.id}]`);
+    expect(text).toContain(`merge candidate entity:pnpm ×2: [${pairOldestFirst[0]}] ↔ [${pairOldestFirst[1]}]`);
     await store.close();
   });
 });
