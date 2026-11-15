@@ -89,3 +89,30 @@ and both fail when the wiring is reverted.
   v1 scale, memoize per repoRoot if a corpus ever shows it).
 - SQLite-backed codebase capability tests: the reload test now covers the SQL read/write path for
   `language`; the edge-ownership keystone tests remain the main SQL-path coverage.
+
+## Release attempt — 0.4.0-beta.4 (2026-11-15)
+
+- Ruling 7: published as **beta.4**, not beta.3. `package.json` already carried `0.4.0-beta.3`
+  from `863562c`, a commit that contains the console work and none of this feature; reusing that
+  number would attribute this work to someone else's release metadata. The Unreleased section
+  became `## 0.4.0-beta.4 — 2026-11-15`, README status and `BETA.md`'s expected-version line moved
+  with it (that one line staged surgically — the rest of `BETA.md`/`ui/*` stayed the operator's
+  uncommitted work).
+- Gate verified on the **committed** tree, not the working tree: a detached worktree at HEAD with
+  copied `node_modules` (never a junction again) ran CI's exact order — ui typecheck 0, lint 0,
+  989 tests passed (the 5 short vs the working tree are the uncommitted `ui/src/lib/agent.test.ts`),
+  root build 0, `npm pack` clean, and the installed tarball answered `version`/`save`/`search`.
+- The one CI-ordering trap worth keeping: `tests/api.test.ts > serves the UI from the same origin`
+  needs a built console, and the server falls back to `ui/dist` when `dist/src/ui-next` is absent.
+  CI builds the UI *before* `npm test`; running `npm test` alone in a fresh checkout fails it. That
+  failure is the harness's order, not a regression.
+- **Blocked on npm's side, not the code's**: run 43713008246 passed `npm ci`, ui build, root build
+  and `prepublishOnly` (992 tests green on the runner), then `npm publish` returned
+  `E404 Not Found - PUT /@franklinww%2fopen-memory`. The package exists (beta.2 is on the registry),
+  so this 404 is npm not recognising an authorized publisher — the workflow's OIDC identity has no
+  Trusted Publisher configured on npmjs.com. Every workflow publish has failed (3/3: two on
+  beta.1 for the unscoped-name rule, this one for identity), so beta.2 was published by hand.
+  Fix: npmjs.com → package → Settings → Trusted Publisher → GitHub Actions with
+  org `codersdfs`, repo `open-memory`, workflow `publish.yml`, Environment empty; then retry with
+  `gh workflow run publish.yml --ref v0.4.0-beta.4` — the workflow's own documented retry path, so
+  no new tag is needed.
