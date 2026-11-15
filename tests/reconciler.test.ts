@@ -7,9 +7,9 @@ function mem(over: Partial<Memory> = {}): Memory {
     id: "old-1", namespace: "pi:u", project: null, kind: "note",
     knowledgeId: null, knowledgeSection: null,
     type: "semantic", text: "use pnpm not npm",
-    embedding: [], importance: 0.8, strength: 0.8, lastUsedAt: null,
+    embedding: [], importance: 0.8, strength: 0.8, lastUsedAt: null, useCount: 0,
     source: "mcp:pi", tags: ["entity:pnpm"], supersedesId: null, isDeleted: 0,
-    visibility: "private", status: "active", pin: 0, createdAt: 1, updatedAt: 1, ...over
+    visibility: "private", status: "active", pin: 0, validAt: null, invalidAt: null, createdAt: 1, updatedAt: 1, ...over
   };
 }
 
@@ -93,12 +93,15 @@ describe("reconcile", () => {
     expect(untyped).toMatchObject({ action: "insert", reason: "typed-no-delete" });
   });
 
-  it("treats a throwing judge as insert", async () => {
+  it("tags a throwing judge as judge-failed, not model-unavailable (P5)", async () => {
     const d = await reconcile({
       ...base, embedderKind: "nim", text: "unrelated wording",
       neighbours: [{ memory: mem(), vectorScore: 0.9 }],
       relation: async () => { throw new Error("down"); }
     });
-    expect(d).toMatchObject({ action: "insert", reason: "model-unavailable" });
+    expect(d).toMatchObject({ action: "insert", reason: "judge-failed" });
+    expect(d.tags).toContain("judged:failed");
+    expect(d.conflictFacet).toBeUndefined();
+    expect(d.tags.every((t) => !t.startsWith("conflict:"))).toBe(true);
   });
 });

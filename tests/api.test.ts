@@ -136,3 +136,53 @@ describe("api", () => {
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
   });
 });
+
+/**
+ * POST /triage (ADR-0040 amendment, 2026-11-09): the retroactive pass writes
+ * INSIDE the daemon process, because the decoded partition snapshots are
+ * invalidated per process (ADR-0034's changes log) — an apply that ran in the
+ * caller's process would leave the daemon scoring archived rows as live until
+ * restart. Same shape as POST /decay: `{apply?}` in the body, the report back.
+ */
+describe("POST /triage", () => {
+  it("dry-run reports and writes nothing; apply archives in the daemon's own process; bare POST is the dry run", async () => {
+    const svc = new MemoryService({ store: new InMemoryVectorStore(), embedder: new HashEmbeddingProvider() });
+    const { app } = await buildServer({ service: svc });
+    await new Promise<void>((r) => app.listen(0, "127.0.0.1", r));
+    const local = `http://127.0.0.1:${(app.address() as AddressInfo).port}`;
+    const localPost = (p: string, body?: unknown) =>
+      fetch(local + p, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    try {
+      // Seeded straight into the store: the write gate refuses junk on every path now.
+      const junk = await svc.store.insert(
+        { namespace: "triage:t", type: "semantic", text: "| 网卡 | MediaTek Wi-Fi 6 | ✅ |", kind: "note", importance: 0.4 },
+        [0.1, 0.2, 0.3]
+      );
+
+      const dry = await localPost("/triage", { apply: false });
+      expect(dry.status).toBe(200);
+      const dryBody = (await dry.json()) as { applied: boolean; archives: { id: string }[] };
+      expect(dryBody.applied).toBe(false);
+      expect(dryBody.archives.map((c) => c.id)).toContain(junk.id);
+      expect((await svc.store.getById(junk.id))!.status).toBe("active");
+
+      const applied = await localPost("/triage", { apply: true });
+      const appliedBody = (await applied.json()) as { applied: boolean; archives: { id: string }[] };
+      expect(appliedBody.applied).toBe(true);
+      expect((await svc.store.getById(junk.id))!.status).toBe("archived");
+      expect((await svc.store.getById(junk.id))!.isDeleted).toBe(0);
+
+      // A body-less POST keeps the diff-first default.
+      const bare = await localPost("/triage");
+      const bareBody = (await bare.json()) as { applied: boolean; archives: unknown[] };
+      expect(bareBody.applied).toBe(false);
+      expect(bareBody.archives).toHaveLength(0);
+    } finally {
+      await new Promise<void>((r) => app.close(() => r()));
+    }
+  });
+});

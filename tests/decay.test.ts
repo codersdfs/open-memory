@@ -4,7 +4,7 @@ import { archiveStale, runDecay, runDecayDetailed } from "../src/core/lifecycle/
 import { MemoryService } from "../src/core/memoryService.js";
 import { callTool } from "../src/mcp/tools.js";
 import { resolveRequestScope } from "../src/core/scope.js";
-import type { MemoryStatus, MemoryType } from "../src/core/types.js";
+import type { Memory, MemoryStatus, MemoryType } from "../src/core/types.js";
 
 /**
  * The lifecycle contract: lose nothing by default, prune only on request.
@@ -19,11 +19,14 @@ const NOW = Date.UTC(2026, 9, 19, 0, 0, 0);
 interface Row {
   namespace?: string;
   type?: MemoryType;
+  kind?: Memory["kind"];
   importance?: number;
   strength?: number;
   ageDays?: number;
   status?: MemoryStatus;
   lastUsedAt?: number | null;
+  /** Directly set, not routed through `reinforce` — the age/clock fields are set the same way. */
+  useCount?: number;
 }
 
 async function add(store: InMemoryVectorStore, row: Row = {}) {
@@ -31,6 +34,7 @@ async function add(store: InMemoryVectorStore, row: Row = {}) {
     {
       namespace: row.namespace ?? "agent:user",
       type: row.type ?? "semantic",
+      kind: row.kind,
       text: `row-${Math.random()}`,
       importance: row.importance ?? 0.4,
       strength: row.strength ?? row.importance ?? 0.4,
@@ -40,6 +44,7 @@ async function add(store: InMemoryVectorStore, row: Row = {}) {
   );
   memory.createdAt = NOW - (row.ageDays ?? 40) * DAY;
   if (row.lastUsedAt !== undefined) memory.lastUsedAt = row.lastUsedAt;
+  if (row.useCount !== undefined) memory.useCount = row.useCount;
   return memory;
 }
 
@@ -85,6 +90,51 @@ describe("archiveStale", () => {
     const page = await store.list({ namespace: "agent:user", includeArchived: true, limit: 1 });
     expect(page.total).toBe(510);
     expect(page.memories[0]!.status).toBe("archived");
+  });
+});
+
+describe("archiveStale hotness (P2, ADR-0016 amendment 2026-11-07)", () => {
+  it("keeps hot old rows and archives cold ones, where the old binary rule kept both", async () => {
+    const store = new InMemoryVectorStore();
+    // The whole point of the swap: under `lastUsedAt !== null`, all three `used*`
+    // rows below were immortal however cold. Hotness weighs how often, not whether.
+    const zeroUse = await add(store, { kind: "note", ageDays: 60, importance: 0.4 });
+    const usedOnceLongAgo = await add(store, { kind: "note", ageDays: 60, lastUsedAt: NOW - 40 * DAY, useCount: 1, importance: 0.4 });
+    // log1p(10)·exp(−ln2·60/30) = 2.398/4 = 0.600 ≥ ln2/2 = 0.347 → kept.
+    const usedOften = await add(store, { kind: "note", ageDays: 200, lastUsedAt: NOW - 60 * DAY, useCount: 10, importance: 0.4 });
+    // A row used yesterday sits inside its kind's window: the grace floor, unchanged.
+    const usedRecently = await add(store, { kind: "note", ageDays: 40, lastUsedAt: NOW - DAY, useCount: 3 });
+    // The importance floor survives the swap untouched (reviewers check this line):
+    // importance ≥ 0.6 is never demoted by the clock, however cold the row is.
+    const floored = await add(store, { kind: "note", ageDays: 60, importance: 0.6 });
+    // And the durable skip runs before any clock is read (ADR-0021): a decision
+    // with zero uses at 400 days is not even measured.
+    const durable = await add(store, { kind: "decision", ageDays: 400, importance: 0.4 });
+    // The half-life is the kind's existing window, not a new constant: a fact at 60
+    // days is inside its 90-day window, where a note at 60 days is two windows past.
+    const youngFact = await add(store, { kind: "fact", ageDays: 60, importance: 0.4 });
+
+    expect(await archiveStale(store, { now: NOW })).toBe(2);
+    for (const id of [zeroUse.id, usedOnceLongAgo.id]) {
+      expect((await store.getById(id))!.status).toBe("archived");
+    }
+    for (const memory of [usedOften, usedRecently, floored, durable, youngFact]) {
+      expect((await store.getById(memory.id))!.status).toBe("active");
+    }
+    // Idempotent, as ADR-0016 measured on the live store.
+    expect(await archiveStale(store, { now: NOW })).toBe(0);
+  });
+
+  it("the half-life follows the kind window: the same row is hot for a fact and cold for a task", async () => {
+    const store = new InMemoryVectorStore();
+    // log1p(2)·exp(−ln2·60/30) = 1.099/4 = 0.275 < 0.347 → cold for `note`.
+    const asNote = await add(store, { kind: "note", ageDays: 60, lastUsedAt: NOW - 60 * DAY, useCount: 2, importance: 0.4 });
+    // The same age and count against the fact's 90-day window: 1.099·exp(−ln2·60/90)
+    // = 1.099·0.630 = 0.692 ≥ 0.347 → hot.
+    const asFact = await add(store, { kind: "fact", ageDays: 60, lastUsedAt: NOW - 60 * DAY, useCount: 2, importance: 0.4 });
+    expect(await archiveStale(store, { now: NOW })).toBe(1);
+    expect((await store.getById(asNote.id))!.status).toBe("archived");
+    expect((await store.getById(asFact.id))!.status).toBe("active");
   });
 });
 

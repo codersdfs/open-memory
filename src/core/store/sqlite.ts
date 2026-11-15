@@ -1,13 +1,41 @@
 // @ts-nocheck
 import { randomUUID } from "crypto";
 import { statSync } from "node:fs";
-import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
+import type { KnowledgeEdge, Memory, MemoryEvent, MemoryEventKind, MemoryInput, WriteEventMeta } from "../types.js";
 import type { KnowledgeCapability, ProjectSummary, VectorStore } from "./interface.js";
 import { DF_CAP_RATIO, LEXICAL_RAREST_K, LEXICAL_TOKEN_LIMIT, MIN_ROWS_FOR_DF_CAP, PINNED_ORDER_DF } from "./interface.js";
 import { indexTerms, queryTerms } from "../retrieval/terms.js";
 import { PartitionCache, type PartitionRow, type PartitionVectors } from "./partitionCache.js";
+import {
+  BUCKET_ABSTRACT_ROWS,
+  accumulateCentroid,
+  addToCentroid,
+  boundCanReachFloor,
+  bucketScanBound,
+  bucketScanOrder,
+  buildAbstract,
+  bucketPrefilterEnabled,
+  BUCKET_RADIUS_SLACK,
+  finishCentroid,
+  pendingAfterRefresh,
+  planBucketRefresh,
+  queryToCentroid,
+  type BucketRefreshReport,
+} from "./buckets.js";
 import { deriveKind } from "../write/kind.js";
+import { facetTagsOf, rederiveTags } from "../write/facets.js";
+import { extractValidAt, textHash } from "../write/text.js";
+import { DROP_LEDGER_CAP, type CurationDrop, type CurationDropInput } from "../write/curation.js";
 import { median } from "../stats.js";
+import type {
+  CodebaseCapability,
+  CodebaseStats,
+  CodeEdgeRow,
+  CodeFileChange,
+  CodeFileInfo,
+  CodeSymbolRow
+} from "../codebase/types.js";
+import { codeFileId } from "../codebase/ids.js";
 
 /**
  * The candidate pool that vectorSearch and cosineSpread must agree on. They are read
@@ -25,6 +53,7 @@ function candidateWhere(
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   },
   alias = "memories"
 ): { whereSql: string; params: (string | number)[] } {
@@ -59,6 +88,17 @@ function candidateWhere(
   if (opts.type) {
     where.push(`${col("type")} = ?`);
     params.push(opts.type);
+  }
+  // P5 (ADR-0047): the facet slice reads the postings, not the tags column — the same
+  // derived state `facetCandidates` ranks over, and the state the self-heal repairs on
+  // open. `indexFacetsSync` lowercases, so the filter does too; a value with no postings
+  // answers empty, which is information (the marker was resolved or never written), not
+  // an error.
+  if (opts.facet) {
+    where.push(
+      `EXISTS (SELECT 1 FROM memory_facets f WHERE f.memory_id = ${col("id")} AND f.facet = ?)`
+    );
+    params.push(String(opts.facet).toLowerCase());
   }
   if (opts.status) {
     where.push(`${col("status")} = ?`);
@@ -365,6 +405,26 @@ export class SqliteVectorStore implements VectorStore {
   private changeSeq = 0;
   /** Trim the log at twice this, so one slice amortises over many writes. */
   private static readonly CHANGE_LOG = 4096;
+  /** Prepared once; `node:sqlite` statements are cheap to hold, expensive to rebuild per write. */
+  private _eventStmt: any;
+  private _dropStmt: any;
+  /**
+   * P8 (ADR-0048): whether writes mark their bucket pending. Snapshotted in init()
+   * because this sits on the hottest write path (`noteChange` runs for every row of
+   * every import) and a `process.env` read per write is real money on Windows; every
+   * `MEMORY_*` flag in this repo is a process-lifetime knob, and this one is no
+   * different — flipping it is a restart, like the provider switch.
+   */
+  private bucketWritesEnabled = false;
+  /**
+   * The per-search bucket-universe read, cached against the change log's seq (the
+   * same driver the partition cache replays). A search needs the set of projects the
+   * candidate population actually spans — data, not summaries — and a warm partition
+   * answers it from this field instead of a GROUP BY. Cleared outright by the rare
+   * sweeps that move membership without `noteChange` (rename/detach/prune/purge),
+   * which are the same sweeps that already clear the vector cache wholesale.
+   */
+  private bucketUniverse: { seq: number; key: string; projects: (string | null)[] } | null = null;
 
   constructor(dbPath = process.env.MEMORY_DB_PATH ?? "memory.db") {
     this.dbPath = dbPath;
@@ -387,12 +447,32 @@ export class SqliteVectorStore implements VectorStore {
     // at the same time — each with its own MCP server process, plus the daemon. WAL
     // lets readers proceed while a writer commits; busy_timeout makes a concurrent
     // writer wait for the lock instead of throwing SQLITE_BUSY at the agent.
+    //
+    // The order is load-bearing, from the 2026-11-07 final review: all three PRAGMAs
+    // used to share one try/catch, and `journal_mode = WAL` is the one that answers
+    // SQLITE_BUSY when another process holds the file — which is exactly what a first
+    // open after an upgrade does while a peer's migration transaction is still in
+    // flight. Swallowing that error swallowed `busy_timeout` with it, so every later
+    // BEGIN IMMEDIATE (the migration sites below) failed instantly with "database is
+    // locked" and the process died in init() — measured: a second opener crashed at
+    // the `text_hash` site (sqlite.ts:481, pre-fix) ~1 s into a peer's held
+    // migration transaction. Set the patience
+    // first, and let each remaining setting fall back on its own.
+    try {
+      this.db.exec("PRAGMA busy_timeout = 5000");
+    } catch {
+      // A build without the pragma still works; retryWrite() covers the contention.
+    }
     try {
       this.db.exec("PRAGMA journal_mode = WAL");
-      this.db.exec("PRAGMA busy_timeout = 5000");
+    } catch {
+      // Busy behind another writer, or a build without WAL: opening in the file's
+      // current journal mode still works, and a later uncontended open switches it.
+    }
+    try {
       this.db.exec("PRAGMA synchronous = NORMAL");
     } catch {
-      // Builds without WAL still work; retryWrite() covers the remaining contention.
+      // The default FULL is slower, not wrong.
     }
     // 1. create table (IF NOT EXISTS — safe for new + old DBs)
     this.db.exec(`
@@ -467,6 +547,64 @@ export class SqliteVectorStore implements VectorStore {
     if (!cols.has("knowledge_section")) {
       this.db.exec(`ALTER TABLE memories ADD COLUMN knowledge_section TEXT`);
     }
+    // ADR-0018 amendment (2026-11-07): the exact-duplicate key. A derived column —
+    // every write that can change `text` recomputes it (runInsert, updateEmbedding) —
+    // backfilled once like `kind`, because hashing 10^5 rows on open is a one-off
+    // cost and checking per read would be a per-search one. A NULL hash (only from
+    // a foreign writer or an interrupted older migration) reads as "never seen":
+    // the worst outcome is a duplicate on a later re-import, never a lost row.
+    if (!cols.has("text_hash")) {
+      // ALTER and the backfill in ONE transaction — SQLite's DDL is transactional —
+      // so a crash rolls the column itself back and the next open re-runs the whole
+      // migration, instead of leaving NULL hashes that never get a second pass.
+      // `runMigrationTxn` keeps the shape but not the crash: this transaction holds
+      // the write lock across the whole-store hash backfill, and an opener racing it
+      // (daemon restart plus a first CLI write after an upgrade) must wait, not die.
+      await this.runMigrationTxn(`ALTER TABLE memories ADD COLUMN text_hash TEXT`, () => this.backfillTextHashes());
+    }
+    // P2 (ADR-0016 amendment, 2026-11-07): the retrieval counter the hotness rule
+    // reads. Same single-transaction shape as `text_hash` right above — ALTER and
+    // the zero-backfill commit together or not at all, so a crash mid-migration
+    // rolls the column back and the next open re-runs the whole thing instead of
+    // leaving NULLs that never get a second pass. Rows predating the counter get 0:
+    // "no evidence of use" is the honest reading, and the floor is what makes the
+    // rule safe — a migrated store never looks hotter than it was.
+    if (!cols.has("use_count")) {
+      await this.runMigrationTxn(`ALTER TABLE memories ADD COLUMN use_count INTEGER`, () =>
+        this.db.exec(`UPDATE memories SET use_count = 0 WHERE use_count IS NULL`)
+      );
+    }
+    // P6 (ADR-0045): the event-time clock. `valid_at` is parsed from the row's own
+    // `(at:YYYY-MM-DD)` stamp (ADR-0015) — a column for the date that used to be
+    // buried in the text, because a timeline you can only reach with LIKE is not a
+    // timeline. Same single-transaction shape as `text_hash`/`use_count` above:
+    // ALTER and the backfill commit together or not at all, so a crash rolls the
+    // column back and the next open re-runs the whole migration. Rows whose text
+    // carries no stamp keep NULL — "no match does not move" is the contract; a
+    // guessed date would be worse than an admitted unknown.
+    if (!cols.has("valid_at")) {
+      await this.runMigrationTxn(`ALTER TABLE memories ADD COLUMN valid_at INTEGER`, () => this.backfillValidAt());
+    }
+    // P6: the invalidation clock, the other half of the pair. Forward writes come
+    // only from a supersede (the one UPDATE that flips `is_deleted` also stamps
+    // `invalid_at`); the backfill recovers the supersede half for rows already in
+    // that state — a superseded row retired at its successor's `created_at` — and
+    // deliberately leaves plain tombstones NULL: a forget means "removed", and
+    // writing a guess there would corrupt the one honest reading.
+    if (!cols.has("invalid_at")) {
+      await this.runMigrationTxn(
+        `ALTER TABLE memories ADD COLUMN invalid_at INTEGER`,
+        () =>
+          this.db.exec(`
+            UPDATE memories SET invalid_at = (
+              SELECT succ.created_at FROM memories succ WHERE succ.supersedes_id = memories.id
+              ORDER BY succ.created_at ASC LIMIT 1
+            )
+            WHERE is_deleted = 1 AND invalid_at IS NULL
+              AND EXISTS (SELECT 1 FROM memories succ WHERE succ.supersedes_id = memories.id)
+          `)
+      );
+    }
     // 3. create indexes (after columns guaranteed to exist)
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_memories_ns_type ON memories(namespace, type);
@@ -484,6 +622,12 @@ export class SqliteVectorStore implements VectorStore {
         WHERE knowledge_id IS NOT NULL AND is_deleted = 0;
       CREATE INDEX IF NOT EXISTS idx_memories_knowledge ON memories(knowledge_id)
         WHERE knowledge_id IS NOT NULL;
+      -- ADR-0018 amendment: the fold lookup seeks on (namespace, hash) — that pair
+      -- is selective enough that the project/type/status predicates findExistingHashes
+      -- then applies run over a handful of rows, not the partition. The index is
+      -- partial because NULL hashes (only ever from a foreign writer) answer no query.
+      CREATE INDEX IF NOT EXISTS idx_memories_text_hash ON memories(namespace, text_hash)
+        WHERE text_hash IS NOT NULL;
     `);
     // 4. lexical index (ADR-0012). The postings every search reads are derived
     // state: they can always be recomputed from `memories.text`, so a corrupt or
@@ -506,6 +650,23 @@ export class SqliteVectorStore implements VectorStore {
         n INTEGER NOT NULL
       );
     `);
+    // P4 (ADR-0046): the facet index, the join-key half of `tags`. Same shape as
+    // `memory_terms` — a posting list keyed by the joined value, maintained by the
+    // same code paths in the same transactions — because it answers the same kind of
+    // question ("which rows share this key") and inherits the same crash property:
+    // a row and its facets commit together or not at all. `namespace` is carried
+    // denormalized so "same entity, this partition" (the P5 conflict window) is one
+    // indexed seek without a join; the candidate query still joins `memories` for
+    // the rest of its filters, exactly as the lexical arm does.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_facets (
+        facet TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        PRIMARY KEY (facet, memory_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_facets_memory ON memory_facets(memory_id);
+    `);
     // 5. knowledge links (ADR-0023). A row per written link, not per resolved edge:
     // a target that resolves only when a second page is created has to be visible
     // as debt (to_id NULL), and `target` is what tells an editor which line to fix.
@@ -518,10 +679,169 @@ export class SqliteVectorStore implements VectorStore {
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_links_to ON knowledge_links(to_id);
     `);
+    // Codebase index (ADR-0050). Derived state, the repository's files are the
+    // truth: code_files carries the content hash the sync diffs against, and the
+    // persisted re-export statements and type-field maps let a chain into an
+    // *unchanged* file resolve without re-parsing it. code_edges are keyed on
+    // their full triple, so a symbol referenced five times is one edge.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS code_files (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        path TEXT NOT NULL,
+        hash TEXT,
+        mtime INTEGER,
+        lines INTEGER,
+        parse_error TEXT,
+        re_exports TEXT NOT NULL DEFAULT '[]',
+        fields TEXT NOT NULL DEFAULT '{}',
+        language TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_code_files_path ON code_files(project, path);
+      CREATE TABLE IF NOT EXISTS code_symbols (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        signature TEXT,
+        line_start INTEGER,
+        line_end INTEGER,
+        exported INTEGER NOT NULL DEFAULT 0,
+        parent_id TEXT,
+        fan_in INTEGER NOT NULL DEFAULT 0,
+        language TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(file_id);
+      CREATE INDEX IF NOT EXISTS idx_code_symbols_project ON code_symbols(project);
+      CREATE TABLE IF NOT EXISTS code_edges (
+        kind TEXT NOT NULL,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        PRIMARY KEY (kind, from_id, to_id, evidence)
+      );
+      CREATE INDEX IF NOT EXISTS idx_code_edges_from ON code_edges(from_id);
+      CREATE INDEX IF NOT EXISTS idx_code_edges_to ON code_edges(to_id);
+      -- The fan_in recompute groups the calls edges by target; without the
+      -- (to_id, kind) pair the planner reads the whole edge table per symbol and
+      -- a 12k-symbol index costs seconds instead of milliseconds.
+      CREATE INDEX IF NOT EXISTS idx_code_edges_to_kind ON code_edges(to_id, kind);
+    `);
+    // A store opened by a build older than the fields column reads the same
+    // tables: add the column in place (the established ALTER-if-missing
+    // pattern), and its '{}' default reads as "no persisted fields" until the
+    // file's next sync rewrites the row.
+    const codeFileCols = this.db.prepare(`PRAGMA table_info(code_files)`).all() as { name: string }[];
+    if (!codeFileCols.some((c) => c.name === "fields")) {
+      this.db.exec(`ALTER TABLE code_files ADD COLUMN fields TEXT NOT NULL DEFAULT '{}'`);
+    }
+    // Language (roadmap Phase 2): the grammar id that indexed the row. Existing
+    // rows were indexed by the TypeScript scanner, so 'typescript' is the honest
+    // backfill — the same渐进 convergence the fields default uses.
+    const codeSymbolCols = this.db.prepare(`PRAGMA table_info(code_symbols)`).all() as { name: string }[];
+    if (!codeFileCols.some((c) => c.name === "language")) {
+      this.db.exec(`ALTER TABLE code_files ADD COLUMN language TEXT`);
+      this.db.exec(`UPDATE code_files SET language = 'typescript' WHERE language IS NULL`);
+    }
+    if (!codeSymbolCols.some((c) => c.name === "language")) {
+      this.db.exec(`ALTER TABLE code_symbols ADD COLUMN language TEXT`);
+      this.db.exec(`UPDATE code_symbols SET language = 'typescript' WHERE language IS NULL`);
+    }
+    // P2 (ADR-0016 amendment, 2026-11-07): store-level bookkeeping as a small KV,
+    // not a column — this describes the file, not any memory, and a maintenance
+    // timestamp on 10^5 rows would be the same number 10^5 times. IF NOT EXISTS,
+    // like every other table here: the same migration path runs on new and old DBs.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS store_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+    // P6 (ADR-0045): the write history. Append-only by construction — nothing in
+    // this file ever UPDATEs or DELETEs from it, and that is the point: the row a
+    // hard delete removes is exactly the row whose story has to keep answering.
+    // Shape follows mem0's history table (id/memory_id/old_memory/new_memory/event,
+    // bench/.venv-mem0/.../storage.py:108-119), minus its `is_deleted` flag — the
+    // log here is never soft-deleted, so the flag would always read 0. One row per
+    // write point, written in the same transaction as the write it describes.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id TEXT NOT NULL,
+        event TEXT NOT NULL CHECK (event IN ('insert','reinforce','supersede','archive')),
+        old_value TEXT,
+        new_value TEXT,
+        reason TEXT,
+        model TEXT,
+        at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events(memory_id);
+    `);
+    // The drop ledger (ADR-0040 observability amendment): every write the curation
+    // filter refused, with its class, its advice, and a MASKED preview. Its own table,
+    // deliberately NOT a memory_events row — an event is keyed by a memory id, and a
+    // refused note never gets one. That missing id is the whole reason a dropped note
+    // used to leave no trace: the write threw before embed/insert, so there was no row,
+    // no id, and nothing to answer "why is this note missing" on the next run.
+    // `hash` is normalizeText's sha256 (write/text.ts), so two runs that re-send the
+    // same note fold into one count without either having to keep the words.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS curation_drops (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        hash TEXT NOT NULL,
+        preview TEXT NOT NULL,
+        junk TEXT NOT NULL,
+        advice TEXT NOT NULL,
+        origin TEXT NOT NULL,
+        path TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        project TEXT,
+        at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_drops_hash ON curation_drops(hash);
+      CREATE INDEX IF NOT EXISTS idx_drops_namespace ON curation_drops(namespace, at);
+    `);
+    // P8 (ADR-0048): the bucket summaries — one row per (namespace, project), the
+    // model-free abstract, the bucket's centroid geometry, and the drift counters.
+    // NOT memories: these rows never enter `list`, a search result, or any candidate
+    // pool — they are derived state like the postings, rebuilt by the maintenance
+    // pass and read only by the vector arm behind MEMORY_BUCKET_PREFILTER=on.
+    // `project` uses '' for the unscoped backlog (the `memories.project IS NULL`
+    // rows) because a PRIMARY KEY over a nullable column would let two NULL rows
+    // coexist; the mapping lives at the two boundaries (bucketKeyOf / projectOfKey).
+    // `embedding` is the bucket's unit centroid (mean row direction), `cos_theta` the
+    // covering radius of that cap — together they bound every cosine the bucket's
+    // rows can reach, which is what the prefilter's skip rule reads. The summary is
+    // written in two shapes: a refresh writes abstract+geometry+counters; a write's
+    // pending bump (noteChange) upserts a placeholder with no embedding — both are
+    // "stale" to the search path, and stale is the safe state (full scan, never a
+    // skip).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_buckets (
+        namespace TEXT NOT NULL,
+        project TEXT NOT NULL,
+        abstract TEXT NOT NULL DEFAULT '',
+        dim INTEGER NOT NULL DEFAULT 0,
+        embedding BLOB,
+        norm REAL NOT NULL DEFAULT 0,
+        cos_theta REAL NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        pending INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (namespace, project)
+      );
+    `);
     this.backfillTerms();
+    this.backfillFacets();
     this.rebuildTermDfIfEmpty();
     this.migrateVectors();
     this.ready = true;
+    // P8 (ADR-0048): the pending marker is write-path state, so the flag is read once
+    // per open — the same one-per-process reading every constructor-time knob uses.
+    this.bucketWritesEnabled = bucketPrefilterEnabled();
   }
 
   /**
@@ -650,6 +970,124 @@ export class SqliteVectorStore implements VectorStore {
     // Precise marking: only the partitions that actually held the row lose their
     // decoded data. A blanket clear would make the cache useless under a write burst.
     this.vectors.dropRow(id);
+    this.bucketUniverse = null;
+    // P8 (ADR-0048): one write marks its bucket pending, so the prefilter treats the
+    // bucket as summary-less until the next refresh — a row written moments ago is
+    // scanned, never skipped (the ADR-0026 "written moments ago" rule, held at the
+    // write path instead of an index update). One statement, upsert: the placeholder
+    // it can create carries no embedding, which the search reads as stale → full
+    // scan for that bucket. Off unless the feature is on: with the prefilter off
+    // this adds nothing to any write, and the table stays empty.
+    if (this.bucketWritesEnabled) this.markBucketPending(id);
+  }
+
+  /** `''` encodes the unscoped backlog in the bucket key (the PK column is NOT NULL). */
+  private static bucketKeyOf(project: string | null | undefined): string {
+    return project ?? "";
+  }
+
+  private static projectOfKey(key: string): string | null {
+    return key === "" ? null : key;
+  }
+
+  /**
+   * The predicate that selects one bucket's rows inside a candidate WHERE. The
+   * unscoped arm matches the empty-string project too — a defensive `OR` no current
+   * writer can trigger (`normalizeProject` slugs `""` to null) but the key mapping
+   * folds that value into the unscoped bucket, so the scan must fold with it.
+   */
+  private static bucketWhere(project: string | null): string {
+    return project === null ? "(m.project IS NULL OR m.project = '')" : "m.project = ?";
+  }
+
+  /**
+   * Mark one row's bucket pending (P8, ADR-0048). The bucket is read off the row —
+   * `noteChange` is the single choke point every write path already passes, and its
+   * callers mostly hold only the id. One primary-key seek plus one upsert, the same
+   * order of cost as the history event a write already records; a purged id finds no
+   * row and marks nothing (nothing of it remains to scan).
+   *
+   * The statement stays synchronous on purpose: `noteChange` runs inline after every
+   * write, and a fire-and-forget marker would let a search that immediately follows
+   * its own save read the bucket table before the marker lands. Lock contention is
+   * what busy_timeout (5 s) is set for, so a held write lock makes the marker WAIT,
+   * not fail; the failure this catch exists for is the immediate-BUSY corner retryWrite
+   * documents (a WAL checkpoint racing a commit). There the fallback is not a warn
+   * alone: a lost marker with a surviving summary would make the search TRUST a cap
+   * that does not contain the just-written row — the silent-stale shape the prefilter
+   * exists to make impossible — so the summary row itself is dropped, which forces
+   * full scans for that bucket until the next refresh rebuilds it. When even the drop
+   * cannot land, the warning says exactly what is at stake instead of the old, wrong
+   * "search falls back to full scans" (which was true only while no summary existed).
+   */
+  private markBucketPending(id: string): void {
+    let bucket: { namespace: string; projectKey: string } | undefined;
+    try {
+      const row = this.db.prepare(`SELECT namespace, project FROM memories WHERE id = ?`).get(id) as
+        | { namespace: string; project: string | null }
+        | undefined;
+      if (!row) return;
+      bucket = { namespace: row.namespace, projectKey: SqliteVectorStore.bucketKeyOf(row.project) };
+      this.db
+        .prepare(
+          `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, total, pending, updated_at)
+           VALUES (?, ?, '', 0, NULL, 0, 0, 1, 0)
+           ON CONFLICT(namespace, project) DO UPDATE SET pending = pending + 1`
+        )
+        .run(bucket.namespace, bucket.projectKey);
+    } catch (err) {
+      // A pending marker must never fail a write that already committed.
+      const reason = err instanceof Error ? err.message : String(err);
+      if (bucket) {
+        try {
+          this.db
+            .prepare(`DELETE FROM memory_buckets WHERE namespace = ? AND project = ?`)
+            .run(bucket.namespace, bucket.projectKey);
+          warnOnce(
+            "bucket-pending-drop",
+            `bucket pending marker failed (${reason}); dropped the bucket summary so its bucket scans in full until the next refresh`
+          );
+          return;
+        } catch (dropErr) {
+          warnOnce(
+            "bucket-pending",
+            `bucket pending marker failed and the stale summary could not be dropped — the bucket may be served ` +
+            `from its previous summary until the next refresh: ${dropErr instanceof Error ? dropErr.message : String(dropErr)}`
+          );
+          return;
+        }
+      }
+      warnOnce("bucket-pending-seek", `bucket pending marker skipped, row unreadable: ${reason}`);
+    }
+  }
+
+  /** The projects the candidate population spans — data, not summaries (a missing summary must be visible). */
+  private bucketUniverseProjects(whereSql: string, params: (string | number)[]): (string | null)[] {
+    // The key carries the bound values, not just the clause text: two partitions share
+    // a WHERE string (`namespace = ?`), and a cache keyed on the text alone would hand
+    // one partition's buckets to another.
+    const key = `${whereSql}|${JSON.stringify(params)}`;
+    if (this.bucketUniverse && this.bucketUniverse.seq === this.changeSeq && this.bucketUniverse.key === key) {
+      return this.bucketUniverse.projects;
+    }
+    // The CASE folds a (never-writable) '' project into the unscoped bucket, the same
+    // fold `bucketKeyOf` applies on the write side.
+    const projects = (
+      this.db
+        .prepare(
+          `SELECT DISTINCT CASE WHEN m.project IS NULL OR m.project = '' THEN NULL ELSE m.project END AS project
+             FROM memories m WHERE ${whereSql}`
+        )
+        .all(...(params as any)) as { project: string | null }[]
+    ).map((r) => r.project);
+    this.bucketUniverse = { seq: this.changeSeq, key, projects };
+    return projects;
+  }
+
+  /** Invalidate the bucket state the rare sweeps strand (see the call sites). */
+  private dropBucketsWhere(clause: string, ...params: (string | number)[]): void {
+    this.db.prepare(`DELETE FROM memory_buckets WHERE ${clause}`).run(...(params as any));
+    this.bucketUniverse = null;
   }
 
   /**
@@ -686,6 +1124,37 @@ export class SqliteVectorStore implements VectorStore {
     this.db
       .prepare(`INSERT OR REPLACE INTO memory_vectors (memory_id, dim, vec, norm, q8, scale) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(id, embedding.length, packVector(embedding), Math.sqrt(norm), q8, scale);
+  }
+
+  /**
+   * One history row (P6, ADR-0045). Caller owns the transaction — an event is only
+   * truthful when it commits with the write it describes; an event that lands after
+   * a rollback would report a write the store never accepted.
+   */
+  private insertEventSync(
+    memoryId: string,
+    event: MemoryEventKind,
+    at: number,
+    fields: { oldValue?: string | null; newValue?: string | null; reason?: string | null; model?: string | null } = {}
+  ): void {
+    this.eventStmt().run(
+      memoryId,
+      event,
+      fields.oldValue ?? null,
+      fields.newValue ?? null,
+      fields.reason ?? null,
+      fields.model ?? null,
+      at
+    );
+  }
+
+  private eventStmt(): any {
+    if (!this._eventStmt) {
+      this._eventStmt = this.db.prepare(
+        `INSERT INTO memory_events (memory_id, event, old_value, new_value, reason, model, at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+    }
+    return this._eventStmt;
   }
 
   /** Full rows for a set of ids, one query. Missing ids are simply absent. */
@@ -739,6 +1208,21 @@ export class SqliteVectorStore implements VectorStore {
     const terms = this.termRows(text);
     for (const [token, tf] of terms) stmt.run(token, id, tf);
     if (terms.size > 0) this.bumpDf(terms.keys(), 1);
+  }
+
+  /**
+   * Replace this row's facet postings (P4, ADR-0046). Caller owns the transaction —
+   * every call site sits inside the same BEGIN/COMMIT as the write that moved the
+   * tags, so a row whose facets drifted from its tags can only come from a writer
+   * that bypassed this file, never from a crash. Values are lowercased: derived
+   * facets are already slugs, and a caller-supplied `entity:Foo` joins `entity:foo`.
+   */
+  private indexFacetsSync(id: string, namespace: string, tags: string[] | undefined): void {
+    this.db.prepare(`DELETE FROM memory_facets WHERE memory_id = ?`).run(id);
+    const facets = facetTagsOf(tags);
+    if (facets.length === 0) return;
+    const stmt = this.db.prepare(`INSERT OR IGNORE INTO memory_facets (facet, memory_id, namespace) VALUES (?, ?, ?)`);
+    for (const facet of facets) stmt.run(facet.toLowerCase(), id, namespace);
   }
 
   /**
@@ -804,6 +1288,83 @@ export class SqliteVectorStore implements VectorStore {
   }
 
   /**
+   * Self-heal for rows whose tags hold facets but whose `memory_facets` postings are
+   * missing (P4, ADR-0046) — rows written before the index existed, or by a writer
+   * that bypassed these code paths. Same `NOT EXISTS` anti-join shape as
+   * `backfillTerms`, for the same reason: no marker row to forget, so a crashed
+   * write is repaired on the next open instead of one memory being unfindable by
+   * its entity forever.
+   *
+   * Two differences from `backfillTerms`, and both come from one fact: a ZERO-FACET
+   * row is common (casual prose legitimately derives nothing), where a zero-term row
+   * is rare. (1) A zero-facet row is a *permanent* member of this anti-join — it will
+   * never earn postings — so a LIMIT on the scan itself would let the first 5,000 of
+   * them shadow an injured row further down the table on every open, and the self-heal
+   * would silently die exactly on the chat-heavy stores this index matters for. The
+   * scan is therefore chunked by rowid and runs to exhaustion (or to the write cap);
+   * the 5,000 bounds what ONE open *repairs*, never what it *evaluates*, and only an
+   * actual repair consumes the budget. (2) Zero-facet rows are skipped before the
+   * write transaction opens, so the steady state is a scan per open and no write —
+   * not a permanent no-op transaction.
+   */
+  private backfillFacets(): void {
+    const scan = this.db.prepare(
+      `SELECT m.rowid AS rid, m.id AS id, m.namespace AS namespace, m.tags AS tags
+         FROM memories m
+        WHERE m.rowid > ? AND NOT EXISTS (SELECT 1 FROM memory_facets f WHERE f.memory_id = m.id)
+        ORDER BY m.rowid
+        LIMIT 5000`
+    );
+    const repairable: { id: string; namespace: string; tags: string[] | undefined }[] = [];
+    let cursor = 0;
+    for (;;) {
+      const rows = scan.all(cursor) as { rid: number; id: string; namespace: string; tags: string | null }[];
+      if (rows.length === 0) break;
+      cursor = rows[rows.length - 1]!.rid;
+      for (const row of rows) {
+        let tags: string[] | undefined;
+        try {
+          tags = row.tags ? (JSON.parse(row.tags) as string[]) : undefined;
+        } catch {
+          tags = undefined; // a foreign writer's malformed JSON is not ours to fix here
+        }
+        if (facetTagsOf(tags).length === 0) continue; // no facets, no postings, no budget spent
+        repairable.push({ id: row.id, namespace: row.namespace, tags });
+        if (repairable.length >= 5000) break;
+      }
+      if (repairable.length >= 5000) break;
+    }
+    if (repairable.length === 0) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of repairable) this.indexFacetsSync(row.id, row.namespace, row.tags);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+      throw err;
+    }
+  }
+
+  /**
+   * One-time derivation of `text_hash` for rows that predate the column
+   * (ADR-0018 amendment). Same shape and same rationale as `backfillKinds`: a
+   * sha256 per row is a one-off cost on the first open after upgrade.
+   */
+  private backfillTextHashes(): void {
+    // Called inside the caller's transaction (see the ALTER site). Chunked SELECTs
+    // bound the memory — `.all()` on 10^5 rows' text would read the column twice —
+    // and the loop runs to empty, so no store is big enough to silently keep NULLs.
+    const stmt = this.db.prepare(`UPDATE memories SET text_hash = ? WHERE id = ?`);
+    for (;;) {
+      const rows = this.db
+        .prepare(`SELECT id, text FROM memories WHERE text_hash IS NULL LIMIT 5000`)
+        .all() as { id: string; text: string }[];
+      if (rows.length === 0) break;
+      for (const row of rows) stmt.run(textHash(row.text), row.id);
+    }
+  }
+
+  /**
    * One-time classification of rows that predate the `kind` column (ADR-0021).
    * Batched in a single transaction: the heuristic is a few regexes per row and
    * 10^5 rows is a one-off cost on the first open after upgrade, not per search.
@@ -824,6 +1385,54 @@ export class SqliteVectorStore implements VectorStore {
     } catch (err) {
       try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
       throw err;
+    }
+  }
+
+  /**
+   * One-time derivation of `valid_at` for rows that predate the column
+   * (P6, ADR-0045). Same shape as `backfillTextHashes`: the caller's transaction
+   * holds the ALTER, chunked SELECTs bound the memory, and the loop runs to empty —
+   * a store is never big enough to silently keep NULLs on rows that do carry a
+   * stamp. Rows with no `(at:…)` in the text are left NULL on purpose: the column
+   * records what the text states, and inventing a date from `created_at` would
+   * blur the two clocks the column exists to separate.
+   *
+   * Unlike `backfillTextHashes` (whose `textHash` has a value for every text, so
+   * every selected row leaves the set the same pass), this loop can select a row it
+   * then refuses to update — and a row that stays selected forever means the loop
+   * never ends, inside `init()`'s migration write lock. Two independent guards
+   * close that (the 2026-11-08 review reproduced the hang with a literal
+   * `(at:YYYY-MM-DD)` template in an old store):
+   *   - the pre-filter demands the *numeric* shape (GLOB `[0-9]` classes, not LIKE
+   *     `_`, which matches any character and let `(at:abcd-ef-gh)` through);
+   *   - a pass that updated nothing ends the loop — selected-but-rejected rows are
+   *     exactly the "no match does not move" population, so leaving them NULL is
+   *     the contract, not a failure to retry.
+   */
+  private backfillValidAt(): void {
+    const stmt = this.db.prepare(`UPDATE memories SET valid_at = ? WHERE id = ?`);
+    for (;;) {
+      const rows = this.db
+        .prepare(
+          `SELECT id, text FROM memories
+            WHERE valid_at IS NULL
+              AND text GLOB '*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
+            LIMIT 5000`
+        )
+        .all() as { id: string; text: string }[];
+      if (rows.length === 0) break;
+      let updated = 0;
+      for (const row of rows) {
+        const at = extractValidAt(row.text);
+        if (at !== null) {
+          stmt.run(at, row.id);
+          updated++;
+        }
+      }
+      // The termination guarantee: a pass with zero updates can never make progress
+      // on the next one — the same rows would be selected again. Break instead of
+      // holding the migration's write lock forever.
+      if (updated === 0) break;
     }
   }
 
@@ -850,9 +1459,258 @@ export class SqliteVectorStore implements VectorStore {
     throw lastErr;
   }
 
+  /**
+   * A first-open migration transaction — the two ALTER+backfill sites in `init()` —
+   * as BEGIN IMMEDIATE, DDL, backfill, COMMIT under `retryWrite`, from the
+   * 2026-11-07 final review.
+   *
+   * These sites used to be bare `exec`s: a daemon restart racing a CLI's first
+   * write after an upgrade hit `database is locked` within milliseconds — the
+   * migration transaction deliberately holds the write lock across the whole-store
+   * `text_hash` backfill (10^5 row hashes can pass one five-second busy wait), and
+   * the loser of that race used to die in `service.init()` instead of waiting. The
+   * transaction shape (and with it the crash-rolls-back-then-re-run guarantee the
+   * sites were built for) is unchanged; only the failure mode moved from throw to
+   * wait-and-retry.
+   *
+   * `duplicate column name` is caught on purpose: two openers can both read the
+   * schema as missing the column, and the one that wakes from its lock-wait finds
+   * the winner already committed — and the winner's transaction backfilled in the
+   * same commit, so "already migrated" is the whole truth and the open proceeds.
+   */
+  private async runMigrationTxn(ddl: string, afterAlter: () => void): Promise<void> {
+    await this.retryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(ddl);
+        afterAlter();
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        if (/duplicate column name/i.test(String((err as Error)?.message ?? err))) return;
+        throw err;
+      }
+    });
+  }
+
   close(): void {
     try { this.db?.close(); } catch {}
     this.ready = false;
+  }
+
+  /**
+   * Store-level KV (P2, ADR-0016 amendment): today only `last_maintenance_at` and
+   * the last maintenance report, written by the daemon's scheduler and read back by
+   * `/stats` after a restart — the point of persisting them is precisely that a
+   * restarted daemon can tell whether the store is overdue instead of blind-running.
+   */
+  async getMeta(key: string): Promise<string | null> {
+    this.ensure();
+    const row = this.db.prepare(`SELECT value FROM store_meta WHERE key = ?`).get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  async setMeta(key: string, value: string): Promise<void> {
+    this.ensure();
+    await this.retryWrite(() =>
+      this.db
+        .prepare(`INSERT INTO store_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+        .run(key, value)
+    );
+  }
+
+  /**
+   * Bucket summary refresh (P8, ADR-0048). The threshold decision is `planBucketRefresh`
+   * (shared with the in-memory store). The summary itself is local compute over the
+   * vectors the store already holds — the unit centroid of the bucket's row
+   * directions plus the smallest radius that covers them all (`finishCentroid`) —
+   * and the abstract is `buildAbstract` over the newest live rows. No embedder: a
+   * refresh never makes a network call, and the geometry is in the same space the
+   * rows are by construction.
+   *
+   * `beforeWrite` is a test seam (not part of the store interface) invoked after a
+   * target's geometry is read and before that target's summary is written — the exact
+   * per-bucket window the pending-reset race lives in — with the target handed in so
+   * a test can put a concurrent write inside ONE bucket's window and pin that the
+   * write's drift marker survives the refresh.
+   */
+  async refreshBucketSummaries(opts: { now?: number; beforeWrite?: (target: { namespace: string; project: string | null }) => void | Promise<void> } = {}): Promise<BucketRefreshReport> {
+    this.ensure();
+    const now = opts.now ?? Date.now();
+    const universe = this.db
+      .prepare(
+        `SELECT namespace,
+                CASE WHEN project IS NULL OR project = '' THEN NULL ELSE project END AS project,
+                COUNT(*) AS total
+           FROM memories
+          WHERE is_deleted = 0 AND status = 'active'
+          GROUP BY namespace, CASE WHEN project IS NULL OR project = '' THEN NULL ELSE project END`
+      )
+      .all() as { namespace: string; project: string | null; total: number }[];
+    const existingRows = this.db
+      .prepare(`SELECT namespace, project, dim, total, pending FROM memory_buckets`)
+      .all() as { namespace: string; project: string; dim: number; total: number; pending: number }[];
+    const existing = new Map(existingRows.map((r) => [`${r.namespace}\u0000${r.project}`, r]));
+    const planned = planBucketRefresh(
+      universe.map((u) => ({ key: `${u.namespace}\u0000${SqliteVectorStore.bucketKeyOf(u.project)}`, total: u.total })),
+      new Map(
+        [...existing].map(([key, r]) => [key, { dim: r.dim, total: r.total, pending: r.pending }])
+      ),
+      await this.storedDim()
+    );
+
+    // Dropped first: a summary whose bucket holds no live row is a phantom that would
+    // spend scan time ranking rows no scan can return.
+    for (const key of planned.dropped) {
+      const [namespace, project] = key.split("\u0000");
+      await this.retryWrite(() =>
+        this.db.prepare(`DELETE FROM memory_buckets WHERE namespace = ? AND project = ?`).run(namespace, project)
+      );
+    }
+
+    const targets = universe.filter(
+      (u) => planned.targets.includes(`${u.namespace}\u0000${SqliteVectorStore.bucketKeyOf(u.project)}`)
+    );
+    const currentDim = await this.storedDim();
+    let refreshed = 0;
+    for (const t of targets) {
+      // The abstract: newest live rows, deterministically — the sample the refresh
+      // can cite (kept in the table for diagnostics, never ranked on).
+      const rows = this.db
+        .prepare(
+          `SELECT text FROM memories m
+            WHERE m.namespace = ? AND ${SqliteVectorStore.bucketWhere(t.project)}
+              AND m.is_deleted = 0 AND m.status = 'active'
+            ORDER BY m.created_at DESC, m.id ASC
+            LIMIT ?`
+        )
+        .all(...(t.project === null ? [t.namespace] : [t.namespace, t.project]), BUCKET_ABSTRACT_ROWS) as {
+        text: string;
+      }[];
+      // The geometry: every live row's direction, meaned. Rows at a foreign width
+      // (an interrupted reembed) are excluded here exactly as the search path
+      // excludes them, so the radius covers precisely the rows a scan can score.
+      if (currentDim === null) continue;
+      const vectors = this.db
+        .prepare(
+          `SELECT v.vec AS vec, v.dim AS dim FROM memories m JOIN memory_vectors v ON v.memory_id = m.id
+            WHERE m.namespace = ? AND ${SqliteVectorStore.bucketWhere(t.project)}
+              AND m.is_deleted = 0 AND m.status = 'active'`
+        )
+        .all(...(t.project === null ? [t.namespace] : [t.namespace, t.project])) as { vec: Buffer; dim: number }[];
+      const usable = vectors.filter((r) => r.dim === currentDim).map((r) => unpackVector(r.vec));
+      if (usable.length === 0) continue; // nothing scannable — leave the summary absent
+      const acc = accumulateCentroid(currentDim);
+      for (const vec of usable) addToCentroid(acc, vec);
+      const geo = finishCentroid(acc, 1);
+      // The radius: the smallest centroid-to-row cosine, against the finished
+      // centroid — the true cap the bound consumes.
+      let cosTheta = 1;
+      for (const vec of usable) cosTheta = Math.min(cosTheta, queryToCentroid(vec, geo.centroid, geo.norm));
+      // The pending baseline, read in the SAME synchronous block as the geometry: it
+      // is the drift count the cap about to be stored actually describes. Everything
+      // that marks pending from here on is post-snapshot drift the reset below must
+      // keep (review, 2026-11-09: an unconditional `pending = 0` inside the retry
+      // backoff erased a concurrent write's marker, and the bucket then trusted a
+      // cap that did not contain the new row).
+      const planKey = `${t.namespace}\u0000${SqliteVectorStore.bucketKeyOf(t.project)}`;
+      const planRow = this.db
+        .prepare(`SELECT pending, updated_at FROM memory_buckets WHERE namespace = ? AND project = ?`)
+        .get(t.namespace, SqliteVectorStore.bucketKeyOf(t.project)) as
+        | { pending: number; updated_at: number }
+        | undefined;
+      const plan = planRow ? { pending: planRow.pending, updatedAt: planRow.updated_at } : null;
+      if (opts.beforeWrite) await opts.beforeWrite({ namespace: t.namespace, project: t.project });
+      await this.retryWrite(() => {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          // Re-read inside the lock: no writer can commit between this read and the
+          // reset, so `pendingAfterRefresh`'s subtraction is atomic against writes.
+          const cur = this.db
+            .prepare(`SELECT pending, updated_at FROM memory_buckets WHERE namespace = ? AND project = ?`)
+            .get(t.namespace, SqliteVectorStore.bucketKeyOf(t.project)) as
+            | { pending: number; updated_at: number }
+            | undefined;
+          const newPending = pendingAfterRefresh(
+            plan,
+            cur ? { pending: cur.pending, updatedAt: cur.updated_at } : null
+          );
+          const values = [
+            t.namespace,
+            SqliteVectorStore.bucketKeyOf(t.project),
+            buildAbstract(rows.map((r) => r.text)),
+            geo.centroid.length,
+            packVector(geo.centroid),
+            geo.norm,
+            Math.max(-1, cosTheta - BUCKET_RADIUS_SLACK),
+            t.total,
+            newPending,
+            now
+          ];
+          if (cur) {
+            this.db
+              .prepare(
+                `UPDATE memory_buckets SET abstract = ?, dim = ?, embedding = ?, norm = ?, cos_theta = ?,
+                   total = ?, pending = ?, updated_at = ? WHERE namespace = ? AND project = ?`
+              )
+              .run(
+                values[2], values[3], values[4], values[5], values[6],
+                values[7], values[8], values[9], values[0], values[1]
+              );
+          } else {
+            this.db
+              .prepare(
+                `INSERT INTO memory_buckets (namespace, project, abstract, dim, embedding, norm, cos_theta, total, pending, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              )
+              .run(...(values as any));
+          }
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+          throw err;
+        }
+      });
+      refreshed++;
+    }
+    return { refreshed, skipped: planned.skipped, dropped: planned.dropped.length, total: universe.length };
+  }
+
+  /** The summary rows without their embedding bytes — the read side for tests and diagnostics. */
+  async bucketSummaries() {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT namespace, project, dim, total, pending, embedding, updated_at FROM memory_buckets`)
+      .all() as {
+      namespace: string;
+      project: string;
+      dim: number;
+      total: number;
+      pending: number;
+      embedding: Buffer | null;
+      updated_at: number;
+    }[];
+    return rows.map((r) => ({
+      namespace: r.namespace,
+      project: SqliteVectorStore.projectOfKey(r.project),
+      dim: r.dim,
+      total: r.total,
+      pending: r.pending,
+      hasEmbedding: r.embedding !== null && r.embedding.length > 0,
+      updatedAt: r.updated_at
+    }));
+  }
+
+  /**
+   * Drop every summary — `reembedAll`'s invalidation (P8, ADR-0048). A provider swap
+   * can keep the old width, so the dim check alone would leave old-model cosines
+   * ranking new-model queries; no summary is the safe state (full scans everywhere)
+   * until the next refresh rebuilds.
+   */
+  async dropBucketSummaries(): Promise<void> {
+    this.ensure();
+    await this.retryWrite(() => this.db.exec(`DELETE FROM memory_buckets`));
+    this.bucketUniverse = null;
   }
 
   async insert(input: MemoryInput, embedding: number[]): Promise<Memory> {
@@ -862,12 +1720,21 @@ export class SqliteVectorStore implements VectorStore {
     // Row + posting list + vector in one transaction: a memory whose terms never
     // landed would be invisible to lexical search while looking perfectly healthy,
     // and a row whose vector is missing is invisible to every search at once.
+    // The insert event rides the same transaction (P6, ADR-0045) — an event that
+    // committed without its write, or a write without its event, would both be a
+    // history that lies.
+    const now = mem.createdAt;
     await this.retryWrite(() => {
       this.db.exec("BEGIN IMMEDIATE");
       try {
         this.runInsert(stmt, mem);
         this.indexTermsSync(mem.id, mem.text);
+        // The facet postings ride the same transaction (P4, ADR-0046): a row whose
+        // entity landed in memory_facets while its row rolled back — or the reverse —
+        // would join the wrong memories together, which is worse than not joining.
+        this.indexFacetsSync(mem.id, mem.namespace, mem.tags);
         this.writeVectorSync(mem.id, embedding);
+        this.insertEventSync(mem.id, "insert", now, { newValue: mem.text, reason: input.source ?? null });
         this.db.exec("COMMIT");
       } catch (err) {
         try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
@@ -899,7 +1766,17 @@ export class SqliteVectorStore implements VectorStore {
         for (let i = 0; i < made.length; i++) {
           this.runInsert(stmt, made[i]);
           this.indexTermsSync(made[i].id, made[i].text);
+          // Same-transaction facet postings (P4, ADR-0046), one statement per row
+          // exactly like the terms above — the bulk path is not a second class of
+          // index consistency.
+          this.indexFacetsSync(made[i].id, made[i].namespace, made[i].tags);
           this.writeVectorSync(made[i].id, items[i].embedding);
+          // One event per row, same transaction as the batch (P6, ADR-0045): a bulk
+          // import that left no history would be the one write nobody could audit.
+          this.insertEventSync(made[i].id, "insert", made[i].createdAt, {
+            newValue: made[i].text,
+            reason: items[i].input.source ?? null
+          });
         }
         this.db.exec("COMMIT");
       } catch (err) {
@@ -912,6 +1789,51 @@ export class SqliteVectorStore implements VectorStore {
     // decoded partition silently missing all of them (ADR-0035).
     for (const row of made) this.noteChange(row.id);
     return made;
+  }
+
+  /**
+   * Which of these hashes already have a readable-live row in one partition
+   * (ADR-0018 amendment). Chunked at 900 parameters so a 5,000-row import never
+   * leans on SQLite's variable limit, and partial-indexed on (namespace, text_hash)
+   * so a chunk is a seek, not a scan. The population is what `list()` shows by
+   * default — tombstoned, archived and draft rows are excluded on purpose, so a
+   * sentence no ordinary search returns can be re-imported — and `project`/`type`
+   * confine the fold to one partition so one project's copy never folds another's.
+   */
+  async findExistingHashes(opts: {
+    namespace: string;
+    hashes: string[];
+    project?: string | null;
+    type?: string;
+  }): Promise<Set<string>> {
+    this.ensure();
+    // The readable-live population, same exclusion `list()` applies by default:
+    // a row no read can show must not block an import either.
+    const extra: string[] = ["is_deleted = 0", "status != 'archived'", "status != 'draft'"];
+    const head: (string | number)[] = [opts.namespace];
+    if (opts.project !== undefined) {
+      if (opts.project === null) extra.push("project IS NULL");
+      else {
+        extra.push("project = ?");
+        head.push(opts.project);
+      }
+    }
+    if (opts.type) {
+      extra.push("type = ?");
+      head.push(opts.type);
+    }
+    const found = new Set<string>();
+    for (let i = 0; i < opts.hashes.length; i += 900) {
+      const chunk = opts.hashes.slice(i, i + 900);
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT text_hash FROM memories
+           WHERE namespace = ? AND ${extra.join(" AND ")} AND text_hash IN (${chunk.map(() => "?").join(", ")})`
+        )
+        .all(...head, ...chunk) as { text_hash: string | null }[];
+      for (const row of rows) if (row.text_hash) found.add(row.text_hash);
+    }
+    return found;
   }
 
   /** `memories` is a rowid table; `last_insert_rowid` is how the FTS row finds its row. */
@@ -934,6 +1856,8 @@ export class SqliteVectorStore implements VectorStore {
       importance: input.importance ?? 0.5,
       strength: input.strength ?? input.importance ?? 0.5,
       lastUsedAt: null,
+      // P2: a fresh row has earned nothing yet; the counter only moves on `reinforce`.
+      useCount: 0,
       source: input.source,
       tags: input.tags,
       supersedesId: input.supersedesId ?? null,
@@ -941,6 +1865,11 @@ export class SqliteVectorStore implements VectorStore {
       visibility: input.visibility ?? "private",
       status: input.status ?? "active",
       pin: input.pin ?? 0,
+      // P6 (ADR-0045): the event-time clock comes from the text's own stamp, or
+      // stays NULL when the text names no date. Derived here, at the one INSERT
+      // every write path shares, for the same reason `text_hash` is.
+      validAt: extractValidAt(input.text),
+      invalidAt: null,
       createdAt: now,
       updatedAt: now
     };
@@ -948,8 +1877,8 @@ export class SqliteVectorStore implements VectorStore {
 
   private insertStmt(): any {
     return this.db.prepare(
-      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO memories (id, namespace, type, project, kind, knowledge_id, knowledge_section, text, embedding, importance, strength, last_used_at, source, tags, supersedes_id, is_deleted, visibility, status, pin, created_at, updated_at, text_hash, use_count, valid_at, invalid_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
   }
 
@@ -977,7 +1906,14 @@ export class SqliteVectorStore implements VectorStore {
       mem.status,
       mem.pin,
       mem.createdAt,
-      mem.updatedAt
+      mem.updatedAt,
+      // Derived here, at the one INSERT every write path shares (insert, insertMany,
+      // supersede): a hash computed anywhere else is a hash that can drift from its
+      // row and silence the wrong insert (ADR-0018 amendment).
+      textHash(mem.text),
+      mem.useCount,
+      mem.validAt,
+      mem.invalidAt
     );
   }
 
@@ -986,6 +1922,111 @@ export class SqliteVectorStore implements VectorStore {
     const stmt = this.db.prepare(`SELECT * FROM memories WHERE id = ?`);
     const row = stmt.get(id) as Row | undefined;
     return row ? this.attachVectors([memoryFromRow(row)])[0] : null;
+  }
+
+  /**
+   * The write history of one row (P6, ADR-0045), oldest first. Reads `memory_events`
+   * and nothing else, so a purged id still answers with the events that survived it.
+   */
+  async history(id: string): Promise<MemoryEvent[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT id, memory_id, event, old_value, new_value, reason, model, at FROM memory_events WHERE memory_id = ? ORDER BY id ASC`)
+      .all(id) as { id: number; memory_id: string; event: MemoryEventKind; old_value: string | null; new_value: string | null; reason: string | null; model: string | null; at: number }[];
+    return rows.map((r) => ({
+      id: r.id,
+      memoryId: r.memory_id,
+      event: r.event,
+      oldValue: r.old_value,
+      newValue: r.new_value,
+      reason: r.reason,
+      model: r.model,
+      at: r.at
+    }));
+  }
+
+/**
+   * Append one refused write to the drop ledger (ADR-0040 observability). Awaiting
+   * signature over a synchronous statement, so the service can call it without a
+   * transaction to join: a drop is a diagnostic, not a memory, and never travels with
+   * one. Bounded by DROP_LEDGER_CAP — a loop that re-sends the same junk line keeps
+   * its trace without growing a table nobody reads. The oldest rows go; a drop carries
+   * no fact and no chain, so losing the tail is safe, and `count`/`firstAt` then
+   * describe the window still kept rather than all time.
+   */
+  async recordCurationDrop(drop: CurationDropInput): Promise<void> {
+    this.ensure();
+    if (!this._dropStmt) {
+      this._dropStmt = this.db.prepare(
+        `INSERT INTO curation_drops (hash, preview, junk, advice, origin, path, namespace, project, at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+    }
+    this._dropStmt.run(
+      drop.hash, drop.preview, drop.junk, drop.advice, drop.origin, drop.path,
+      drop.namespace, drop.project, drop.at
+    );
+    this.db
+      .prepare(`DELETE FROM curation_drops WHERE id <= (SELECT MAX(id) - ? FROM curation_drops)`)
+      .run(DROP_LEDGER_CAP);
+  }
+
+  /**
+   * The drop ledger: ONE row per distinct refused note (folded on its text hash),
+   * newest first, each carrying how many times it has been refused and when the first
+   * refusal fell. Folding happens in SQL rather than in the service so both stores
+   * answer the question the same way, and so a repeat-heavy loop reads as one line —
+   * "conversational x4, first dropped Tuesday" — instead of four identical ones.
+   */
+  async curationDrops(opts: { hash?: string; namespace?: string; junk?: string; since?: number; limit?: number }): Promise<CurationDrop[]> {
+    this.ensure();
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (opts.hash) { where.push("hash = ?"); args.push(opts.hash); }
+    if (opts.namespace) { where.push("namespace = ?"); args.push(opts.namespace); }
+    if (opts.junk) { where.push("junk = ?"); args.push(opts.junk); }
+    if (opts.since !== undefined) { where.push("at >= ?"); args.push(opts.since); }
+    const limit = Math.max(1, Math.min(500, opts.limit ?? 50));
+    const rows = this.db
+      .prepare(`
+        SELECT * FROM (
+          SELECT c.*, COUNT(*) OVER w AS dup_count, MIN(at) OVER w AS first_at,
+                 ROW_NUMBER() OVER (PARTITION BY hash ORDER BY id DESC) AS rn
+          FROM curation_drops c
+          ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          WINDOW w AS (PARTITION BY hash)
+        ) WHERE rn = 1 ORDER BY id DESC LIMIT ?
+      `)
+      .all(...args, limit) as any[];
+    return rows.map((r) => ({
+      id: r.id,
+      hash: r.hash,
+      preview: r.preview,
+      junk: r.junk,
+      advice: r.advice,
+      origin: r.origin,
+      path: r.path,
+      namespace: r.namespace,
+      project: r.project ?? null,
+      at: r.at,
+      count: r.dup_count,
+      firstAt: r.first_at
+    }));
+  }
+
+
+  /**
+   * Rows whose `supersedes_id` names this id — the forward half of the chain. The
+   * partial index `idx_memories_supersedes` makes it a seek. Tombstones included on
+   * purpose (see interface.ts): a chain that stops at the first retired row is not
+   * the chain.
+   */
+  async successorsOf(id: string): Promise<Memory[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT * FROM memories WHERE supersedes_id = ? ORDER BY created_at ASC, id ASC`)
+      .all(id) as Row[];
+    return rows.map(memoryFromRow);
   }
 
   async storedDim(): Promise<number | null> {
@@ -1009,6 +2050,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
     withVectors?: boolean;
   }): Promise<{ memories: Memory[]; total: number }> {
     this.ensure();
@@ -1036,6 +2078,15 @@ export class SqliteVectorStore implements VectorStore {
         where.push("knowledge_id = ?");
         params.push(opts.knowledge);
       }
+    }
+    // P5 (ADR-0047): the facet slice, over the postings — the identical EXISTS the
+    // candidate reads use through `candidateWhere`, so a filtered page and a filtered
+    // search can never disagree about what carries a facet.
+    if (opts.facet) {
+      where.push(
+        `EXISTS (SELECT 1 FROM memory_facets f WHERE f.memory_id = memories.id AND f.facet = ?)`
+      );
+      params.push(String(opts.facet).toLowerCase());
     }
     // governance-lite status filter (ADR-0006)
     if (opts.status) {
@@ -1077,6 +2128,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ median: number; count: number }> {
     this.ensure();
     const { whereSql, params } = candidateWhere(opts, "m");
@@ -1174,19 +2226,32 @@ export class SqliteVectorStore implements VectorStore {
     // Identity moved, vectors did not: snapshots keyed by the old project (or the
     // new one) answer the wrong membership. Rare sweep, so the prune precedent
     // applies — one clear instead of reading ids back to mark precisely.
-    if (res.changes > 0) this.vectors.clear();
+    if (res.changes > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): the move also changed which bucket every row belongs to, and
+      // it did not pass noteChange (renames deliberately leave updated_at alone).
+      // Both slugs' summaries go: a missing summary is the safe state — the next
+      // search scans those buckets in full, and the next refresh rebuilds.
+      this.dropBucketsWhere("project IN (?, ?)", from, to);
+    }
     return res.changes;
   }
 
   async forgetProject(slug: string, opts: { mode: "detach" | "delete" }): Promise<{ detached: number; deleted: number }> {
     this.ensure();
     if (opts.mode === "detach") {
-      const res = await this.retryWrite(() =>
-        this.db.prepare(`UPDATE memories SET project = NULL WHERE project = ?`).run(slug)
-      );
-      if (res.changes > 0) this.vectors.clear();
-      return { detached: res.changes, deleted: 0 };
+    const res = await this.retryWrite(() =>
+      this.db.prepare(`UPDATE memories SET project = NULL WHERE project = ?`).run(slug)
+    );
+    if (res.changes > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): detach moves every row into the unscoped bucket without
+      // noteChange — same rare-sweep clear as the rename above.
+      this.dropBucketsWhere("project = ?", slug);
+      this.dropBucketsWhere("project = ?", "");
     }
+    return { detached: res.changes, deleted: 0 };
+  }
     // Soft delete, like `deleteSoft` per row: the audit trail stays restorable.
     // Tombstones are left as they are — they already left every candidate pool.
     const res = await this.retryWrite(() =>
@@ -1194,12 +2259,21 @@ export class SqliteVectorStore implements VectorStore {
         .prepare(`UPDATE memories SET is_deleted = 1, updated_at = ? WHERE project = ? AND is_deleted = 0`)
         .run(Date.now(), slug)
     );
-    if (res.changes > 0) this.vectors.clear();
+    if (res.changes > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): the project's rows just left every candidate pool; its summary
+      // would rank a phantom bucket until the next refresh. Same sweep clear.
+      this.dropBucketsWhere("project = ?", slug);
+    }
     return { detached: 0, deleted: res.changes };
   }
 
   async deleteSoft(id: string): Promise<void> {
     this.ensure();
+    // No history row here on purpose (P6, ADR-0045): a plain forget is a tombstone,
+    // not one of the four write points, and it deliberately leaves `invalid_at` NULL
+    // — "removed" and "stopped being true" are different facts, and only supersede
+    // claims the latter.
     const stmt = this.db.prepare(`UPDATE memories SET is_deleted = 1, updated_at = ? WHERE id = ?`);
     await this.retryWrite(() => stmt.run(Date.now(), id));
     // `is_deleted` is part of the candidate WHERE, so the row leaves every partition
@@ -1211,16 +2285,36 @@ export class SqliteVectorStore implements VectorStore {
 
   async updateEmbedding(id: string, embedding: number[], text: string): Promise<void> {
     this.ensure();
-    const stmt = this.db.prepare(`UPDATE memories SET embedding = '', text = ?, updated_at = ? WHERE id = ?`);
+    const stmt = this.db.prepare(
+      `UPDATE memories SET embedding = '', text = ?, text_hash = ?, tags = ?, valid_at = ?, updated_at = ? WHERE id = ?`
+    );
     // `reembed` can arrive with different text; the posting list has to follow or
     // lexical search keeps matching the words the row used to have. The vector row
-    // is rewritten in the same transaction for the same reason.
+    // is rewritten in the same transaction for the same reason — and so are the
+    // duplicate hash and the event-time clock, which both describe this row's text
+    // now, not the one it had (valid_at recomputes from the new text; no match
+    // leaves it NULL — a date the text no longer states is a date it no longer has).
+    //
+    // P4 (ADR-0046): the facets follow the text too. They were derived from the
+    // sentence the row used to be, so a rewritten row re-derives them — the caller's
+    // plain tags survive (`rederiveTags`), the `entity:`/`topic:`/`path:` values move
+    // to what the new text states — and the tags column and the facet postings are
+    // rewritten together, which is what keeps the invariant (facet postings == the
+    // row's facet tags) true on this path instead of only at insert time.
     await this.retryWrite(() => {
       this.db.exec("BEGIN IMMEDIATE");
       try {
-        stmt.run(text, Date.now(), id);
-        const row = this.db.prepare(`SELECT rowid AS r FROM memories WHERE id = ?`).get(id) as { r: number } | undefined;
+        const row = this.db.prepare(`SELECT namespace, tags FROM memories WHERE id = ?`).get(id) as
+          | { namespace: string; tags: string | null }
+          | undefined;
+        if (!row) {
+          this.db.exec("COMMIT");
+          return; // nothing to update — same contract as the old UPDATE matching zero rows
+        }
+        const tags = rederiveTags(row.tags ? (JSON.parse(row.tags) as string[]) : undefined, text);
+        stmt.run(text, textHash(text), JSON.stringify(tags), extractValidAt(text), Date.now(), id);
         this.indexTermsSync(id, text);
+        this.indexFacetsSync(id, row.namespace, tags);
         this.writeVectorSync(id, embedding);
         this.db.exec("COMMIT");
       } catch (err) {
@@ -1236,7 +2330,11 @@ export class SqliteVectorStore implements VectorStore {
     this.noteRewrite(id, embedding);
   }
 
-  async updateMeta(id: string, patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number }): Promise<Memory | null> {
+  async updateMeta(
+    id: string,
+    patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number; importance?: number; tags?: string[]; knowledgeId?: string | null; knowledgeSection?: string | null },
+    meta?: WriteEventMeta
+  ): Promise<Memory | null> {
     this.ensure();
     const fields: string[] = [];
     const vals: (string | number)[] = [];
@@ -1245,6 +2343,9 @@ export class SqliteVectorStore implements VectorStore {
     if (patch.visibility !== undefined) { fields.push("visibility = ?"); vals.push(patch.visibility); }
     // Restore support: `forget` is a soft delete, so un-forgetting is a flag flip.
     if (patch.isDeleted !== undefined) { fields.push("is_deleted = ?"); vals.push(patch.isDeleted); }
+    // Retroactive curation (ADR-0040 amendment 2026-11-08): triage sinks a stock
+    // row's rank through the same patch method, not a second write path.
+    if (patch.importance !== undefined) { fields.push("importance = ?"); vals.push(patch.importance); }
     // ADR-0023: a sync relabels an adopted pre-v0.7 row without re-embedding, so
     // tags and the two knowledge columns have to be patchable here.
     if (patch.tags !== undefined) { fields.push("tags = ?"); vals.push(JSON.stringify(patch.tags)); }
@@ -1253,7 +2354,60 @@ export class SqliteVectorStore implements VectorStore {
     if (fields.length === 0) return this.getById(id);
     fields.push("updated_at = ?"); vals.push(Date.now());
     const stmt = this.db.prepare(`UPDATE memories SET ${fields.join(", ")} WHERE id = ?`);
-    await this.retryWrite(() => stmt.run(...vals, id));
+    // A tags patch rewrites the row's join keys (P4, ADR-0046): the knowledge sync's
+    // relabel and P5's conflict marker both arrive here, so the facet postings are
+    // replaced in the same transaction as the tags column — a relabel that committed
+    // while the postings still named the old facets would hand the facet arm (and
+    // P5's same-entity lookups) rows the tags no longer describe. Every branch below
+    // that can carry a tags field therefore reindexes; a patch without one keeps the
+    // bare single-statement shape it had.
+    if (patch.status === "archived") {
+      // The archive write point (P6, ADR-0045): the flip and its history row commit
+      // together. The prior status has to be read inside the same transaction — an
+      // event recording `active` for a row that was already archived would be a
+      // second lie of the same kind as an event without its write. A re-archive is
+      // a no-op and writes nothing; a restore (`status` moving anywhere else) is
+      // not one of the four write points and records no event.
+      const now = Date.now();
+      await this.retryWrite(() => {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          const row = this.db.prepare(`SELECT status, namespace FROM memories WHERE id = ?`).get(id) as
+            | { status: string | null; namespace: string }
+            | undefined;
+          stmt.run(...vals, id);
+          if (row && row.status !== null && row.status !== "archived") {
+            this.insertEventSync(id, "archive", now, {
+              oldValue: row.status,
+              newValue: "archived",
+              reason: meta?.reason ?? null
+            });
+          }
+          if (row && patch.tags !== undefined) this.indexFacetsSync(id, row.namespace, patch.tags);
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+          throw err;
+        }
+      });
+    } else if (patch.tags !== undefined) {
+      await this.retryWrite(() => {
+        this.db.exec("BEGIN IMMEDIATE");
+        try {
+          const row = this.db.prepare(`SELECT namespace FROM memories WHERE id = ?`).get(id) as
+            | { namespace: string }
+            | undefined;
+          stmt.run(...vals, id);
+          if (row) this.indexFacetsSync(id, row.namespace, patch.tags);
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+          throw err;
+        }
+      });
+    } else {
+      await this.retryWrite(() => stmt.run(...vals, id));
+    }
     // Every patchable field here is either part of the candidate WHERE (status,
     // is_deleted, knowledge_id) or content a caller may read back, so a partition
     // holding the row is no longer a correct snapshot of it. This used to touch no
@@ -1263,12 +2417,51 @@ export class SqliteVectorStore implements VectorStore {
     return this.getById(id);
   }
 
-  async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[]): Promise<Memory> {
+  /**
+   * The supersede write point (P6, ADR-0045), all in one transaction: the successor's
+   * insert (row, postings, vector, its own insert event), the old row's invalidation
+   * — `is_deleted = 1` **and `invalid_at = now` in the same UPDATE** — and the
+   * supersede event naming the decision (`reason`) and the judge that made it
+   * (`model`). Both halves of the chain move atomically; the previous two-call shape
+   * (insert, then `deleteSoft`) left a window where the successor existed but the
+   * old row was still live with no history of why.
+   */
+  async supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[], meta?: WriteEventMeta): Promise<Memory> {
     this.ensure();
     const old = await this.getById(oldId);
     if (!old) throw new Error(`old memory ${oldId} not found`);
-    const created = await this.insert({ ...newInput, supersedesId: oldId }, newEmbedding);
-    await this.deleteSoft(oldId);
+    const created = this.buildRow({ ...newInput, supersedesId: oldId }, newEmbedding);
+    const stmt = this.insertStmt();
+    const now = Date.now();
+    await this.retryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.runInsert(stmt, created);
+        this.indexTermsSync(created.id, created.text);
+        // The successor's facet postings commit with it (P4, ADR-0046): its tags
+        // carry the facets inherited from the row it replaced, and the version
+        // chain reads as one entity only while every link in it is indexed.
+        this.indexFacetsSync(created.id, created.namespace, created.tags);
+        this.writeVectorSync(created.id, newEmbedding);
+        this.insertEventSync(created.id, "insert", now, { newValue: created.text, reason: newInput.source ?? null });
+        this.db.prepare(`UPDATE memories SET is_deleted = 1, invalid_at = ?, updated_at = ? WHERE id = ?`).run(now, now, oldId);
+        this.insertEventSync(oldId, "supersede", now, {
+          oldValue: old.text,
+          newValue: created.text,
+          reason: meta?.reason ?? null,
+          model: meta?.model ?? null
+        });
+        this.db.exec("COMMIT");
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw err;
+      }
+    });
+    // After the commit, never inside — both rows changed membership in every decoded
+    // partition (one joined, one left): skipping either is how the cache serves a
+    // dead row, the exact regression ADR-0034/0035 were measured on.
+    this.noteChange(created.id);
+    this.noteChange(oldId);
     return created;
   }
 
@@ -1291,23 +2484,27 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; vectorScore: number }[]> {
     this.ensure();
     const { whereSql, params } = candidateWhere(opts, "m");
     const q = opts.queryEmbedding;
-    if (this.q8Enabled()) {
-      const hit = this.vectorSearchQ8(whereSql, params, q, opts.limit);
-      if (hit) return hit;
+    // P8 (ADR-0048): the bucket prefilter, before the exact scan. It answers with the
+    // same rows the full scan would (each bucket scan applies the full candidate WHERE
+    // plus its own project predicate; the union's top-`limit` over per-bucket top-`limit`
+    // lists is the global top-`limit`), so this is a cost path, not a semantics one.
+    // Any incapability — feature off, no summaries, undiscriminating summaries, a scan
+    // set that covers everything — falls through to the exact path unchanged.
+    if (bucketPrefilterEnabled()) {
+      const hit = this.vectorSearchBucketed(opts, whereSql, params, q, opts.limit);
+      if (hit !== null) return hit;
     }
     const qf = new Float32Array(q);
     let qn = 0;
     for (let i = 0; i < q.length; i++) qn += q[i] * q[i];
     qn = Math.sqrt(qn);
 
-    const partition = this.partitionVectors(whereSql, params, q.length);
-    const { top, vecs } = partition
-      ? topFromPartition(partition, qf, qn, opts.limit)
-      : this.scanPartition(whereSql, params, qf, qn, opts.limit);
+    const { top, vecs } = this.scanCandidates(whereSql, params, qf, qn, opts.limit);
     const byId = this.fetchByIds(top.map((s) => s.id));
     return top.flatMap((s, i) => {
       const row = byId.get(s.id);
@@ -1316,6 +2513,149 @@ export class SqliteVectorStore implements VectorStore {
       // The scan already had this vector in hand; reading it back would be a second
       // trip for data the caller (MMR) genuinely needs.
       memory.embedding = Array.from(vecs[i]);
+      return [{ memory, vectorScore: s.vectorScore }];
+    });
+  }
+
+  /**
+   * One exact scan over a resolved candidate WHERE — the body `vectorSearch` has run
+   * since ADR-0017, factored out so the bucket prefilter can run it per bucket (P8,
+   * ADR-0048). Same two-phase shape, same partition cache (keyed by the bucket-scoped
+   * WHERE, so each bucket's decode warms separately), same int8 shortlist when
+   * MEMORY_Q8 asks for it: the prefilter narrows *which* rows are scanned, never how
+   * a row is scored.
+   */
+  private scanCandidates(
+    whereSql: string,
+    params: (string | number)[],
+    qf: Float32Array,
+    qn: number,
+    limit: number
+  ): { top: { id: string; vectorScore: number }[]; vecs: Float32Array[] } {
+    if (this.q8Enabled()) {
+      const hit = this.vectorSearchQ8(whereSql, params, Array.from(qf), limit);
+      if (hit) {
+        // Same shape as the float path's return; the vectors came back attached to
+        // the memories, so they are lifted out of the hit rather than re-read.
+        return {
+          top: hit.map((h) => ({ id: h.memory.id, vectorScore: h.vectorScore })),
+          vecs: hit.map((h) => new Float32Array(h.memory.embedding)),
+        };
+      }
+    }
+    const partition = this.partitionVectors(whereSql, params, qf.length);
+    return partition ? topFromPartition(partition, qf, qn, limit) : this.scanPartition(whereSql, params, qf, qn, limit);
+  }
+
+  /**
+   * The bucket prefilter itself (P8, ADR-0048). Per bucket, an UPPER bound on the
+   * cosine any of its rows can reach with the query — `bucketScanBound` over the
+   * bucket's centroid and its covering radius. Walk the buckets best-bound first,
+   * merging each one's top-`limit` into the result; stop at the first bucket whose
+   * bound cannot reach the current floor. A skipped bucket provably holds no row
+   * that could enter the top-`limit`, so the returned list is the exact scan's list
+   * (up to the BUCKET_BOUND_EPS slack, which is float-noise sized, and to the order
+   * of exact ties — see the ADR). Returns `null` for the plain exact scan whenever
+   * there is nothing to save: one bucket, no summaries yet.
+   *
+   * The universe comes from the DATA (`bucketUniverseProjects`), never from the
+   * summary table — a bucket with no summary is stale and scanned in full, never
+   * skipped. Per-bucket scans reuse `scanCandidates`, so a warm bucket costs the
+   * partition-cache hit ADR-0029 measured, not a re-decode.
+   */
+  private vectorSearchBucketed(
+    opts: {
+      namespace: string;
+      queryEmbedding: number[];
+      includeDeleted?: boolean;
+      status?: string;
+      includeArchived?: boolean;
+      includeDraft?: boolean;
+    },
+    whereSql: string,
+    params: (string | number)[],
+    q: number[],
+    limit: number
+  ): { memory: Memory; vectorScore: number }[] | null {
+    // P8 exactness guard (independent review, 2026-11-08): the summaries describe
+    // the DEFAULT population — `is_deleted = 0 AND status = 'active'`, which is what
+    // refreshBucketSummaries' universe, abstract and geometry queries all read. A
+    // search over a wider one (tombstones via includeDeleted, archived or draft rows
+    // via the include flags, any explicit status slice) ranks buckets by caps that do
+    // not cover those rows' directions, and a skip there drops true top hits — found
+    // by review probe: an archived row was the exact scan's top-1 and ABSENT from the
+    // prefiltered result. The contract is "cost time, never rows", so a wider
+    // population falls back to the plain exact scan. Narrower filters (type, kind,
+    // project, knowledge, facet) need no guard: a cap over a superset still bounds
+    // every subset of it.
+    if (opts.status !== undefined || opts.includeDeleted || opts.includeArchived || opts.includeDraft) {
+      return null;
+    }
+    const summaries = this.db
+      .prepare(`SELECT project, dim, embedding, norm, cos_theta, total, pending FROM memory_buckets WHERE namespace = ?`)
+      .all(opts.namespace) as {
+      project: string;
+      dim: number;
+      embedding: Buffer | null;
+      norm: number;
+      cos_theta: number;
+      total: number;
+      pending: number;
+    }[];
+    if (summaries.length === 0) return null; // never warmed — one tiny read, then the exact path
+
+    const qf = new Float32Array(q);
+    let qn = 0;
+    for (let i = 0; i < q.length; i++) qn += q[i] * q[i];
+    qn = Math.sqrt(qn);
+
+    const byKey = new Map(summaries.map((s) => [SqliteVectorStore.bucketKeyOf(s.project), s]));
+    const universe = this.bucketUniverseProjects(whereSql, params);
+    if (universe.length < 2) return null; // one bucket is the exact scan already
+
+    // Stale = no summary, no embedding yet (a write's placeholder), a summary at
+    // another width, a degenerate (zero-norm) centroid, or a bucket with writes
+    // since its refresh. All of these scan in full; none of them is ever skipped.
+    const fresh: { key: string; bound: number }[] = [];
+    const stale: string[] = [];
+    for (const project of universe) {
+      const key = SqliteVectorStore.bucketKeyOf(project);
+      const s = byKey.get(key);
+      if (!s || s.embedding === null || s.dim !== q.length || s.norm <= 0 || s.pending > 0) {
+        stale.push(key);
+        continue;
+      }
+      const a = queryToCentroid(q, unpackVector(s.embedding), s.norm);
+      fresh.push({ key, bound: bucketScanBound(a, s.cos_theta) });
+    }
+    const order = bucketScanOrder(fresh, stale);
+
+    // Walk. The merged list is re-sorted per bucket so the floor is always the
+    // limit-th best score seen; `limit` is ≤ overFetch (20), so this is cheap next
+    // to any scan.
+    const merged: { id: string; vectorScore: number; vec: Float32Array }[] = [];
+    let floor = Number.NEGATIVE_INFINITY;
+    for (const step of order) {
+      if (merged.length >= limit && !boundCanReachFloor(step.bound, floor)) break;
+      const project = SqliteVectorStore.projectOfKey(step.key);
+      const bucketWhere = `${whereSql} AND ${SqliteVectorStore.bucketWhere(project)}`;
+      const bucketParams = project === null ? params : [...params, project];
+      const { top, vecs } = this.scanCandidates(bucketWhere, bucketParams, qf, qn, limit);
+      for (let i = 0; i < top.length; i++) merged.push({ ...top[i], vec: vecs[i] });
+      if (merged.length > 0) {
+        merged.sort((a, z) => z.vectorScore - a.vectorScore || (a.id < z.id ? -1 : a.id > z.id ? 1 : 0));
+        if (merged.length > limit) merged.length = limit;
+        floor = merged[merged.length - 1]!.vectorScore;
+      }
+    }
+    const top = merged.slice(0, limit);
+    if (top.length === 0) return [];
+    const byId = this.fetchByIds(top.map((s) => s.id));
+    return top.flatMap((s) => {
+      const row = byId.get(s.id);
+      if (!row) return [];
+      const memory = memoryFromRow(row);
+      memory.embedding = Array.from(s.vec);
       return [{ memory, vectorScore: s.vectorScore }];
     });
   }
@@ -1620,6 +2960,7 @@ export class SqliteVectorStore implements VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; lexicalScore: number }[]> {
     this.ensure();
     const tokens = [...new Set(queryTerms(opts.query))].slice(0, LEXICAL_TOKEN_LIMIT);
@@ -1690,6 +3031,68 @@ export class SqliteVectorStore implements VectorStore {
     }
     this.attachVectors(memories);
     return memories.map((memory, i) => ({ memory, lexicalScore: scores[i] }));
+  }
+
+  /**
+   * Facet candidates (P4, ADR-0046): rows whose stored tags share at least one of the
+   * given facets, most shared facets first. Read from the postings, not the partition —
+   * the same ADR-0033 shape `lexicalCandidates` uses: seek `memory_facets` by facet
+   * value, join `memories` once per hit for the visibility filters, group and cap. The
+   * facet values arrive already derived (`deriveFacets` on the query, or a caller's
+   * own list for P5), lowercased here because that is how `indexFacetsSync` stores them.
+   */
+  async facetCandidates(opts: {
+    namespace: string;
+    facets: string[];
+    limit: number;
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
+    facet?: string;
+  }): Promise<{ memory: Memory; sharedFacets: string[] }[]> {
+    this.ensure();
+    const facets = [...new Set(opts.facets.map((f) => String(f ?? "").toLowerCase()).filter((f) => f.length > 0))];
+    if (facets.length === 0 || opts.limit <= 0) return [];
+    const { whereSql, params } = candidateWhere(opts, "m");
+    const marks = facets.map(() => "?").join(", ");
+    // GROUP BY over the posting lists: a facet held by a popular entity can have
+    // thousands of postings, but the ranked head is what the LIMIT keeps, and the
+    // count is one integer per candidate row. Ties break by id, like every other
+    // ranked read here — the same query must answer the same way twice.
+    const rows = this.db
+      .prepare(
+        `SELECT f.memory_id AS id, COUNT(*) AS shared
+           FROM memory_facets f
+           JOIN memories m ON m.id = f.memory_id AND ${whereSql}
+          WHERE f.facet IN (${marks})
+          GROUP BY f.memory_id
+          ORDER BY shared DESC, id ASC
+          LIMIT ?`
+      )
+      .all(...(params as any), ...(facets as any), opts.limit) as { id: string; shared: number }[];
+    if (rows.length === 0) return [];
+    const byId = this.fetchByIds(rows.map((r) => r.id));
+    const wanted = new Set(facets);
+    const out: { memory: Memory; sharedFacets: string[] }[] = [];
+    for (const r of rows) {
+      const row = byId.get(r.id);
+      if (!row) continue;
+      const memory = memoryFromRow(row);
+      // The intersection comes from the row's own tags, not from the postings: the
+      // tags column is the source the invariant pins the table to, and reporting
+      // what the postings counted would report the index rather than the row.
+      const sharedFacets = facetTagsOf(memory.tags)
+        .map((t) => t.toLowerCase())
+        .filter((t) => wanted.has(t));
+      out.push({ memory, sharedFacets: [...new Set(sharedFacets)] });
+    }
+    this.attachVectors(out.map((o) => o.memory));
+    return out;
   }
 
   /** df of each query token, from `term_df`. */
@@ -1765,14 +3168,39 @@ export class SqliteVectorStore implements VectorStore {
     // once both land, because SQLite does the arithmetic. Batched into a single
     // UPDATE because a search reinforces what it returns, and one commit per hit put
     // five fsyncs on the read path.
-    const res = await this.retryWrite(() =>
-      this.db
-        .prepare(
-          `UPDATE memories SET strength = MIN(0.95, strength + 0.02), last_used_at = ?, updated_at = ?
+    const res = await this.retryWrite(() => {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        // The ids that actually move. The UPDATE's WHERE excludes tombstones, and an
+        // event naming a row the write skipped would be a history that lies — one
+        // indexed SELECT inside the transaction is what buys the accurate log without
+        // opening a read-modify-write race on the numbers (the arithmetic above is
+        // still SQLite's, not ours).
+        const live = this.db
+          .prepare(`SELECT id FROM memories WHERE id IN (${unique.map(() => "?").join(", ")}) AND is_deleted = 0`)
+          .all(...(unique as any)) as { id: string }[];
+        const out = this.db
+          .prepare(
+            // P2 (ADR-0016 amendment): `use_count` is the third number a retrieval moves,
+            // next to strength and the use clock. COALESCE because a NULL can only come
+            // from a foreign writer — the migration backfilled every row it saw — and a
+            // NULL must count as "used once from zero", not as a poisoned NULL forever.
+            `UPDATE memories SET strength = MIN(0.95, strength + 0.02), use_count = COALESCE(use_count, 0) + 1, last_used_at = ?, updated_at = ?
             WHERE id IN (${unique.map(() => "?").join(", ")}) AND is_deleted = 0`
-        )
-        .run(now, now, ...(unique as any))
-    );
+          )
+          .run(now, now, ...(unique as any));
+        for (const row of live) {
+          // The text did not change, so old/new stay NULL — the event itself is the
+          // record of the retrieval (semantics per MemoryEvent in types.ts).
+          this.insertEventSync(row.id, "reinforce", now);
+        }
+        this.db.exec("COMMIT");
+        return out;
+      } catch (err) {
+        try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw err;
+      }
+    });
     return (res as unknown as { changes: number }).changes ?? 0;
   }
 
@@ -1817,7 +3245,14 @@ export class SqliteVectorStore implements VectorStore {
     // bug ADR-0035 fixed for single writes, and it cannot be fixed the same way —
     // prune returns a count, not the ids, and it is a rare sweep (decay, the daemon),
     // so dropping every decoded partition once is cheaper than reading the ids back.
-    if (pruned > 0) this.vectors.clear();
+    if (pruned > 0) {
+      this.vectors.clear();
+      // P8 (ADR-0048): the sweep also shrank buckets without noteChange. Summaries go
+      // wholesale, per the same precedent — a full scan until the next refresh is the
+      // correct answer, and the next refresh rebuilds only what it finds.
+      await this.retryWrite(() => this.db.exec(`DELETE FROM memory_buckets`));
+      this.bucketUniverse = null;
+    }
     return pruned;
   }
 
@@ -1846,8 +3281,16 @@ export class SqliteVectorStore implements VectorStore {
         this.db.exec("BEGIN IMMEDIATE");
         try {
           this.db.prepare(`DELETE FROM memory_terms WHERE memory_id IN (${marks})`).run(...(ids as any));
+          // The facet postings are derived state like the terms above — a purged row
+          // must not keep joining anything (P4, ADR-0046).
+          this.db.prepare(`DELETE FROM memory_facets WHERE memory_id IN (${marks})`).run(...(ids as any));
           this.db.prepare(`DELETE FROM memory_vectors WHERE memory_id IN (${marks})`).run(...(ids as any));
           this.db.prepare(`DELETE FROM memories WHERE id IN (${marks})`).run(...(ids as any));
+          // `memory_events` is deliberately not in this list (P6, ADR-0045): the
+          // purge exists to reclaim a row, and the story of what happened to it —
+          // inserts, reinforcements, the supersede that retired it — is the audit
+          // half the row cannot take with it. Nothing in this file ever deletes
+          // from that table.
           this.db.exec("COMMIT");
         } catch (err) {
           try { this.db.exec("ROLLBACK"); } catch { /* already unwound */ }
@@ -1865,6 +3308,10 @@ export class SqliteVectorStore implements VectorStore {
       this.vectors.clear();
       this.changes.length = 0;
       this.changeSeq++;
+      // P8 (ADR-0048): same sweep shape — the summaries go with the rows that fed
+      // them, and the next refresh rebuilds from what is left.
+      await this.retryWrite(() => this.db.exec(`DELETE FROM memory_buckets`));
+      this.bucketUniverse = null;
     }
     return purged;
   }
@@ -1994,6 +3441,246 @@ export class SqliteVectorStore implements VectorStore {
           .all() as { from_id: string; to_id: string | null; target: string }[]);
     return rows.map((r) => ({ from: r.from_id, to: r.to_id ?? null, target: r.target }));
   }
+
+  // ---- Codebase capability (ADR-0050). Primitive persistence: the sync decides
+  // what changed, this decides how it lands — one transaction per sync, every
+  // edge a file owns deleted before its replacement is inserted, fan_in recomputed
+  // over the live edges inside the same commit. A crash lands all of a sync or
+  // none of it, never a half-indexed repository.
+
+  get codebase(): CodebaseCapability {
+    return this as unknown as CodebaseCapability;
+  }
+
+  private codeFileRow(r: { id: string; project: string; path: string; hash: string | null; mtime: number | null; lines: number | null; parse_error: string | null; re_exports: string; fields: string }): CodeFileInfo {
+    let reExports: { spec: string; names: string[] }[] = [];
+    try {
+      const parsed = JSON.parse(r.re_exports) as unknown;
+      if (Array.isArray(parsed)) {
+        reExports = parsed
+          .filter((x): x is { spec: string; names: string[] } => typeof x === "object" && x !== null && typeof (x as { spec?: unknown }).spec === "string")
+          .map((x) => ({ spec: x.spec, names: Array.isArray(x.names) ? x.names.map(String) : [] }));
+      }
+    } catch {
+      // A malformed blob reads as no re-exports — the sync rewrites it on the
+      // next change to the file, and an import through it simply does not resolve.
+    }
+    let fields: Record<string, Record<string, string>> = {};
+    try {
+      const parsedFields = JSON.parse(r.fields) as unknown;
+      if (parsedFields && typeof parsedFields === "object" && !Array.isArray(parsedFields)) {
+        for (const [typeName, typeFields] of Object.entries(parsedFields as Record<string, unknown>)) {
+          if (!typeFields || typeof typeFields !== "object" || Array.isArray(typeFields)) continue;
+          const entry: Record<string, string> = {};
+          for (const [fieldName, fieldType] of Object.entries(typeFields as Record<string, unknown>)) {
+            if (typeof fieldType === "string") entry[fieldName] = fieldType;
+          }
+          fields[typeName] = entry;
+        }
+      }
+    } catch {
+      // A malformed blob reads as no fields — the sync rewrites it on the next
+      // change to the file, and a two-level call through it builds no edge.
+    }
+    let language: string | null = (r as { language?: string | null }).language ?? null;
+    return { id: r.id, project: r.project, path: r.path, hash: r.hash, mtime: r.mtime, lines: r.lines, parseError: r.parse_error, reExports, fields, language };
+  }
+
+  private codeSymbolRow(r: Record<string, unknown>): CodeSymbolRow {
+    return {
+      id: String(r.id),
+      project: String(r.project),
+      fileId: String(r.file_id),
+      path: String(r.path),
+      name: String(r.name),
+      qualifiedName: String(r.qualified_name),
+      kind: String(r.kind) as CodeSymbolRow["kind"],
+      signature: (r.signature as string | null) ?? "",
+      lineStart: (r.line_start as number | null) ?? null,
+      lineEnd: (r.line_end as number | null) ?? null,
+      exported: Number(r.exported) === 1,
+      parentId: (r.parent_id as string | null) ?? null,
+      fanIn: Number(r.fan_in ?? 0),
+      language: (r.language as string | null) ?? null
+    };
+  }
+
+  private codeSymbolSql(where: string, params: (string | number)[], suffix = ""): CodeSymbolRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, project, file_id, path, name, qualified_name, kind, signature, line_start, line_end, exported, parent_id, fan_in, language
+         FROM code_symbols WHERE ${where}${suffix}`
+      )
+      .all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.codeSymbolRow(r));
+  }
+
+  async codeFiles(project: string): Promise<CodeFileInfo[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT id, project, path, hash, mtime, lines, parse_error, re_exports, fields, language FROM code_files WHERE project = ? ORDER BY path`)
+      .all(project) as { id: string; project: string; path: string; hash: string | null; mtime: number | null; lines: number | null; parse_error: string | null; re_exports: string; fields: string; language: string | null }[];
+    return rows.map((r) => this.codeFileRow(r));
+  }
+
+  async codeSymbols(project: string, opts?: { includeModules?: boolean }): Promise<CodeSymbolRow[]> {
+    this.ensure();
+    return this.codeSymbolSql("project = ?" + (opts?.includeModules ? "" : " AND kind != 'module'"), [project], " ORDER BY path, qualified_name");
+  }
+
+  async codeSymbolsByIds(project: string, ids: string[]): Promise<CodeSymbolRow[]> {
+    this.ensure();
+    if (ids.length === 0) return [];
+    const out: CodeSymbolRow[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      out.push(...this.codeSymbolSql(`project = ? AND id IN (${chunk.map(() => "?").join(",")})`, [project, ...chunk]));
+    }
+    return out;
+  }
+
+  async codeSymbolsMatching(project: string, substr: string, limit: number): Promise<CodeSymbolRow[]> {
+    this.ensure();
+    const escaped = substr.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+    const pattern = `%${escaped}%`;
+    return this.codeSymbolSql(
+      `project = ? AND kind != 'module' AND (name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\' OR signature LIKE ? ESCAPE '\\')`,
+      [project, pattern, pattern, pattern],
+      ` ORDER BY fan_in DESC, name LIMIT ${Math.max(1, Math.floor(limit))}`
+    );
+  }
+
+  async codeSymbolById(project: string, id: string): Promise<CodeSymbolRow | null> {
+    this.ensure();
+    const rows = this.codeSymbolSql("project = ? AND id = ?", [project, id]);
+    return rows[0] ?? null;
+  }
+
+  async codeEdges(project: string, symbolId: string, dir: "in" | "out"): Promise<CodeEdgeRow[]> {
+    this.ensure();
+    // Edges are project-qualified through their endpoints, so the project filter
+    // rides the symbols table: an edge whose endpoint died with its file answers
+    // nothing (and the sync deletes it in the same transaction as the symbol).
+    const col = dir === "in" ? "to_id" : "from_id";
+    const other = dir === "in" ? "from_id" : "to_id";
+    const rows = this.db
+      .prepare(
+        `SELECT e.kind, e.from_id, e.to_id, e.evidence FROM code_edges e
+         JOIN code_symbols s ON s.id = e.${other} AND s.project = ?
+         WHERE e.${col} = ? ORDER BY e.kind, e.evidence`
+      )
+      .all(project, symbolId) as { kind: string; from_id: string; to_id: string; evidence: string }[];
+    return rows.map((r) => ({ kind: r.kind as CodeEdgeRow["kind"], fromId: r.from_id, toId: r.to_id, evidence: r.evidence as CodeEdgeRow["evidence"] }));
+  }
+
+  async codeStats(project: string): Promise<CodebaseStats> {
+    this.ensure();
+    const files = this.db.prepare(`SELECT COUNT(*) AS c FROM code_files WHERE project = ?`).get(project) as { c: number };
+    const parseErrors = this.db.prepare(`SELECT COUNT(*) AS c FROM code_files WHERE project = ? AND parse_error IS NOT NULL`).get(project) as { c: number };
+    const symbols = this.db.prepare(`SELECT COUNT(*) AS c FROM code_symbols WHERE project = ?`).get(project) as { c: number };
+    const edges = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM code_edges e JOIN code_symbols s ON s.id = e.from_id WHERE s.project = ?`)
+      .get(project) as { c: number };
+    return { files: files.c, parseErrors: parseErrors.c, symbols: symbols.c, edges: edges.c };
+  }
+
+  private codeDeleteEdges(ids: string[], bothSides = true): void {
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const placeholders = chunk.map(() => "?").join(",");
+      if (bothSides) {
+        this.db.prepare(`DELETE FROM code_edges WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`).run(...chunk, ...chunk);
+      } else {
+        this.db.prepare(`DELETE FROM code_edges WHERE from_id IN (${placeholders})`).run(...chunk);
+      }
+    }
+  }
+
+  async codeApplyChanges(project: string, changes: CodeFileChange[]): Promise<void> {
+    this.ensure();
+    const db = this.db;
+    const insertFile = db.prepare(
+      `INSERT INTO code_files (id, project, path, hash, mtime, lines, parse_error, re_exports, fields, language)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET hash = excluded.hash, mtime = excluded.mtime, lines = excluded.lines,
+         parse_error = excluded.parse_error, re_exports = excluded.re_exports, fields = excluded.fields, language = excluded.language`
+    );
+    const insertSymbol = db.prepare(
+      `INSERT OR REPLACE INTO code_symbols (id, project, file_id, path, name, qualified_name, kind, signature, line_start, line_end, exported, parent_id, fan_in, language)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    );
+    const insertEdge = db.prepare(`INSERT OR REPLACE INTO code_edges (kind, from_id, to_id, evidence) VALUES (?, ?, ?, ?)`);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const change of changes) {
+        const fid = codeFileId(project, change.path);
+        const oldIds = (db.prepare(`SELECT id FROM code_symbols WHERE file_id = ?`).all(fid) as { id: string }[]).map((r) => r.id);
+        // A changed file only owns its OUTBOUND edges: symbol ids are
+        // deterministic, so inbound edges to its surviving symbols stay valid
+        // and must survive; a removed file takes every edge touching it.
+        this.codeDeleteEdges(oldIds, change.hash === null);
+        db.prepare(`DELETE FROM code_symbols WHERE file_id = ?`).run(fid);
+        if (change.hash === null) {
+          db.prepare(`DELETE FROM code_files WHERE id = ?`).run(fid);
+          continue;
+        }
+        insertFile.run(fid, project, change.path, change.hash, change.mtime, change.lines, change.parseError, JSON.stringify(change.reExports), JSON.stringify(change.fields), change.language);
+        for (const sym of change.symbols) {
+          insertSymbol.run(
+            sym.id, project, sym.fileId, sym.path, sym.name, sym.qualifiedName, sym.kind, sym.signature,
+            sym.lineStart, sym.lineEnd, sym.exported ? 1 : 0, sym.parentId, sym.language
+          );
+        }
+        for (const edge of change.edges) {
+          insertEdge.run(edge.kind, edge.fromId, edge.toId, edge.evidence);
+        }
+      }
+      // Fan-in is recomputed, never patched: a symbol whose last inbound edge
+      // died has to read 0. The correlated subquery this replaced was measured at
+      // 32 s on an 11k-symbol index (the planner reads every calls edge per row),
+      // so the count is read in ONE grouped pass and written by PK seek — linear
+      // in the edges, not quadratic in the symbols.
+      db.prepare(`UPDATE code_symbols SET fan_in = 0 WHERE project = ? AND fan_in != 0`).run(project);
+      const counts = db
+        .prepare(
+          `SELECT e.to_id AS id, COUNT(*) AS c FROM code_edges e
+           JOIN code_symbols s ON s.id = e.to_id AND s.project = ?
+           WHERE e.kind = 'calls' GROUP BY e.to_id`
+        )
+        .all(project) as { id: string; c: number }[];
+      const setFanIn = db.prepare(`UPDATE code_symbols SET fan_in = ? WHERE id = ?`);
+      for (const row of counts) setFanIn.run(row.c, row.id);
+      db.exec("COMMIT");
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // A commit that already landed cannot roll back; rethrow the original error.
+      }
+      throw e;
+    }
+  }
+
+  async codeForget(project: string): Promise<number> {
+    this.ensure();
+    const db = this.db;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const symbols = db.prepare(`SELECT COUNT(*) AS c FROM code_symbols WHERE project = ?`).get(project) as { c: number };
+      db.prepare(`DELETE FROM code_edges WHERE from_id IN (SELECT id FROM code_symbols WHERE project = ?) OR to_id IN (SELECT id FROM code_symbols WHERE project = ?)`).run(project, project);
+      db.prepare(`DELETE FROM code_symbols WHERE project = ?`).run(project);
+      db.prepare(`DELETE FROM code_files WHERE project = ?`).run(project);
+      db.exec("COMMIT");
+      return symbols.c;
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Same contract as codeApplyChanges: rethrow the original failure.
+      }
+      throw e;
+    }
+  }
 }
 
 type Row = {
@@ -2009,6 +3696,7 @@ type Row = {
   importance: number;
   strength: number | null;
   last_used_at: number | null;
+  use_count: number | null;
   source: string | null;
   tags: string | null;
   supersedes_id: string | null;
@@ -2016,6 +3704,8 @@ type Row = {
   visibility: string | null;
   status: string | null;
   pin: number | null;
+  valid_at: number | null;
+  invalid_at: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -2040,6 +3730,9 @@ function memoryFromRow(r: Row): Memory {
     // A column added later can be null in a DB migrated by an older build.
     strength: r.strength ?? r.importance,
     lastUsedAt: r.last_used_at ?? null,
+    // P2: like `strength` and `last_used_at`, a column a pre-migration or foreign
+    // row can answer NULL for; 0 is the honest "no recorded use".
+    useCount: r.use_count ?? 0,
     source: r.source ?? undefined,
     tags: r.tags ? JSON.parse(r.tags) : undefined,
     supersedesId: r.supersedes_id,
@@ -2047,6 +3740,10 @@ function memoryFromRow(r: Row): Memory {
     visibility: (r.visibility as Memory["visibility"]) ?? "private",
     status: (r.status as Memory["status"]) ?? "active",
     pin: r.pin ?? 0,
+    // P6 (ADR-0045): columns a pre-migration or foreign row can answer NULL for,
+    // like `strength` above — NULL here is the honest "unknown", never a guess.
+    validAt: r.valid_at ?? null,
+    invalidAt: r.invalid_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at
   };

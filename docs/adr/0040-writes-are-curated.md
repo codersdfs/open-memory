@@ -100,9 +100,15 @@ Three secondary decisions:
 
 `extractAndSave` returns `{memories, rejected}` and `POST /extract` reports the
 count — Mem0's `{"facts": []}` is a success, and "the turn held nothing durable"
-must be distinguishable from "the extractor was off". `saveMany` keeps curation
-off, for the same reason reconcile is off there: a 5,000-row import that dies on
-row 3 because one line ends in a colon is a hostile gate.
+must be distinguishable from "the extractor was off". `saveMany` kept curation off
+when this ADR was written — "a 5,000-row import that fails on row 3 because one line
+ends in a colon is a hostile gate." That sentence is superseded (2026-11-07, P1 of
+`docs/research/memory-systems-notes-2026-11-07.md`, ADR-0018 Amendment): the bulk
+path now runs this same zero-network verdict and *skips* a rejected row instead of
+killing the batch, so row 3's colon costs one line of `skipDetails` and the import
+keeps its gate. `secret` and empty text are refused on every write path —
+`{raw:true}` excuses neither — short of the explicit `MEMORY_CURATE=off` switch that
+turns the whole verdict off.
 
 ## Consequences
 
@@ -134,6 +140,9 @@ row 3 because one line ends in a colon is a hostile gate.
   they name a kind — the same bargain `deriveKind` makes.
 - **No retroactive curation.** A `curate` pass over the existing 515 rows is a
   one-off audit, not a feature; the store does not silently rewrite its stock.
+  (Reversed 2026-11-08 by the user's decision, P3 of the memory-systems research —
+  see the Amendment below. The pass exists now, and "diff first" is what keeps it
+  from being silent.)
 - **Paraphrase dedup is still reconcile's job.** Curation decides existence,
   reconcile decides effect; the two stay separate verdicts on purpose, because
   the guards that make supersede safe (`episodic-no-delete`, `pinned-no-delete`)
@@ -141,3 +150,128 @@ row 3 because one line ends in a colon is a hostile gate.
 - **The daemon applies this on restart.** A long-running daemon serves the code
   it booted with; the gate is live in every new process, MCP client, and CLI
   invocation that constructs a `MemoryService`.
+
+## Amendment (2026-11-08): retroactive curation exists now — `ai-memory triage`, diff first
+
+This record took two "the stock is never rewritten" positions, and both are now
+reversed by the same research (`docs/research/memory-systems-notes-2026-11-07.md`),
+one apiece:
+
+- **"`saveMany` kept curation off"** (Decision section) — reversed 2026-11-07 by
+  P1 (ADR-0018 amendment): the bulk path runs this same zero-network verdict per
+  row, skipping rejected lines instead of killing the batch. The inline note at
+  the end of the Decision section carries it.
+- **"No retroactive curation"** (the bullet above) — reversed 2026-11-08 by P3,
+  on the user's explicit decision (the research notes listed it as ⚖️ needing
+  sign-off; P1's reversal and this one were settled together). The verdict stops
+  being a write contract only: the stock gets the same judgement through
+  `ai-memory triage` (`src/core/lifecycle/triage.ts`), an explicit operator
+  command — never a silent rewrite, which is the part of the original decision
+  that survives unchanged.
+
+What shipped, in the order the command promises it:
+
+- **Diff first.** The default run writes nothing: it reports *would archive N /
+  would demote N / merge candidates M* with ids, classes and reasons as samples,
+  and `--apply` is the only mode that touches rows. The dry-run comparison in
+  `tests/triage.test.ts` is over every mutable column including `updated_at`, not
+  spot checks.
+- **Junk → archive, never a hard delete.** The seven hard classes flip
+  `status = archived` through `updateMeta` — the same reversible demotion decay's
+  default pass makes (ADR-0016); the row, its vector and its audit trail stay,
+  and `purgeDeleted` remains as unreachable from here as it is from the
+  scheduler.
+- **Weak classes → importance sinks, the row survives.** `progress` and
+  `self-narration` get the write-time explicit-write bargain: importance to 0.35
+  (`DEMOTE_IMPORTANCE`), kind untouched. A row already at or under the floor is
+  where the ladder would have put it, so it is neither written nor counted.
+- **`updateMeta` gained an `importance` patch — both stores.** The prerequisite
+  gap the research named (the patch had no way to move the judge's number) is
+  closed in `SqliteVectorStore` and `InMemoryVectorStore` alike; the SQLite path
+  keeps its trailing `noteChange`, so a demoted or archived row leaves every
+  decoded partition snapshot it sat in (ADR-0034) — pinned by a cache-counter
+  test, not assumed.
+- **The write runs inside the daemon when there is one** (added 2026-11-09, after
+  review caught the cross-process cache hole in the first cut). `--apply` posts
+  `POST /triage`, for the same reason `/decay` is a daemon route: the decoded
+  partition snapshots are invalidated per process (ADR-0034's changes log), so an
+  apply written from the caller's process would leave a running daemon scoring
+  archived and demoted rows as live until restart. A daemon older than the route
+  answers 404 and the identical code runs in-process — the `knowledge sync`
+  fallback — and the stderr caveat about restarting the daemon then prints in
+  **both** output modes: stdout is the payload, and a script consuming `--json`
+  must not lose the warning with it.
+- **The contracts outrank the regexes.** The pass skips durable kinds
+  (`decision`/`convention`/`gotcha` — ADR-0021, the same skip P2 preserved when
+  decay swapped to hotness), pinned rows (pin is the one explicit "keep this" —
+  ADR-0011), drafts (a governance state — ADR-0006), knowledge rows (an index of
+  a file, which the next sync would re-insert — ADR-0023), tombstones and rows
+  already archived. Only rows a read can still hand out are candidates.
+- **Merge is a report line, not an action.** Live rows sharing an `entity:*`
+  facet and the same `normalizeText` are listed as merge candidates in both
+  modes; picking a survivor rewrites identity, and that decision stays with
+  reconcile and its guards (ADR-0015), the same split the original "no
+  retroactive curation" bullet argued for — it was the *silence* it objected to
+  keeping, not the boundary itself.
+- **The judge's absence is counted, not recorded.** Live rows carrying no
+  `judged:*` tag are counted in-process (`unjudged`) — "the judge priced this row
+  low" and "the judge never ran" are indistinguishable after the fact (ADR-0041
+  stores unjudged rows untagged, fail-open), and whether a triage-visible tag
+  fixes that is ADR-0041's pending amendment (P5), deliberately not written here.
+
+Verified by `tests/triage.test.ts` (both stores: dry-run byte-identical; apply
+archives junk and idempotently re-reports zero; durable kinds, pin, draft,
+knowledge rows and tombstones unmoved; merge candidates listed and never merged;
+`updateMeta` importance on both stores plus the partition-cache invalidation),
+by `tests/api.test.ts` (`POST /triage`: the dry run writes nothing, apply
+archives inside the daemon's own process, a bare POST stays the dry run) and by
+`tests/cli.test.ts` (dry-run prints the diff and writes nothing; `--apply`
+writes; the machine shape is stable under `--json`; the in-process fallback
+carries the daemon caveat on stderr in both output modes; against a live server
+the CLI posts `/triage` and prints no caveat).
+
+## Amendment (2026-11-09): a refused write leaves a trace
+
+The original Decision made a rejection *explain itself* — the advice text, the
+422 body, the CLI exit — and stopped there. The in-band answer was the whole of
+it, so a note refused at 14:02 and never stored could not be found again: the
+operator asking "why was this dropped?" had to remember the exact text and
+re-type it, hoping the same regex fired. That is the feedback this amendment
+answers, and the gap was confirmed rather than assumed — `saveDetailed` throws
+before `embed`/`insert`, so the row never exists, and `memory_events`
+(ADR-0045) keys every event on `memory_id TEXT NOT NULL`. A dropped write has no
+id, so the write history cannot describe it. `extractAndSave` was worse: it
+counted refusions (`rejected += 1`) and threw the per-row reason away entirely.
+
+- **The trace is a separate ledger, not the chain.** `curation_drops` (SQLite
+  table, array mirror in the in-memory store) is written by the curation domain
+  in `MemoryService`, and the supersede/version-chain tables are untouched. The
+  temptation was one more `MemoryEventKind`, and that is a type error waiting to
+  happen: an event kind with no subject breaks the one constraint the history
+  table has, and it would let the chain's readers — `ChainView`, drill,
+  reconciler — see rows that are not memories. Refusals are not versioned, never
+  supersede, never archive, so they share no lifecycle with events.
+- **The secret class redacts its own evidence.** A drop's preview runs through
+  `redactSecrets()` (the same patterns that refused it) before storage. A ledger
+  that copies the refused key into a table to record that it refused a key has
+  done the thing the gate exists to prevent — and it is the one class where this
+  repo already prefers the false kill. The advice says which pattern fired, which
+  is all an operator needs.
+- **Repeats are one row with a count.** Reads fold on the note's
+  `textHash` — newest preview wins, `count` and `firstAt` keep the history —
+  because "the same error again" is the question, and the answer is a number on
+  one row rather than an index into N copies.
+- **A trace never breaks a write.** `logDrop` swallows store errors and no-ops
+  when a backend lacks the capability. Losing observability is bad; turning a
+  refused write into a crashed request is worse.
+- **Bounded by row count, not age.** `DROP_LEDGER_CAP = 1000` with an eviction
+  after each insert. A time window would hide the oldest drop of an error that
+  finally recurs — the exact case the feedback describes.
+
+Verified by `tests/drop-ledger.test.ts` on both stores: a note that reads as
+conversation is refused *and* queryable; the same note refused again in a new
+process comes back as one row with `count: 2` and the first refusal's timestamp;
+the trace survives a reopen (SQLite); a secret drop records the class and keeps
+no key; bulk and extract refusals land with their path and origin; curation
+off logs nothing. `GET /drops` and `memory_drops` are covered in the same file,
+and `tests/mcp.test.ts` now lists `memory_drops` in the advertised tools.

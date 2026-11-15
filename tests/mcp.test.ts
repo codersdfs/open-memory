@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createMcpServer } from "../src/mcp/server.js";
 import { callTool, MEMORY_TOOLS } from "../src/mcp/tools.js";
 import { MemoryService } from "../src/core/memoryService.js";
@@ -81,11 +84,12 @@ describe("MCP tool listing", () => {
     const res = await call({ jsonrpc: "2.0", id: 3, method: "tools/list" });
     const tools = (res.result as { tools: typeof MEMORY_TOOLS }).tools;
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ["memory_brief", "memory_forget", "memory_get", "memory_knowledge", "memory_list", "memory_project", "memory_remember", "memory_search", "memory_stats"].sort()
+      ["codebase_index", "codebase_search", "codebase_symbol", "memory_brief", "memory_drops", "memory_forget", "memory_get", "memory_knowledge", "memory_list", "memory_project", "memory_remember", "memory_search", "memory_stats"].sort()
     );
     for (const t of tools) {
       expect(t.description.length).toBeGreaterThan(20);
       expect(t.inputSchema.type).toBe("object");
+      if (t.name.startsWith("codebase_")) continue; // project-scoped, not namespace-scoped
       // `memory_get` / `memory_forget` take only an id (a get is not layer-specific);
       // `memory_project` is store-wide by design — a project spans every partition
       // that wrote into it, so a layer knob would lie. Every other tool must expose
@@ -342,5 +346,58 @@ describe("memory_list merges the scope fan-out into one recent-first page", () =
     const res: any = await callTool({ service, defaultAgent: "claude" }, "memory_list", { limit: -1 });
     expect(ids(res)).toEqual([expect.any(String)]);
     expect(res.text).not.toMatch(/→ 0 of/);
+  });
+});
+
+describe("codebase tools", () => {
+  it("registers the three codebase tools", () => {
+    const names = MEMORY_TOOLS.map((t) => t.name);
+    for (const name of ["codebase_index", "codebase_search", "codebase_symbol"]) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("indexes a repository and reads symbols back", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ai-memory-mcp-cb-"));
+    try {
+      writeFileSync(join(dir, "util.ts"), `export function utilHelper(s: string): string { return s; }\n`);
+      const index = await call({
+        jsonrpc: "2.0", id: 40, method: "tools/call",
+        params: { name: "codebase_index", arguments: { dir, project: "cbmcp" } }
+      });
+      const indexResult = index.result as { isError?: boolean; structuredContent: { indexed: number; project: string } };
+      expect(indexResult.isError ?? false).toBe(false);
+      expect(indexResult.structuredContent.project).toBe("cbmcp");
+      expect(indexResult.structuredContent.indexed).toBe(1);
+
+      const search = await call({
+        jsonrpc: "2.0", id: 41, method: "tools/call",
+        params: { name: "codebase_search", arguments: { query: "utilHelper", project: "cbmcp" } }
+      });
+      const searchResult = search.result as { isError?: boolean; structuredContent: { symbols: { qualifiedName: string; score: number }[] } };
+      expect(searchResult.isError ?? false).toBe(false);
+      expect(searchResult.structuredContent.symbols[0]!.qualifiedName).toBe("utilHelper");
+      expect(searchResult.structuredContent.symbols[0]!.score).toBe(1);
+
+      const symbol = await call({
+        jsonrpc: "2.0", id: 42, method: "tools/call",
+        params: { name: "codebase_symbol", arguments: { name: "utilHelper", project: "cbmcp" } }
+      });
+      const symbolResult = symbol.result as { isError?: boolean; structuredContent: { symbol: { qualifiedName: string } } };
+      expect(symbolResult.isError ?? false).toBe(false);
+      expect(symbolResult.structuredContent.symbol.qualifiedName).toBe("utilHelper");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("answers missing arguments and unknown symbols as tool results", async () => {
+    const noQuery: any = await callTool({ service: svc, defaultAgent: "claude" }, "codebase_search", {});
+    expect(noQuery.isError).toBe(true);
+    const noName: any = await callTool({ service: svc, defaultAgent: "claude" }, "codebase_symbol", {});
+    expect(noName.isError).toBe(true);
+    const unknown: any = await callTool({ service: svc, defaultAgent: "claude" }, "codebase_symbol", { name: "no-such-symbol", project: "cbmcp" });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toMatch(/no symbol/);
   });
 });

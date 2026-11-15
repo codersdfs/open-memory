@@ -1,9 +1,11 @@
 import "../config.js";
 import type { EmbeddingProvider } from "./embedding/provider.js";
 import { createEmbeddingProvider } from "./embedding/index.js";
+import type { BucketRefreshReport } from "./store/buckets.js";
+import { bucketPrefilterEnabled } from "./store/buckets.js";
 import type { ProjectSummary, VectorStore } from "./store/interface.js";
 import { HybridRetriever } from "./retrieval/hybrid.js";
-import type { Memory, MemoryInput, SearchOptions, SearchResult } from "./types.js";
+import type { ChainView, Memory, MemoryInput, SearchOptions, SearchResult } from "./types.js";
 import { Extractor } from "./extraction/extractor.js";
 import { InMemoryVectorStore } from "./store/memory.js";
 import { resolveDbPath } from "./dbPath.js";
@@ -14,10 +16,15 @@ import { deriveKind, KIND_IMPORTANCE } from "./write/kind.js";
 import { assembleBrief } from "./retrieval/brief.js";
 import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, type KnowledgePageView } from "./knowledge/view.js";
 import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
+import { syncCodebase, type SyncCodebaseOptions } from "./codebase/sync.js";
+import { codebaseSearch, codebaseSymbolDetail } from "./codebase/view.js";
+import type { CodebaseSearchResult, CodebaseSymbolDetail, CodebaseSyncReport } from "./codebase/types.js";
 import type { BriefOptions, BriefResult } from "./types.js";
-import { reconcile, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
-import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, type CurationVerdict } from "./write/curation.js";
-import { jevEnabled, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
+import { reconcile, unionNeighbours, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
+import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, renderVerdict, redactSecrets, DROP_PREVIEW_CHARS, type CurationDrop, type CurationDropInput, type CurationVerdict } from "./write/curation.js";
+import { textHash } from "./write/text.js";
+import { appendTag, buildTags, facetTagsOf } from "./write/facets.js";
+import { jevEnabled, jevApiKey, jevRelation, jevWriteGate, writeGateEnabled, importanceFor, WRITE_GATE_MIN, DEFAULT_RELATION_MARGIN } from "./judgment/judge.js";
 
 export type SaveInput = Omit<MemoryInput, "namespace" | "scope"> & { namespace?: string; agent?: string; user?: string; scope?: MemoryScope };
 
@@ -104,6 +111,60 @@ export class MemoryService {
     this.store.close();
   }
 
+/**
+   * Shape one refused write for the drop ledger. Keyed on `textHash` so repeats fold,
+   * and previewed through `redactSecrets` before anything else touches it: the note the
+   * filter refused for holding a key must not be the note the ledger keeps a key in.
+   * Whitespace collapses because the ledger line is a one-line trace, not an archive.
+   */
+  private dropOf(
+    input: SaveInput,
+    verdict: CurationVerdict,
+    path: "save" | "bulk",
+    namespace: string,
+    project: string | null
+  ): CurationDropInput {
+    const preview = redactSecrets(input.text).replace(/\s+/g, " ").trim().slice(0, DROP_PREVIEW_CHARS);
+    return {
+      hash: textHash(input.text),
+      preview,
+      junk: verdict.junk ?? "low-value",
+      advice: verdict.advice,
+      origin: input.source === "extractor" ? "extracted" : "explicit",
+      path,
+      namespace,
+      project,
+      at: Date.now()
+    };
+  }
+
+  /**
+   * Leave the trace, then let the refusal proceed. A store that predates the ledger
+   * records nothing and nothing breaks; a store that throws while recording must not
+   * turn a refused write into a failed one, so the error is swallowed on purpose —
+   * losing a diagnostic is allowed, losing the caller's command is not.
+   */
+  private async logDrop(drop: CurationDropInput): Promise<void> {
+    try {
+      await this.store.recordCurationDrop?.(drop);
+    } catch {
+      // Observability only: never a second reason to fail.
+    }
+  }
+
+  /**
+   * Why a note is missing, after the response that said so has been thrown away: the
+   * drop ledger. Pass `text` to ask about one exact note (folded on its hash, so the
+   * answer is "refused 3 times, first on Tuesday" rather than "nothing found"), or
+   * nothing to see what the filter has been eating. Empty means no refusals, not a
+   * store that dropped silently — every built-in store records.
+   */
+  async curationDrops(opts: { text?: string; namespace?: string; junk?: string; since?: number; limit?: number } = {}): Promise<CurationDrop[]> {
+    const hash = opts.text ? textHash(opts.text) : undefined;
+    if (opts.text && !hash) return [];
+    return (await this.store.curationDrops?.({ ...opts, hash })) ?? [];
+  }
+
   /**
    * Save one memory and report what it did to the store.
    *
@@ -112,11 +173,23 @@ export class MemoryService {
    * `<agent>:<user>`. Reconciling happens inside one partition only, so the same
    * sentence may legitimately exist as a private note and a shared fact.
    *
-   * The neighbour query below is the one the old dedup loop already ran: the five
-   * nearest rows in this partition and type. It was thrown away after an exact-string
-   * compare; `reconcile` is the only thing that changed about it.
+   * The neighbour query below grew arms in P5 (ADR-0047): the same-type vector top-5 the
+   * old dedup loop already ran — thrown away after an exact-string compare until
+   * `reconcile` made it the decision — plus the rows sharing the write's `entity:` facets
+   * (P4's `facetCandidates`) and the same partition without the type wall, deduped and
+   * capped at ten. Every arm feeds the same guarded decision; none of them admits a row
+   * on its own.
+   *
+   * `opts.raw` is the bulk escape hatch (ADR-0018 amendment), honoured on the
+   * per-row path too so `{ reconcile: true, raw: true }` means exactly what the
+   * batch path means by it: every reject except `secret` and except empty text is
+   * excused, and both demotion ladders are skipped — the regex one and the model
+   * write gate (ADR-0041). Skipping the model gate is not cosmetic: leaving it on
+   * would spend a network call per row and price rows the caller just declared off-
+   * limits. A caller who says "raw" is not asking the store to second-guess their
+   * rows' importance.
    */
-  async saveDetailed(input: SaveInput): Promise<SaveResult> {
+  async saveDetailed(input: SaveInput, opts: { raw?: boolean } = {}): Promise<SaveResult> {
     const env = runtimeEnv();
     const namespace = input.namespace?.trim()
       ? input.namespace
@@ -140,8 +213,18 @@ export class MemoryService {
     let curation: CurationVerdict | undefined;
     if ((env.MEMORY_CURATE ?? "").trim().toLowerCase() !== "off") {
       const verdict = curate(input.text, { origin });
-      if (verdict.action === "reject") throw new CurationRejected(verdict);
-      if (verdict.action === "demote" && input.kind === undefined && input.importance === undefined) {
+      // `raw` excuses every reject except `secret` and except empty text — the two
+      // verdicts ADR-0040 calls false-kill-preferred, which no caller intent excuses
+      // ("Empty is empty on every path"). A raw row that is neither stays the
+      // caller's own act: demotion is skipped too, second-guessing a declared "raw"
+      // batch's importance is how a memory system stops being trusted.
+      if (verdict.action === "reject" && !(opts.raw && verdict.junk !== "secret" && input.text.trim())) {
+        // The trace the feedback asked for: the throw is the answer only while the
+        // caller is still holding the response. Log first, then refuse.
+        await this.logDrop(this.dropOf(input, verdict, "save", namespace, project));
+        throw new CurationRejected(verdict);
+      }
+      if (verdict.action === "demote" && !opts.raw && input.kind === undefined && input.importance === undefined) {
         effectiveKind = DEMOTE_KIND;
         importance = DEMOTE_IMPORTANCE;
         curationTag = verdict.tag;
@@ -152,15 +235,20 @@ export class MemoryService {
     // every write no judge has seen. Rows the extractor's jev already priced carry
     // `judged:jev` and skip this — one judgement per row, never two. A curation
     // demotion also stands: the structural verdict outranks the model's optimism about
-    // the same sentence. Fail-open, like everything else on the judge wire — no key or
-    // a failed call stores the write unjudged rather than losing it.
-    if (!curation && !alreadyJevJudged(input) && writeGateEnabled() && input.text.trim().length >= 12) {
+    // the same sentence. `raw` skips the gate entirely (ADR-0018 amendment): it is the
+    // model's half of the demotion ladder, and a caller who declared the batch off-
+    // limits should not pay a network call per row to be second-guessed anyway.
+    // Fail-open, like everything else on the judge wire — no key or a failed call
+    // stores the write unjudged rather than losing it.
+    if (!opts.raw && !curation && !alreadyJevJudged(input) && writeGateEnabled() && input.text.trim().length >= 12) {
       const verdict = await jevWriteGate(input.text);
       if (verdict) {
         const callerSetValues = input.kind === undefined && input.importance === undefined;
         if (verdict.keep < WRITE_GATE_MIN() || verdict.scaffold >= 0.5) {
           if (origin === "extracted") {
-            throw new CurationRejected({ action: "reject", junk: "low-value", advice: ADVICE["low-value"] });
+            const gateVerdict: CurationVerdict = { action: "reject", junk: "low-value", advice: ADVICE["low-value"] };
+            await this.logDrop(this.dropOf(input, gateVerdict, "save", namespace, project));
+            throw new CurationRejected(gateVerdict);
           }
           if (callerSetValues) {
             // An explicit write is the caller's ask: priced, not refused — the same
@@ -225,7 +313,13 @@ export class MemoryService {
       return { memory, decision: { action: "insert", reason: "disabled", text: memory.text, tags: memory.tags ?? [], lexical: 0 } };
     }
 
-    const neighbours = await this.store.vectorSearch({
+    // P5 (ADR-0047): the conflict window. The write used to reconcile against one arm —
+    // the five nearest rows of its own partition and type — which is exactly the window
+    // gap3 named: a contradiction filed under another type, or joined by an entity the
+    // embedder ranks outside the top-5, never reached the decision. Three arms now feed
+    // one deduped, capped list; reaching is still not admitting, because every neighbour
+    // faces the same `nearest()` floors as before.
+    const vectorArm = await this.store.vectorSearch({
       namespace,
       // Reconcile stays inside one project: the same sentence filed under two
       // repositories is two facts with two lifetimes, and reinforcing one into the
@@ -238,6 +332,49 @@ export class MemoryService {
       limit: 5,
       includeDeleted: false
     });
+    // Arm 2 — same entity, this partition (P4's `facetCandidates`, ADR-0046): the rows
+    // sharing an `entity:` facet with the text being written, any type. The facets are
+    // the ones the incoming row itself will carry (the same `buildTags` the decision
+    // stores), because a join key only joins if both sides hold it. vectorScore 0 — a
+    // facet row is reached, not scored; it still clears the lexical/containment floors
+    // to win anything, the no-free-channel rule the facet arm already answers to.
+    const incomingTags = buildTags(input.text, curationTag ? [...(input.tags ?? []), curationTag] : input.tags);
+    const entityFacets = [...new Set(facetTagsOf(incomingTags).map((t) => t.toLowerCase()))].filter(
+      (t) => t.startsWith("entity:")
+    );
+    const facetArm =
+      entityFacets.length > 0 && this.store.facetCandidates
+        ? await this.store.facetCandidates({
+            namespace,
+            project: target.project,
+            facets: entityFacets,
+            knowledge: null,
+            includeDeleted: false,
+            limit: 5
+          })
+        : [];
+    // Arm 3 — the type wall comes down: the same vector query without `type`, so a
+    // contradiction filed as an event or a procedure can reach a semantic write (and
+    // vice versa). Skipped when arm 1 already ran unfiltered — the same query twice
+    // would be a second scan buying nothing.
+    const crossTypeArm = target.type
+      ? await this.store.vectorSearch({
+          namespace,
+          project: target.project,
+          knowledge: null,
+          queryEmbedding: embedding,
+          limit: 5,
+          includeDeleted: false
+        })
+      : [];
+    const neighbours = unionNeighbours(
+      [
+        vectorArm,
+        facetArm.map(({ memory }) => ({ memory, vectorScore: 0 })),
+        crossTypeArm
+      ],
+      10
+    );
     const decision = await reconcile({
       text: input.text,
       type: target.type,
@@ -273,12 +410,16 @@ export class MemoryService {
       const storedEmbedding = decision.text === input.text
         ? embedding
         : await this.embedder.embed(decision.text, { inputType: "passage" });
+      // The supersede history row (P6, ADR-0045) records the decision that retired the
+      // old row: the reconcile reason, and which judge made it when a model did — the
+      // gap this closes is exactly "the verdict used to be one console.warn line".
+      const model = decision.reason.startsWith("model-") ? (this.relation ? "injected-relation-judge" : "jev") : null;
       const memory = await this.store.supersede(decision.oldId, {
         ...target,
         text: decision.text,
         tags: decision.tags,
         importance: Math.max(old?.importance ?? 0, input.importance ?? 0.5)
-      }, storedEmbedding);
+      }, storedEmbedding, { reason: decision.reason, model });
       // A model decision that deleted a row is the one event a user cannot reconstruct
       // from the store afterwards, so it leaves a line behind.
       if (decision.reason.startsWith("model-")) {
@@ -289,6 +430,20 @@ export class MemoryService {
     }
 
     const memory = await this.store.insert({ ...target, tags: decision.tags }, embedding);
+    // P5 (ADR-0047): the marker lands on both sides of the pair. The incoming row carried
+    // `conflict:<entity>` in decision.tags through the insert above, which indexes its
+    // postings; the *existing* row can only take a new tag through `updateMeta`'s tags
+    // patch — the P4-maintained path (ADR-0046) that rewrites the postings in the same
+    // transaction as the column. Patching the column any other way would leave the
+    // postings describing the old tags, and the invariant test would catch it as drift.
+    // Only a readable-live row takes the marker: a row tombstoned between the neighbour
+    // query and now is not a pair to adjudicate.
+    if (decision.conflictFacet && decision.oldId) {
+      const conflicted = await this.store.getById(decision.oldId);
+      if (conflicted && conflicted.isDeleted !== 1) {
+        await this.store.updateMeta(conflicted.id, { tags: appendTag(conflicted.tags, decision.conflictFacet) });
+      }
+    }
     return {
       memory,
       // A decision that named an action this service could not carry out keeps its
@@ -302,18 +457,29 @@ export class MemoryService {
    * The relation judge for this call.
    *
    * Injected judges win (tests). Otherwise jev answers, and only when a judge is actually
-   * configured: no key means no call, not a call that fails. The margin is read per call
-   * so a value saved in the console applies to the next write without a restart.
+   * configured: no key means no judge, not a call that fails — the same reading ADR-0041's
+   * trust ladder gives the write gate ("no key → stores unjudged, untagged"), and since P5
+   * it is also what makes the judge *absent* (conflict marking eligible, ADR-0047) rather
+   * than *failed*. The margin is read per call so a value saved in the console applies to
+   * the next write without a restart.
+   *
+   * The wire distinguishes the two unjudged outcomes the reconciler must tell apart: a
+   * judge that answered but cleared no label resolves `null` (undecided, untagged), while
+   * one that returned no answer at all — request failed after retries, endpoint down —
+   * *rejects*, which is what makes the reconciler's `judge-failed` branch reachable. The
+   * old shape swallowed both into `null`, and a broken judge then looked exactly like a
+   * cautious one.
    */
   private relationJudge(): RelationJudge | undefined {
     if (this.relation) return this.relation;
-    if (!jevEnabled()) return undefined;
+    if (!jevEnabled() || !jevApiKey()) return undefined;
     return (oldText: string, newText: string) =>
       jevRelation(oldText, newText, {
         margin: envNumber(runtimeEnv().MEMORY_RECONCILE_MARGIN, DEFAULT_RELATION_MARGIN)
-      })
-        .then((r) => r?.relation ?? null)
-        .catch(() => null);
+      }).then((r) => {
+        if (!r) throw new Error("relation judge returned no answer");
+        return r.relation;
+      });
   }
 
   /** The old entry point, unchanged for every existing caller: the memory, no decision. */
@@ -322,7 +488,7 @@ export class MemoryService {
   }
 
   /**
-   * Bulk save for imports and replayed history (ADR-0018).
+   * Bulk save for imports and replayed history (ADR-0018, amended 2026-11-07).
    *
    * `reconcile` defaults to **off** here, unlike `save`. Write-time reconcile runs a
    * 5-neighbour vector search per write to decide insert/reinforce/supersede; doing
@@ -330,21 +496,73 @@ export class MemoryService {
    * everything that matters. A bulk import is new material by definition — the
    * caller that is replaying something it already stored can turn reconcile back on
    * explicitly. Embeddings go through `embedBatch` where the provider offers one, so
-   * a remote embedder costs one round trip instead of one per row. Curation is off
-   * here for the same reason: an import is a deliberate act, and a 5,000-row file
-   * that fails on row 3 because one line ends in a colon is a hostile gate.
+   * a remote embedder costs one round trip instead of one per row.
+   *
+   * What the amendment changed: curation (ADR-0040) now runs here too — pure regex,
+   * zero network, so the "deliberate act" excuse no longer holds, and an unfiltered
+   * `saveMany` was the one door through which a 5,000-row import could put the
+   * secret-bearing junk the store had already refused back in. The old hostile-gate
+   * objection (a batch dying on row 3) is answered by skipping per row instead:
+   * every rejected line comes back in `skipDetails` with its input index and the
+   * `renderVerdict` advice, and the rest of the batch lands. `{ raw: true }` (the
+   * CLI's `--no-curate`, `POST /memories/bulk`'s `"raw"`) excuses every reject
+   * **except `secret` and except empty text** — ADR-0040 calls those two the
+   * false-kill-preferred verdicts, and a bulk path that could re-admit credentials
+   * or blanks would undo the gate it just got — and it excuses the demotion ladder
+   * too: a caller who says "raw" is not asking the store to price their rows.
+   * `MEMORY_CURATE=off` still turns the whole verdict off, same switch `save`
+   * honours. The `{reconcile: true}` branch skips per row under the same rules
+   * (`saveDetailed` honours `raw`, including its skip of the model write gate); its
+   * old contract of dying on the first reject after the earlier rows had each
+   * already committed was the same hostile gate with a half-import welded to it.
+   *
+   * Exact duplicates collapse for free, keyed on the partition — (namespace,
+   * project, type) — that `reconcile` itself reads over: the same sentence under
+   * two repositories is two facts with two lifetimes (ADR-0020), so one project's
+   * copy never folds away another's. Only a *readable live* row blocks a re-import
+   * — one outside the population `list()` shows by default (tombstoned, archived or
+   * draft), so the fold agrees with what a search can actually return. The cheap
+   * half of what reconcile was asked to do expensively; near-duplicates stay
+   * reconcile's job, still opt-in.
    */
   async saveMany(
     inputs: SaveInput[],
-    opts: { reconcile?: boolean } = {}
-  ): Promise<{ memories: Memory[]; skipped: number }> {
-    if (inputs.length === 0) return { memories: [], skipped: 0 };
+    opts: { reconcile?: boolean; raw?: boolean } = {}
+  ): Promise<{ memories: Memory[]; skipped: number; skipDetails: { index: number; reason: string }[] }> {
+    if (inputs.length === 0) return { memories: [], skipped: 0, skipDetails: [] };
     if (opts.reconcile) {
+      // Same bargain as the batch path: a rejected row skips with its index and
+      // reason, the rows around it land. Catching `CurationRejected` per row is
+      // also what makes `raw` mean the same thing in both branches.
       const memories: Memory[] = [];
-      for (const input of inputs) memories.push((await this.saveDetailed(input)).memory);
-      return { memories, skipped: 0 };
+      const skipDetails: { index: number; reason: string }[] = [];
+      for (let index = 0; index < inputs.length; index++) {
+        try {
+          memories.push((await this.saveDetailed(inputs[index], { raw: opts.raw })).memory);
+        } catch (err) {
+          if (err instanceof CurationRejected) {
+            skipDetails.push({ index, reason: renderVerdict(err.verdict) });
+            continue;
+          }
+          throw err;
+        }
+      }
+      skipDetails.sort((a, b) => a.index - b.index);
+      return { memories, skipped: skipDetails.length, skipDetails };
     }
-    const targets = inputs.map((input) => {
+    const env = runtimeEnv();
+    const gateOn = (env.MEMORY_CURATE ?? "").trim().toLowerCase() !== "off";
+
+    // 1. Shape each input into a target and run the verdict this door used to skip.
+    //    Demotion keeps `saveDetailed`'s bargain: only values the store derived may
+    //    sink — a caller that named a kind or an importance made its own judgement.
+    const gated: { index: number; target: MemoryInput }[] = [];
+    const skipDetails: { index: number; reason: string }[] = [];
+    // The verdict inside a synchronous `forEach` cannot await its own trace, so the
+    // drops queue up and land before the next step embeds anything — a failed import
+    // still leaves the list of what it refused and why.
+    const pendingDrops: CurationDropInput[] = [];
+    inputs.forEach((input, index) => {
       const namespace = input.namespace?.trim()
         ? input.namespace
         : resolveWriteKey({ agent: input.agent, user: input.user, scope: input.scope });
@@ -367,23 +585,182 @@ export class MemoryService {
         status: input.status,
         pin: input.pin
       };
-      return target;
+      if (gateOn) {
+        const origin = input.source === "extractor" ? ("extracted" as const) : ("explicit" as const);
+        const verdict = curate(input.text, { origin });
+        if (verdict.action === "reject" && !(opts.raw && verdict.junk !== "secret" && input.text.trim())) {
+          skipDetails.push({ index, reason: renderVerdict(verdict) });
+          pendingDrops.push(this.dropOf(input, verdict, "bulk", namespace, project));
+          return;
+        }
+        if (verdict.action === "demote" && !opts.raw && input.kind === undefined && input.importance === undefined) {
+          target.kind = DEMOTE_KIND;
+          target.importance = DEMOTE_IMPORTANCE;
+          target.tags = verdict.tag ? [...(input.tags ?? []), verdict.tag] : input.tags;
+        }
+      }
+      gated.push({ index, target });
     });
+    for (const drop of pendingDrops) await this.logDrop(drop);
+
+    // 2. Collapse exact duplicates before anything is embedded: a skipped row must
+    //    not cost a vector round trip either. Keyed on the partition (namespace,
+    //    project, type) reconcile reads over — never fold across projects (ADR-0020).
+    //    In-batch first — one file can repeat a line — then against the store. A
+    //    store without the capability treats every survivor as new: it cannot know
+    //    otherwise, and inserting is the honest default for an import.
+    const foldKeyOf = (t: MemoryInput) => [t.namespace, t.project ?? "\u0000", t.type].join("\u0000");
+    const seenInBatch = new Map<string, Set<string>>();
+    const unique: { index: number; target: MemoryInput; hash: string }[] = [];
+    for (const g of gated) {
+      const hash = textHash(g.target.text);
+      const key = foldKeyOf(g.target);
+      let byPartition = seenInBatch.get(key);
+      if (!byPartition) {
+        byPartition = new Set();
+        seenInBatch.set(key, byPartition);
+      }
+      if (byPartition.has(hash)) {
+        skipDetails.push({ index: g.index, reason: "duplicate in this batch (exact text)" });
+        continue;
+      }
+      byPartition.add(hash);
+      unique.push({ ...g, hash });
+    }
+    let kept = unique;
+    if (this.store.findExistingHashes && unique.length > 0) {
+      const groups = new Map<string, { namespace: string; project: string | null; type: string; hashes: string[] }>();
+      for (const u of unique) {
+        const key = foldKeyOf(u.target);
+        const group = groups.get(key);
+        if (group) group.hashes.push(u.hash);
+        else groups.set(key, { namespace: u.target.namespace, project: u.target.project ?? null, type: u.target.type, hashes: [u.hash] });
+      }
+      const existing = new Map<string, Set<string>>();
+      for (const [key, group] of groups) {
+        existing.set(key, await this.store.findExistingHashes(group));
+      }
+      kept = [];
+      for (const u of unique) {
+        if (existing.get(foldKeyOf(u.target))?.has(u.hash)) {
+          skipDetails.push({ index: u.index, reason: "already stored (exact text)" });
+          continue;
+        }
+        kept.push(u);
+      }
+    }
+
+    const finish = (memories: Memory[]) => {
+      // Both steps appended; a caller reading reasons by input order wants them sorted.
+      skipDetails.sort((a, b) => a.index - b.index);
+      return { memories, skipped: skipDetails.length, skipDetails };
+    };
+    if (kept.length === 0) return finish([]);
+
     const embeddings = await this.embedder.embedBatch(
-      targets.map((t) => t.text),
+      kept.map((k) => k.target.text),
       { inputType: "passage" }
     );
-    const items = targets.map((input, i) => ({ input, embedding: embeddings[i] }));
+    const items = kept.map((k, i) => ({ input: k.target, embedding: embeddings[i] }));
     if (this.store.insertMany) {
-      return { memories: await this.store.insertMany(items), skipped: 0 };
+      return finish(await this.store.insertMany(items));
     }
     const memories: Memory[] = [];
     for (const it of items) memories.push(await this.store.insert(it.input, it.embedding));
-    return { memories, skipped: 0 };
+    return finish(memories);
   }
 
   async get(id: string): Promise<Memory | null> {
     return this.store.getById(id);
+  }
+
+  /**
+   * The whole supersede chain of one row, walked only when the caller asks
+   * (P6, ADR-0045): `GET /memories/:id?drill=1`, `ai-memory get <id> --history`.
+   *
+   * Explicitly not part of any search: retrieval carries the one-hop predecessor
+   * pointer inside the budget (hybrid.ts), never this walk — adding a chain to the
+   * candidate pool is the PRF mistake again (ADR-0028: merged rows crowd a fixed
+   * budget, evidence-any fell 76% → 72%), and a chain the caller did not ask for is
+   * context the caller must pay for reading.
+   *
+   * A purged id still answers: `memory` null, `events` holding whatever the
+   * append-only log kept — that is the audit half of the write-history table.
+   */
+  async drill(id: string): Promise<ChainView> {
+    const memory = await this.store.getById(id);
+    const events = (await this.store.history?.(id)) ?? [];
+    if (!memory) return { memory: null, ancestors: [], successors: [], events };
+
+    // Backward along `supersedesId`, nearest first. A cycle (or a self-supersede)
+    // terminates on the seen-set, the same guard the console walk uses.
+    const seen = new Set<string>([id]);
+    const ancestors: Memory[] = [];
+    let cursor = memory.supersedesId ?? null;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const row = await this.store.getById(cursor);
+      if (!row) break;
+      ancestors.push(row);
+      cursor = row.supersedesId ?? null;
+    }
+
+    // Forward: breadth-first over rows whose `supersedes_id` names a chain member.
+    // The store capability is one indexed query per level; without it, the fallback
+    // pages the origin's own partition — supersede never crosses a namespace (the
+    // replacement is written into the old row's partition), so the sweep is bounded
+    // by that partition, correct at any size and only slow, the trade `listProjects`
+    // already accepts.
+    const successors: Memory[] = [];
+    let queue = [id];
+    if (this.store.successorsOf) {
+      while (queue.length > 0) {
+        const next: string[] = [];
+        for (const parent of queue) {
+          for (const child of await this.store.successorsOf(parent)) {
+            if (seen.has(child.id)) continue;
+            seen.add(child.id);
+            successors.push(child);
+            next.push(child.id);
+          }
+        }
+        queue = next;
+      }
+    } else {
+      const byParent = new Map<string, Memory[]>();
+      for (let offset = 0; ; offset += 500) {
+        const page = await this.store.list({
+          namespace: memory.namespace,
+          includeDeleted: true,
+          includeArchived: true,
+          includeDraft: true,
+          limit: 500,
+          offset,
+          withVectors: false
+        });
+        for (const row of page.memories) {
+          if (!row.supersedesId) continue;
+          const held = byParent.get(row.supersedesId);
+          if (held) held.push(row);
+          else byParent.set(row.supersedesId, [row]);
+        }
+        if (page.memories.length === 0 || offset + page.memories.length >= page.total) break;
+      }
+      while (queue.length > 0) {
+        const next: string[] = [];
+        for (const parent of queue) {
+          for (const child of byParent.get(parent) ?? []) {
+            if (seen.has(child.id)) continue;
+            seen.add(child.id);
+            successors.push(child);
+            next.push(child.id);
+          }
+        }
+        queue = next;
+      }
+    }
+
+    return { memory, ancestors, successors, events };
   }
 
   /**
@@ -585,6 +962,47 @@ export class MemoryService {
         : resolveScopeKeys({ agent: opts.agent, scope: opts.scope ?? undefined });
   }
 
+  // ---- Codebase memory (ADR-0050). The sync is the only writer, the reads are
+  // deterministic and budgeted; a store without the capability is reported as
+  // missing, never faked. The project rides the same resolution order as every
+  // write: explicit → MEMORY_PROJECT → the git root of the process.
+
+  private codebaseProject(explicit?: string | null): string {
+    const project = resolveProject(explicit).project;
+    if (!project) {
+      throw new Error("codebase memory: no project resolved — pass project explicitly or run inside a git checkout");
+    }
+    return project;
+  }
+
+  async codebaseSync(opts: SyncCodebaseOptions = {}): Promise<CodebaseSyncReport> {
+    return syncCodebase({ store: this.store }, opts);
+  }
+
+  async codebaseSearch(opts: { query: string; project?: string | null; k?: number; budgetTokens?: number }): Promise<CodebaseSearchResult> {
+    return codebaseSearch(this.store, {
+      project: this.codebaseProject(opts.project),
+      query: opts.query,
+      k: opts.k,
+      budgetTokens: opts.budgetTokens
+    });
+  }
+
+  async codebaseSymbol(opts: { idOrName: string; project?: string | null }): Promise<CodebaseSymbolDetail | null> {
+    return codebaseSymbolDetail(this.store, {
+      project: this.codebaseProject(opts.project),
+      idOrName: opts.idOrName
+    });
+  }
+
+  async codebaseForget(opts: { project?: string | null } = {}): Promise<{ project: string; symbols: number }> {
+    const project = this.codebaseProject(opts.project);
+    const cap = this.store.codebase;
+    if (!cap) throw new Error("codebase memory: this store does not implement the codebase capability");
+    const symbols = await cap.codeForget(project);
+    return { project, symbols };
+  }
+
   async updateMeta(
     id: string,
     patch: { status?: string; pin?: number; visibility?: string; isDeleted?: number }
@@ -619,9 +1037,12 @@ export class MemoryService {
    *
    * Curation rejections are the expected outcome here, not errors: an extractor that
    * slices three candidates out of every turn and keeps none of them did its job
-   * (Mem0's `{"facts": []}` is a success). `rejected` says how many were refused and
-   * why-shaped, so a caller can tell "the turn held nothing durable" apart from
-   * "the extractor was off".
+   * (Mem0's `{"facts": []}` is a success). `rejected` says how many were refused,
+   * so a caller can tell "the turn held nothing durable" apart from "the extractor
+   * was off" — and since every refusal went through `save`, the *which* and the *why*
+   * of each one sit in the drop ledger (`curationDrops`) instead of vanishing with the
+   * count. A turn whose note "seems useless until the next run hits the same error"
+   * is therefore traceable across runs, not just counted within one.
    */
   async extractAndSave(turnText: string, namespace: string, referenceDate?: number): Promise<{ memories: Memory[]; rejected: number }> {
     const extracted = await this.extractor.extract(turnText, referenceDate ?? Date.now());
@@ -652,5 +1073,21 @@ export class MemoryService {
       }
     }
     return { memories: saved, rejected };
+  }
+
+  /**
+   * Refresh the bucket summaries (P8, ADR-0048) — the maintenance pass's second step.
+   *
+   * The feature flag is checked here, not in the store: `MEMORY_BUCKET_PREFILTER=off`
+   * (the default) must cost nothing anywhere — no writes, no table growth — and the
+   * store has no business re-reading the env per call. The refresh itself needs no
+   * embedder (the summary is the bucket's own centroid, computed from stored
+   * vectors), so this is pure local work when it runs. `null` says "not running"
+   * back, which the scheduler logs as nothing and the boot warm treats the same way.
+   */
+  async refreshBucketSummaries(): Promise<BucketRefreshReport | null> {
+    if (!bucketPrefilterEnabled()) return null;
+    if (typeof this.store.refreshBucketSummaries !== "function") return null;
+    return this.store.refreshBucketSummaries();
   }
 }

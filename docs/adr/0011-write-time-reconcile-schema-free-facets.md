@@ -24,7 +24,7 @@
 ## Deferred
 
 - **Stage B:** an offline `consolidate` pass for rows written before this existed. The write path cannot clean history it never saw.
-- **Stage C:** read-time expansion over supersede chains and shared facets — the lever for multi-hop, and the only stage that should move a benchmark number.
+- **Stage C:** read-time expansion over supersede chains and shared facets — the lever for multi-hop, and the only stage that should move a benchmark number. The chain half landed on 2026-11-08 as [ADR-0045](0045-write-history-and-two-clocks.md): a search hit carries a one-hop predecessor pointer inside the budget leftover, and the full walk stays behind the explicit `?drill=1` / `ai-memory get <id> --history` — deliberately **not** read-time expansion into the candidate pool, which is the ADR-0028 PRF trade (merged rows crowd a fixed budget) with worse odds, and the shared-facets half remains open.
 - LLM entity extraction (costs a call per write for what four regexes already surface).
 - FTS5 / ANN indexing. Brute-force over one partition is still fast at this corpus size.
 

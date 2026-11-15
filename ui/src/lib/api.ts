@@ -21,6 +21,10 @@ export interface Memory {
   id: string;
   namespace: string;
   type: MemoryType;
+  /** src/core/types.ts:47 — the project slug this row is filed under; null is unscoped (ADR-0042). */
+  project?: string | null;
+  /** src/core/types.ts:16 KINDS — decision|convention|gotcha|fact|task|note, derived on write. */
+  kind?: string;
   text: string;
   /**
    * Absent on every HTTP response unless the call passes `embedding=1` — a 384-float
@@ -62,7 +66,24 @@ export interface SearchResultItem extends Memory {
   tokens: number;
 }
 
-/** src/core/types.ts:119-129 SearchResult. */
+/** src/core/types.ts:213-219 SearchNearMiss — a candidate the gate rejected, kept for the empty-result story (ADR-0037). */
+export interface SearchNearMiss {
+  text: string;
+  relevance: number;
+  bm25: number;
+  vector: number;
+  coverage: number;
+}
+
+/** src/core/types.ts:227-249 SearchDiagnostics — present when the search explains itself (ADR-0037/0039). */
+export interface SearchDiagnostics {
+  threshold: number;
+  partitions: { namespace: string; count: number }[];
+  nearMisses: SearchNearMiss[];
+  outside?: { namespace: string; count: number }[];
+}
+
+/** src/core/types.ts:119-129 SearchResult — `diagnostics` rides along on explain'd searches. */
 export interface SearchResult {
   memories: SearchResultItem[];
   tokensUsed: number;
@@ -70,6 +91,18 @@ export interface SearchResult {
   summary: string | null;
   agent?: string;
   scopes?: string[];
+  diagnostics?: SearchDiagnostics;
+}
+
+/**
+ * src/api/server.ts:503-505 GET /projects, fed by `listProjects` (src/core/memoryService.ts:433).
+ * `project: null` is the ungrouped bucket — rows the process's project resolution left unscoped.
+ */
+export interface ProjectSummary {
+  project: string | null;
+  rows: number;
+  byKind: Record<string, number>;
+  lastActivityAt: number | null;
 }
 
 /** src/core/stats.ts:26-29 StatsBucket. */
@@ -78,20 +111,32 @@ export interface StatsBucket {
   count: number;
 }
 
-/** src/core/stats.ts:31-39 DecayCandidate. */
+/** src/core/stats.ts:56-71 DecayCandidate. */
 export interface DecayCandidate {
   id: string;
   type: MemoryType;
   createdAt: number;
   importance: number;
   strength: number;
+  /** Retrievals so far — what the hotness preview weighs (src/core/lifecycle/decay.ts). */
+  useCount: number;
   isDeleted: number;
   text: string;
   /** `archive` is the default pass (reversible status change); `prune` is the opt-in hard pass. */
   action: 'archive' | 'prune';
 }
 
-/** src/core/stats.ts:41-59 StatsSummary. */
+/** src/core/stats.ts:63-75 PendingConflict — one side of an unjudged contradiction pair (P5). */
+export interface PendingConflict {
+  id: string;
+  type: MemoryType;
+  createdAt: number;
+  text: string;
+  /** The `conflict:*` facets the row carries — the entity(ies) the pair was named after. */
+  conflicts: string[];
+}
+
+/** src/core/stats.ts:73-97 StatsSummary. */
 export interface StatsSummary {
   total: number;
   byType: Record<string, number>;
@@ -106,6 +151,9 @@ export interface StatsSummary {
   strength: StatsBucket[];
   age: StatsBucket[];
   decayCandidates: DecayCandidate[];
+  /** P5 (ADR-0047): live rows wearing a `conflict:*` facet, waiting on an adjudication. */
+  pendingConflicts: number;
+  pendingConflictRows: PendingConflict[];
   textChars: number;
   textTokensEstimate: number;
 }
@@ -123,6 +171,10 @@ export interface StatsResponse extends StatsSummary {
   rowsScanned: number;
   dbPath: string | null;
   dbBytes: number | null;
+  /** P2: when the daemon's maintenance pass last ran (epoch ms), null = never. */
+  lastMaintenanceAt: number | null;
+  /** What the last maintenance pass did, as one line; null = never ran. */
+  lastMaintenanceResult: string | null;
 }
 
 /** src/core/sessions.ts:23-31 SessionTurn. */
@@ -222,8 +274,33 @@ function serverMessage(body: unknown, status: number): string {
   return `HTTP ${status}`;
 }
 
+// P7 (ADR-0049): the console authenticates like every other client. The daemon serves
+// its token to nobody — an injected meta tag was tried and removed by review (any
+// unauthenticated GET of a static page would hand the live token to a same-machine
+// process, the exact threat the boundary exists for) — so the operator pastes the token
+// once into the 401 gate (PrincipalGate) and the browser keeps it in localStorage,
+// scoped to this origin. An absent stored token sends no header and the server answers
+// 401, which is what the gate keys off. Nothing the server renders ever contains it.
+const TOKEN_STORAGE_KEY = 'ai-memory-principal';
+
+/** The principal token this browser holds, or null when the gate has not been passed. */
+export function storedPrincipalToken(): string | null {
+  return localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+/** Store (or clear) the principal token the console sends on every request. */
+export function setStoredPrincipalToken(token: string | null): void {
+  if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  else localStorage.removeItem(TOKEN_STORAGE_KEY);
+}
+
+function principalHeaders(): Record<string, string> {
+  const token = storedPrincipalToken();
+  return token ? { 'x-ai-memory-principal': token } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
+  const res = await fetch(path, { ...init, headers: { ...principalHeaders(), ...init?.headers } });
   const body: unknown = await res.json().catch(() => null);
   // The server's message is the useful one ("text required (1-5000 chars)"); a
   // generic "request failed" throws that away.
@@ -345,14 +422,135 @@ export const api = {
    */
   adoptEnv: (): Promise<{ adopted: string[]; notAdopted: string[]; backupPath: string | null; restartRequired: true }> =>
     request("/settings/adopt-env", sendInit("POST", {})),
+
+  /** GET /projects — src/api/server.ts:503-505 (ADR-0042: projects are a derived dimension). */
+  projects: (): Promise<{ projects: ProjectSummary[] }> => request("/projects"),
+
+  /** POST /brief — src/api/server.ts:485-497, fed by `service.brief` (src/core/types.ts:293-301). */
+  brief: (p: { namespace?: string; budgetTokens?: number }): Promise<BriefResult> =>
+    request("/brief", sendInit("POST", p)),
+
+  /** GET /graph — src/api/server.ts:442-445, fed by `buildGraph(loadPages(vaultDir()))` (src/core/graph.ts:110). */
+  graph: (): Promise<GraphData> => request("/graph"),
+
+  /** GET /positions — src/api/server.ts:446-465; keys are node ids, values canvas coords. */
+  positions: (): Promise<Record<string, { x: number; y: number }>> => request("/positions"),
+
+  /** POST /positions — persists one node's canvas coords to `<vault>/.positions.json`. */
+  savePosition: (slug: string, x: number, y: number): Promise<{ ok: true; count: number }> =>
+    request("/positions", sendInit("POST", { slug, x: Math.round(x), y: Math.round(y) })),
+
+  /** GET /knowledge/:id — src/api/server.ts:565-576; the page's section outline (headings only). */
+  knowledgePage: (id: string): Promise<KnowledgePageView> => request(`/knowledge/${encodeURIComponent(id)}`),
+
+  /** GET /agent/status — src/api/server.ts (ADR-0043). `llm:false` keys the console's local mode. */
+  agentStatus: (): Promise<AgentStatus> => request("/agent/status"),
+
+  /**
+   * POST /agent/chat — src/api/server.ts (ADR-0043). Answers 200 {reply, trace, model} when a
+   * key sits on the server's merged seam; 501 {error:"no-model", hint} when it does not — the
+   * caller falls back to the deterministic engine in `lib/agent.ts`. 502 carries the loop's
+   * failure (endpoint down, non-JSON, did not converge).
+   */
+  agentChat: (body: AgentChatRequest): Promise<AgentChatResponse> =>
+    request("/agent/chat", sendInit("POST", body)),
 };
+
+/** src/api/agent.ts sanitizeIncoming — what the wire accepts from the console. */
+export interface AgentChatMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AgentChatRequest {
+  messages: AgentChatMessage[];
+  /** The picker's partition; the server defaults it. */
+  namespace?: string;
+}
+
+/** src/api/agent.ts agentStatus. */
+export interface AgentStatus {
+  llm: boolean;
+  model: string | null;
+  base: string;
+}
+
+/** src/api/agent.ts AgentTraceStep — one executed tool call, in order. */
+export interface AgentTraceStep {
+  tool: string;
+  args: Record<string, unknown>;
+  summary: string;
+}
+
+export interface AgentChatResponse {
+  reply: string;
+  trace: AgentTraceStep[];
+  model: string;
+}
+
+/** src/core/types.ts:293-301 BriefResult — the fields the console renders. */
+export interface BriefResult {
+  project: string | null;
+  text: string;
+  tokensUsed: number;
+  budgetTokens: number;
+  truncated: boolean;
+}
+
+/** src/core/graph.ts:14-16 GraphEdge; `mutual` edges are drawn hotter than one-way ones. */
+export interface GraphEdge {
+  from: string;
+  to: string;
+  mutual: boolean;
+}
+
+/** src/core/graph.ts GraphNode — `folder` is the first path segment ("" at root), `dangling`
+ *  marks a link whose target file does not exist. */
+export interface GraphNode {
+  id: string;
+  title: string;
+  source: string;
+  deg: number;
+  dangling: boolean;
+  folder: string;
+  tags: string[];
+  file: string;
+}
+
+/** src/core/graph.ts:17 Graph — the whole vault graph; small by design (a repo's wiki). */
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+/** src/core/knowledge/view.ts:20-30 KnowledgePageView — the console renders the section outline. */
+export interface KnowledgeSectionView {
+  key: string;
+  heading: string;
+  chars: number;
+}
+
+export interface KnowledgePageView {
+  id: string;
+  title: string;
+  project: string | null;
+  sections: KnowledgeSectionView[];
+  links: { from: string; to: string; target: string }[];
+  backlinks: { from: string; to: string; target: string }[];
+  dangling: { from: string; to: string; target: string }[];
+}
 
 /** One entry of `GET /embedding`'s `presets` — the factory's own defaults (ticket 015 D3). */
 export interface EmbeddingPreset {
-  provider: "hash" | "openai" | "nim";
-  /** The environment variable this provider needs, **by name**; `null` for `hash`. */
+  provider: 'hash' | 'openai' | 'openai-local' | 'nim';
+  /**
+   * The environment variable this provider reads, **by name**; `null` when none is
+   * needed — which since ADR-0048 covers `hash` (no credential exists) and
+   * `openai-local` (a key is optional: empty sends no Authorization header).
+   */
   keyEnv: string | null;
   model: string | null;
+  /** `0` for `openai-local`: the endpoint's model decides, so `EMBEDDING_DIM` is a user setting. */
   dim: number;
 }
 

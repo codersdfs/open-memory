@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createEmbeddingProvider } from "../src/core/embedding/index.js";
+import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding } from "../src/core/embedding/index.js";
 import { ApiEmbeddingProvider } from "../src/core/embedding/openai.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { InMemoryVectorStore } from "../src/core/store/memory.js";
@@ -42,6 +42,82 @@ describe("embedding provider selection", () => {
   it("rejects a non-numeric dim rather than coercing it", () => {
     expect(() => createEmbeddingProvider(env({ EMBEDDING_PROVIDER: "openai", OPENAI_API_KEY: "sk-x", EMBEDDING_DIM: "big" })))
       .toThrow(/positive integer/);
+  });
+});
+
+// P8 small half (ADR-0048): the local OpenAI-compatible preset. Same wire as
+// `openai`, but the key is OPTIONAL (Ollama/LM Studio authenticate by being on
+// localhost, and some builds reject a Bearer line outright) and nothing has a
+// default — a local endpoint's address, model id and width are facts about the
+// user's install, and the factory refuses to guess any of them.
+describe("openai-local preset", () => {
+  const full = {
+    EMBEDDING_PROVIDER: "openai-local",
+    OPENAI_BASE_URL: "http://localhost:11434/v1",
+    OPENAI_EMBED_MODEL: "nomic-embed-text",
+    EMBEDDING_DIM: "768"
+  };
+
+  it("resolves with NO key — the whole point of the preset", () => {
+    const p = createEmbeddingProvider(env(full));
+    expect(p.name).toBe("openai-local");
+    expect(p.dim).toBe(768);
+  });
+
+  it("names every missing variable at once, with the example the user needs", () => {
+    try {
+      createEmbeddingProvider(env({ EMBEDDING_PROVIDER: "openai-local" }));
+      throw new Error("should have thrown");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      expect(msg).toContain("OPENAI_BASE_URL");
+      expect(msg).toContain("OPENAI_EMBED_MODEL");
+      expect(msg).toContain("EMBEDDING_DIM");
+      expect(msg).toContain("OPENAI_API_KEY is optional");
+    }
+  });
+
+  it("stays visible to the console's preview", () => {
+    const ok = previewEmbedding(env(full));
+    expect(ok).toEqual({ ok: true, provider: "openai-local", model: "nomic-embed-text", dim: 768 });
+    const bad = previewEmbedding(env({ EMBEDDING_PROVIDER: "openai-local" }));
+    expect(bad.ok).toBe(false);
+  });
+
+  it("exposes itself as a preset with no key requirement and no width of its own", () => {
+    const row = EMBEDDING_PRESETS.find((p) => p.provider === "openai-local");
+    expect(row).toEqual({ provider: "openai-local", keyEnv: null, model: null, dim: 0 });
+  });
+
+  it("sends no Authorization header when the key is empty, and Bearer when set", async () => {
+    const headers: Record<string, Record<string, string | string[] | undefined>> = {};
+    const server = createServer((req, res) => {
+      headers[req.url ?? ""] = req.headers;
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: [{ embedding: new Array(8).fill(0.01) }] }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      const local = new ApiEmbeddingProvider({ name: "openai-local", baseUrl: base + "/a", apiKey: "", model: "m", dim: 8, inputType: false });
+      await local.embed("hello");
+      // The absent header is the feature: Ollama 401s a malformed `Bearer `.
+      expect(headers["/a/embeddings"]!.authorization).toBeUndefined();
+
+      const keyed = new ApiEmbeddingProvider({ name: "openai-local", baseUrl: base + "/b", apiKey: "sk-x", model: "m", dim: 8, inputType: false });
+      await keyed.embed("hello");
+      expect(headers["/b/embeddings"]!.authorization).toBe("Bearer sk-x");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("still requires the key for hosted openai — the empty key is openai-local's, not openai's", () => {
+    expect(() => createEmbeddingProvider(env({ EMBEDDING_PROVIDER: "openai" }))).toThrow(/OPENAI_API_KEY/);
   });
 });
 

@@ -4,6 +4,14 @@ export type ApiEmbeddingConfig = {
   /** Reported in `/health` and in the dim-mismatch error. */
   name: string;
   baseUrl: string;
+  /**
+   * May be empty: a local OpenAI-compatible endpoint (Ollama, LM Studio — the
+   * `openai-local` preset, ADR-0048) authenticates by being on localhost, not by a
+   * key, and several of them reject a `Bearer` line outright. Empty means the
+   * `authorization` header is simply not sent — never `Bearer ""` and never a
+   * placeholder, because a header that lies about authenticating is how a 401
+   * becomes "the model is broken".
+   */
   apiKey: string;
   model: string;
   dim: number;
@@ -53,7 +61,12 @@ export class ApiEmbeddingProvider implements EmbeddingProvider {
 
     const res = await fetch(`${this.cfg.baseUrl.replace(/\/+$/, "")}/embeddings`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${this.cfg.apiKey}` },
+      // No key, no header (ADR-0048): Ollama and LM Studio serve `/v1/embeddings`
+      // without one, and some builds 401 a malformed `Bearer ` rather than ignore it.
+      headers: {
+        "content-type": "application/json",
+        ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
+      },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 20_000),
     });

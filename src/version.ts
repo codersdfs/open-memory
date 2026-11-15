@@ -11,7 +11,9 @@ import { fileURLToPath } from "node:url";
  * why `ai-memory version` crashed on every installed copy.
  *
  * Matching the package name keeps a stray `package.json` in an ancestor directory
- * (a host project, a global npm prefix) from being mistaken for this one.
+ * (a host project, a global npm prefix) from being mistaken for this one. It is
+ * matched by its unscoped last path segment, so the check survives the package
+ * living under a scope (`@franklinww/open-memory`) without hard-coding that scope.
  */
 let cached: string | undefined;
 
@@ -21,7 +23,7 @@ export async function appVersion(): Promise<string> {
   for (let i = 0; i < 8; i++) {
     try {
       const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8")) as { name?: string; version?: string };
-      if (pkg.name === "open-memory" && pkg.version) return (cached = pkg.version);
+      if (pkg.name?.split("/").pop() === "open-memory" && pkg.version) return (cached = pkg.version);
     } catch { /* no manifest here — keep walking */ }
     const parent = dirname(dir);
     if (parent === dir) break;

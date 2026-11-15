@@ -1,24 +1,38 @@
-# Open Memory — local-first memory for pi agents
+# Open Memory
 
-> **Status: `0.4.0-beta.2`** — pre-release. The storage format is settled; the HTTP and MCP surfaces
-> can still move between prereleases.
+**Local-first memory your coding agent can actually trust: one SQLite file, zero dependencies, no LLM call per search — and it out-retrieves the hosted "memory" products on their own benchmark.**
 
 ![the console: a query, the floor preset that made seven hits appear, the token budget,
 and the score decomposition behind every hit](docs/images/console-recall-dark.png)
 
-A **local-first, namespace-partitioned memory substrate** that stores *Episodic / Semantic / Procedural / Working* memories as vectors and retrieves them with **smart search + hard token budget** to prevent *Token Burning* (cost) and *Context Burning* (irrelevant dilution).
+> **Status: `0.4.0-beta.4`** — pre-release. The storage format is settled; the HTTP, MCP, and console UI
+> surfaces can still move between prereleases.
+
+Agent memory is usually a vector database you babysit or a cloud you don't trust with your history.
+Open Memory is a single `memory.db` file (`node:sqlite`, WAL) that stores episodic, semantic, procedural
+and working memories and gets them back with hybrid **smart search** under a **hard token budget** — no
+*Token Burning* (cost), no *Context Burning* (dilution). It doesn't just hand back matches; it can show the
+exact score that earned every one.
+
+The proof, on one harness and one pinned reader/judge (LoCoMo `conv-26`, 152 questions):
+**open-memory 69.1% vs OpenViking 39.5% vs mem0 OSS 14.5%** — a judge-free string-hit audit agrees
+(35.3%) and the paired difference is significant (McNemar p=0.0003). Warm searches land in **~9 ms**, and
+it holds **80 req/s with zero dropped requests** while another agent writes underneath. One process, no
+Docker, and your history never leaves the machine.
 
 - **Embedded DB**: SQLite via `node:sqlite` (`memory.db` single file, WAL), no Docker. `VectorStore` interface swappable to Qdrant/Chroma (ADR-0001).
 - **Smart Search**: 2-stage — candidates are the **union** of the vector top-k and the term index (so an exact-word match competes even when its cosine is poor), scored `0.6*BM25 + 0.25*recency + 0.15*strength` (`vector` weight is `0` by default; see Embeddings), BM25 with real `df`/`avgLen` → MMR diversify → relevance floor `0.72` (empty allowed, and it is a floor on *relevance*, not on the total — an old exact match must never age out of reach) → **hard budget** (default 800 tokens) + projection into the leftover + overflow summary (ADR-0002, ADR-0012, ADR-0014). Deterministic, zero extra LLM call.
 - **Hard Budget**: Every `search` returns `{memories, tokensUsed, truncated, summary}`. UI shows `420/800` bar.
 - **Explainable recall** (R1): `?explain=1` (or `--explain`) returns where each score came from — `bm25 +0.37 · recency +0.24 · strength +0.12 = 0.737`. Off by default, because four extra numbers per hit is real payload on a response whose point is a token budget. Everyone returns results; this returns *why*.
-- **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95) and its clock resets, so decay reads age as time-since-last-use. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
+- **Retrieval reinforcement** (R2): a memory that keeps getting retrieved gets stronger (`strength +0.02`, capped 0.95), its clock resets, and its `use_count` ticks up — so decay reads age as time-since-last-use and staleness as a *hotness* of count against age, not a used-once-never-again flag. `importance` stays the judge's write-time number; `strength` is what use has proven. No model call, no cost, and the store gets better the more it is used.
 - **Project memory** (ADR-0020/0021/0022): every write carries a `project` (resolved from the git root, or `MEMORY_PROJECT`) and a `kind` — `decision`, `convention`, `gotcha` are *durable* and decay never archives them, `task` lives a week, `note` a month. `memory_brief` / `ai-memory brief` prints the whole project's standing memory in a fixed order (conventions → decisions → gotchas → open → recent) inside 600 tokens, without a query and without an LLM call. Projects are managed on the same dimension — `ai-memory project list | init | rename | forget` ([ADR-0042](docs/adr/0042-project-management-rides-the-dimension.md)).
 - **Knowledge pages** (ADR-0023): markdown in `vault/` is indexed section by section — the file stays the truth, one row per heading (`knowledge sync` is idempotent: unchanged files write and embed nothing), and `[[links]]` are stored beside the rows as `knowledge_links` with dangling targets kept as null. `memory_knowledge`, `/knowledge` and `ai-memory knowledge` read the index; `neighbors` walks links explicitly, never implicitly.
 - **Console** (`ui/`, built to `dist/src/ui-next`, served at `/`): the one browser UI over the API below — Recall, Memories, Sessions, Graph, Stats — in two themes (dark default, warm-white light). The old inspector is gone.
 - **Vault graph** (`/graph.html`): Obsidian-style node graph over `vault/` — any markdown you point `VAULT_DIR` at. Edges come from `[[wikilinks]]` in the body plus the frontmatter `links:` that ingest writes — nothing is inferred, so the graph never lies about intent. Click a node for the local graph (depth 1-3), filter with `tag:x` / `path:x` / substring, colour by folder, drag nodes; positions persist to `vault/.positions.json`. Dangling and ambiguous links render as hollow nodes — hiding them would hide the maintenance debt.
 - **CLI** (`ai-memory`): every subcommand works non-interactively, because hooks call it. Uses the daemon when one answers, otherwise opens the store in-process.
 - **MCP server** (`src/mcp/tools.ts`): `memory_*` tools, every one accepting an explicit `scope` (`memory_knowledge` adds the vault index).
+- **Codebase memory** (ADR-0050): the repository's code indexed into the same store — files, symbols (functions, classes, methods, types), imports and call references, parsed by a zero-dependency structural scanner. Six languages behind one grammar registry: **TypeScript/JavaScript, Go, Java, C#, Rust, Kotlin** — each row carries the `language` that wrote it, so a mixed-repo index stays auditable; each language's own module system does the import resolution (go.mod prefixes, Java/Kotlin packages-to-directories, Rust `crate::`/`super::` paths, tsconfig `paths` aliases). `codebase_index` is incremental by content hash and idempotent (1,121 mixed-language files re-index in ~2 s); `codebase_search` ranks exact > prefix > substring deterministically under the hard token budget; `codebase_symbol` shows importers, callers and callees, every edge labelled with its evidence (`import` / `re-export` / `local` / `alias` are exact, `name-match` is the heuristic the graph admits to). `ai-memory codebase index | search | symbol | forget` runs the same paths. Python and the remaining graph-quality phases are planned in [docs/roadmap-codebase-memory.md](docs/roadmap-codebase-memory.md).
+- **Local boundary** (ADR-0049): the daemon serves one principal — a key file in the data dir, its token required on every read/write route (`x-ai-memory-principal`), and the namespace user segment owned server-side. Another OS account gets 401/403 instead of a partition it names; a second account runs its own store and port.
 - **Wire it in** ([docs/integrations.md](docs/integrations.md)): one command for the agents it knows, and `agent add` for any other MCP client — no code.
 - **Zero runtime dependencies.** `node:http`, `node:sqlite`, `node:crypto`. Dev-only: tsx, typescript, vitest.
 
@@ -31,7 +45,7 @@ the packed tarball on a clean Ubuntu runner and exercises the CLI, the daemon an
 console there. **macOS is untested** — reports welcome.
 
 ```bash
-npm i -g open-memory    # the package; the command is still `ai-memory`
+npm i -g @franklinww/open-memory    # the package; the command is still `ai-memory`
 ai-memory db info       # where the store lives, and why
 ai-memory save "user prefers dark mode" --type semantic
 ai-memory search "dark mode" --explain
@@ -42,6 +56,25 @@ Then hand it to your agent — one command, dry run until `--write`:
 ```bash
 ai-memory agent link --write   # register with every coding agent detected on this machine
 ai-memory agent doctor         # what it wrote, and whether it can work
+```
+
+Don't feel like typing it? **Copy this whole block and paste it into your agent** — it will
+install, wire itself in, and prove it works:
+
+```text
+Set up Open Memory (local-first agent memory) on this machine for me:
+
+1. Install it globally: `npm i -g @franklinww/open-memory` (the command is `ai-memory`; needs Node 22+).
+2. Wire it into every coding agent it detects, then verify what it wrote:
+   - `ai-memory agent link --write`
+   - `ai-memory agent doctor`
+3. Prove it works end to end:
+   - `ai-memory save "user prefers dark mode" --type semantic`
+   - `ai-memory search "dark mode" --explain`
+
+It writes to a local SQLite file at ~/.ai-memory/memory.db — no Docker, and the default embedder
+needs no API key. If `ai-memory` is already on PATH, skip step 1. Finish by showing me the output
+of `ai-memory agent doctor` and the search.
 ```
 
 Claude Code, Codex, DeepSeek Harness and pi are known by name. Any other MCP client is
@@ -76,7 +109,7 @@ Installed from npm there is no clone to `npm start` in; the server is the same e
 run directly:
 
 ```bash
-node node_modules/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB_PATH
+node node_modules/@franklinww/open-memory/dist/src/api/server.js   # PORT / HOST / MEMORY_DB_PATH
 ```
 
 `PORT` is read by the server **and** by the CLI's daemon probe, so a process that answers
@@ -131,11 +164,12 @@ says which page and which part of it answered.
 | Method | Path | Body / Query |
 |---|---|---|
 | `POST` | `/memories` | `{namespace, type, text, project?, kind?, importance?, tags?, source?}` |
-| `POST` | `/memories/bulk` | `{items: [...], reconcile?}` — up to 5000 rows, one transaction and one embed batch; a bad item fails the request with its `index` |
+| `POST` | `/memories/bulk` | `{items: [...], reconcile?, raw?}` — up to 5000 rows, one transaction and one embed batch; a bad item fails the request with its `index`, and rows the bulk gate rejects or folds skip per row (`skipped`, `skipDetails[]` with input `index` + reason). `raw: true` excuses every reject except `secret` and empty text, and skips demotion — never the duplicate fold |
 | `GET` | `/memories?namespace=&type=&q=&includeDeleted=` | list |
 | `GET` | `/memories/:id` | |
+| `GET` | `/memories/:id?drill=1` | the whole supersede chain + the row's write history: `{memory, ancestors, successors, events}` (nearest ancestor first, breadth-first successors, `memory_events` rows oldest first); a purged id answers `{memory: null, events}` — the history outlives the row ([ADR-0045](docs/adr/0045-write-history-and-two-clocks.md)) |
 | `DELETE` | `/memories/:id` | soft-delete |
-| `POST` | `/memories/:id/supersede` | `{namespace,type,text,...}` creates new + soft-deletes old via `supersedesId` |
+| `POST` | `/memories/:id/supersede` | `{namespace,type,text,...}` creates new + soft-deletes old via `supersedesId`; one transaction, and the old row's `invalid_at` + the supersede event (reason, judge) are written with it ([ADR-0045](docs/adr/0045-write-history-and-two-clocks.md)) |
 | `POST` | `/memories/search` | `{query, namespace, namespaces?, k?, budgetTokens?, threshold?, type?, kind?, project?, explain?}` — `namespaces` is comma-separated and overrides `namespace`; it is how the CLI reads its own partition plus the legacy one. An empty result carries `diagnostics` (`{threshold, partitions:[{namespace,total}], nearMisses, outside?}`) — the key is **absent** when there are matches, so a non-empty response costs no tokens. `outside` lists the same user's partitions this read did not cover but which still hold matching rows, so a miss can say "the answer is one layer over" instead of "nothing was stored" ([ADR-0037](docs/adr/0037-explain-an-empty-search.md), [ADR-0039](docs/adr/0039-an-empty-result-reports-the-partitions-it-did-not-read.md)) |
 | `GET`/`POST` | `/brief` | `{project?, namespaces?, budgetTokens?, sinceDays?}` → `{project, text, tokensUsed, budgetTokens, truncated, sections, counts}` — the project's standing memory with no query (ADR-0022) |
 | `GET` | `/projects` | `{projects: [{project, rows, byKind, lastActivityAt}]}` — every project, live rows only (`(unscoped)` rides along as `project: null`) |
@@ -143,7 +177,7 @@ says which page and which part of it answered.
 | `POST` | `/projects/:slug/rename` | `{to, merge?}` — moves every row (tombstones included) to the new slug; an occupied target is refused until `merge: true` |
 | `DELETE` | `/projects/:slug?mode=` | `mode=delete` (default) soft-deletes the project's live rows, restorable; `mode=detach` sets `project = null`; unknown slug → 404 |
 | `POST` | `/extract` | `{text, namespace, referenceDate?}` — heuristic (no LLM) or LLM if `ENABLE_EXTRACTOR=true` + `OPENAI_API_KEY`; the shape gate drops tables, bullets, headings, prompt XML and terminator-less slices |
-| `POST` | `/decay` | `{archived, pruned, affected}` — archive-first: never-retrieved rows older than 30d with `importance < 0.6` become `archived`. Deleting only happens in the opt-in hard pass |
+| `POST` | `/decay` | `{archived, pruned, affected}` — archive-first: rows past their kind's window whose hotness `log1p(uses)·exp(−ln2·age/window)` fell under the keep line, with `importance < 0.6`, become `archived`. Deleting only happens in the opt-in hard pass, and the daemon's own `MEMORY_MAINTAIN_HOURS` sweep cannot reach it — the scheduler's entry takes no hard flag ([ADR-0016](docs/adr/0016-archive-first-decay.md)) |
 | `POST` | `/compact` | `{bytesBefore, bytesAfter}` — VACUUM and report the file footprint (db + WAL + shm); `501` when the store has no file to rewrite |
 | `GET` | `/graph` | wiki node graph: `{nodes, edges}` |
 | `GET` | `/knowledge?namespace=` | pages: `{pages, dangling, edges}` (ADR-0023) |
@@ -153,7 +187,14 @@ says which page and which part of it answered.
 | `GET`/`POST` | `/positions` | read / write `{slug, x, y}` for the graph canvas |
 | `GET` | `/health` | |
 | `GET` | `/stats?namespace=` | |
+| `GET` | `/drops?text=&namespace=&junk=&limit=` | why writes were refused: `{drops: [{hash, preview, junk, advice, origin, path, namespace, project, at, count, firstAt}]}` — one row per distinct refused note, newest wins, secrets redacted in the preview (ADR-0040 amendment) |
 | `PATCH` | `/memories/:id` | `{status?, pin?}` governance |
+
+Every route above except `/health` and the static console requires the daemon's principal
+token in the `x-ai-memory-principal` header — tokenless answers **401**, a wrong token
+**403**, and a `namespace` naming a user segment the daemon's principal does not own
+**403**. The CLI, the MCP server and the hooks attach it automatically; see
+[The principal and the local boundary](#the-principal-and-the-local-boundary).
 
 ### Agent wiring (tool-first, ADR-0003)
 
@@ -161,7 +202,7 @@ Wiring an agent that already exists is a CLI command, not this snippet — see
 [docs/integrations.md](docs/integrations.md). This section is for an agent you are writing.
 
 ```ts
-import { MemoryService, createMemoryTool, autoInject } from "open-memory";
+import { MemoryService, createMemoryTool, autoInject } from "@franklinww/open-memory";
 
 const svc = new MemoryService();
 await svc.init();
@@ -175,13 +216,63 @@ const { injected } = await autoInject(svc, messages, { namespace: "agent1:user42
 // injected is string to prepend to prompt, or null if no memories above threshold
 ```
 
-HTTP alternative (any language):
+HTTP alternative (any language) — the daemon serves one principal, so carry its token
+(read it from the key file shown by `ai-memory principal status`):
 
 ```bash
+TOKEN=$(node -e "console.log(JSON.parse(require('fs').readFileSync(require('os').homedir()+'/.ai-memory/principal.key','utf8')).token)")
 curl -X POST http://127.0.0.1:3000/memories/search \
   -H "Content-Type: application/json" \
+  -H "x-ai-memory-principal: $TOKEN" \
   -d '{"query":"where does user live?","namespace":"default:default","k":5,"budgetTokens":800,"threshold":0.72}'
 ```
+
+## The principal and the local boundary
+
+The daemon serves **exactly one principal**: the OS account that owns its data directory.
+On first start it writes `principal.key` into the memory home — a 256-bit token plus the
+namespace user segment this principal owns — and from then on every read/write route
+demands that token in the `x-ai-memory-principal` header ([ADR-0049](docs/adr/0049-principal-and-the-local-boundary.md)).
+
+What the token defends, and only what it defends: a process under **another OS account**
+can reach the loopback port but cannot read this account's key file, so it can no longer
+read another user's partitions by naming them — tokenless is **401**, a foreign token is
+**403**. The user segment itself is server-owned: scope you leave unpinned (`agent`/`scope`
+writes, `agent`/`scope`/`all` reads, the project marker) resolves with the principal's
+segment no matter what your environment says, and an explicit `namespace` naming someone
+else's segment is refused with 403 rather than honored or quietly relabeled. The legacy
+`default:default` partition stays open to the principal — that is where every pre-existing
+row lives, **no namespace in the store is rewritten and no migration runs**, so existing
+rows, the seed and the CLI behave exactly as before for the segments they were written
+under.
+
+Two honest limits, stated because a boundary that oversells is worse than none: a process
+under the **same** OS account is not defended — it can read the key file and open the
+SQLite file directly, so no token stops it — and there is **no at-rest encryption**; the
+store is plaintext SQLite. That is the same reservation the research review recorded, and
+it is drawn as a boundary, not claimed as a solution.
+
+- **The CLI, the MCP server and `ai-memory inject --server <url>`** read the key file and
+  attach the header themselves; a missing file degrades to the daemon's 401, which names
+  the path. **The console authenticates like every other client**: the daemon serves the
+  token to nobody — an earlier build injected it into the served HTML, and one
+  unauthenticated `GET /graph.html` was enough to mint the header, so it was removed —
+  and on a 401 the console shows a gate where you paste the token once (`ai-memory
+  principal reveal` prints it); the browser keeps it in localStorage for this origin,
+  and the vault graph page shares it. Nothing the daemon serves to an unauthenticated
+  reader contains the token.
+- **A second OS account** gets its own store file (the default already resolves under the
+  account's home) and its own `PORT`. There is no multi-principal daemon on purpose: a
+  daemon holding one secret cannot defend what it shares. Cross-principal sharing is an
+  explicit export, never a namespace.
+- **`ai-memory principal status`** shows the binding and whether the store's partitions
+  agree; **`ai-memory principal recover --from-db`** is the lost-key / machine-move path —
+  it writes a **new** token (the old one is never reconstructed) and re-derives the user
+  segment from the partitions the store actually holds, one-way. The running daemon still
+  holds the previous binding until restarted; the restart still walks, because
+  `/admin/shutdown` accepts the key file's *current* token even while the daemon holds an
+  older one — the one repair lever the gate keeps, and only the owning account could have
+  read that file. **`principal reveal`** prints the raw token for the console's gate.
 
 ### Retrieval floors
 
@@ -196,14 +287,22 @@ This is a deliberate divergence, not drift. The agent is answering questions it 
 
 ## Write reconcile
 
-Every save reconciles before it inserts. The five nearest memories in the same partition
-and type — the query the old exact-text dedup already ran — decide one of three things:
+Every save reconciles before it inserts. Since P5 the candidate window is a three-arm
+union, deduped and capped at ten: the five nearest memories of the same partition **and
+type** — the query the old exact-text dedup already ran — plus the rows sharing the
+write's `entity:` facets (P4's `facetCandidates`, any type), plus the same partition with
+the type wall down, so a contradiction filed as an event can reach a semantic write.
+Reaching is still not admitting: every neighbour clears the same floors as before, and a
+facet-sourced row carries `vectorScore = 0`, so it earns its way in on its own words. The
+guards below outrank everything the window adds.
 
 | Outcome | When | What happens |
 |---|---|---|
 | `reinforce` | the same claim, reworded (punctuation and case do not matter; a reordering does) | the existing row gains strength and its use clock resets; nothing is inserted |
 | `supersede` | the new memory adds detail, contradicts the old one, or the judge says so | the new row is stored, the old one is soft-deleted and linked by `supersedes_id`, and the old claim is appended as `(previously: …)` when it carried something the new one does not |
-| `insert` | nothing near enough, or the neighbour is pinned, `episodic`, or written by `extractor` | a new row, exactly like before |
+| `insert` (`conflict-unjudged`) | the judge is **absent** — not configured or no key — and the surviving pair names one `entity:` subject while stating different claims | a new row, exactly like before — but both rows now carry a `conflict:<entity>` facet, and `/stats?full=1` counts them (`pendingConflicts`) with a **pending conflicts** panel in the console Stats view. The marker moves through the P4-maintained paths only: the new row's tags through the insert, the existing row's through `updateMeta`'s tags patch, so its facet postings follow the column |
+| `insert` (`judge-failed`) | the judge was **asked and failed** — the wire returned nothing | a new row tagged `judged:failed`, and the failure counted on stderr; never a conflict marker — a failed call admits nothing about the pair ([ADR-0041 amendment](docs/adr/0041-the-write-gates-judgement-call-goes-to-the-model.md)) |
+| `insert` | nothing near enough, or the neighbour is pinned, `episodic`, or written by `extractor` — those four guards answer before the judge or the marker ever could | a new row, exactly like before |
 
 `memory_remember` says which happened: `stored`, `already known`, or
 `superseded <oldId>: <newId>`. `MEMORY_RECONCILE=off` restores the old exact-text dedup
@@ -213,7 +312,14 @@ Knobs, all env-only and read per write: `MEMORY_RECONCILE_LEX` (`0.80`, token ov
 `MEMORY_RECONCILE_COS` (`0.85`, only when a real embedder is configured — the hash
 embedder returns ~0.9 cosine to everything), `MEMORY_RECONCILE_MARGIN` (`0.15`, how far
 the top judgement must lead the runner-up before it may delete a row). Tags written by
-this path carry facets: `entity:`, `topic:`, `path:`, inherited across a supersede.
+this path carry facets: `entity:`, `topic:`, `path:` — and, since P5, `conflict:`,
+minted only by the marker, never derived from text. All of them are indexed —
+`memory_facets`, a posting list committed with the row and kept equal to the row's own
+facet tags by construction ([ADR-0046](docs/adr/0046-facet-index-and-third-candidate-arm.md)) —
+and `conflict:*` facets are what the pending-conflict count, the console panel and the
+`facet:` filter on `list`/`vectorSearch`/`lexicalCandidates` read. A judge that answered
+but cleared no label (`MEMORY_RECONCILE_MARGIN` held it back) stores unjudged and
+untagged: cautious is not broken ([ADR-0047](docs/adr/0047-conflict-window-and-pending-conflicts.md)).
 
 No benchmark claim is made for this stage: it changes what gets stored, not how multi-hop
 is assembled. The read-time stage is a separate change (v0.4, [ADR-0012](docs/adr/0012-candidate-union-over-term-index.md))
@@ -223,7 +329,7 @@ See [ADR-0011](docs/adr/0011-write-time-reconcile-schema-free-facets.md).
 ## Smart Search details
 
 - **Stage 1**: candidates are the union of `vectorSearch` over the namespace partition (over-fetch `max(20, k*4)`) and `lexicalCandidates` from the term index — so a row whose exact words match competes even when the embedder ranks it outside the vector window. Score is `0.6*BM25 + 0.25*recency + 0.15*strength` (plus vector when a real embedder is configured), BM25 uses real `df`/`avgLen` over the candidate set, then the relevance gate and `score >= threshold` filter (allows empty → prevents context pollution). A row found only by words enters at `vectorScore = 0` and still has to clear both gates.
-- **Stage 2**: MMR `lambda=0.6` diversify, sort, then `budgetEnforce` — skips rows that do not fit (it no longer stops at the first big one), then fills what is left by projecting one block to its most query-relevant lines *only when no later block would have fit whole* (the projection can never eat room a whole row needed). Rows that still do not fit become the extractive overflow summary. The result is then capped at `k`; `truncated` reports either cap. `MEMORY_ASSEMBLE=off` returns whole rows only ([ADR-0014](docs/adr/0014-project-into-leftover-budget.md)).
+- **Stage 2**: MMR `lambda=0.6` diversify, sort, then `budgetEnforce` — skips rows that do not fit (it no longer stops at the first big one), then fills what is left by projecting one block to its most query-relevant lines *only when no later block would have fit whole* (the projection can never eat room a whole row needed). Rows that still do not fit become the extractive overflow summary. The result is then capped at `k`; `truncated` reports either cap. `MEMORY_ASSEMBLE=off` returns whole rows only ([ADR-0014](docs/adr/0014-project-into-leftover-budget.md)). A hit that replaced something carries one extra line — `前身(YYYY-MM-DD): ≤80 chars of the predecessor` — inside whatever budget is still unspent, and skipped when the row already carries that predecessor inline as `(previously: …)`: one copy of a retired claim per answer, never two. Never a pool row, never a `k` slot, the full chain only behind the explicit `?drill=1` / `--history` walk ([ADR-0045](docs/adr/0045-write-history-and-two-clocks.md); adding reachable rows to the pool is the ADR-0028 PRF trade that cost evidence-any 76% → 72%).
 - **Tokens**: heuristic `cjkChars + latinChars/4` (CJK counts one token per character — `len/4` under-counted Chinese by 2-3x and budgets overflowed silently); swap to `js-tiktoken` by installing it (auto-detected).
 
 ## Embeddings
@@ -240,11 +346,13 @@ EMBEDDING_PROVIDER=nim     NVIDIA_API_KEY=nvapi-...         # nvidia/nemotron-3-
 EMBEDDING_DIM=1024                                          # for any other model
 ```
 
+**A fourth preset, for local endpoints (`openai-local`, ADR-0048).** Ollama, LM Studio and llama.cpp speak the same `/embeddings` wire, and they authenticate by being on localhost — so `EMBEDDING_PROVIDER=openai-local` is the hosted `openai` preset with the key made optional: an empty `OPENAI_API_KEY` (or none at all) sends **no `Authorization` header at all**, never `Bearer ""`. What it does not do is guess: a local endpoint's address, model id and width are facts about your install, so all three of `OPENAI_BASE_URL`, `OPENAI_EMBED_MODEL` and `EMBEDDING_DIM` are required before the provider resolves, and the factory names every missing one (e.g. `OPENAI_BASE_URL=http://localhost:11434/v1` for Ollama). The switch is still ADR-0009's — settings + restart + `reembed` — and the console's Embeddings card offers it as a preset row that is never disabled for a missing key, which is the whole difference between it and the hosted row beside it.
+
 NIM gets the `input_type` (`query` on search, `passage` on save) and `truncate` body fields that E5/Nemotron score on; OpenAI rejects those, so they are sent only for NIM.
 
 **A third path, from the console.** `Embeddings` in the Stats view picks a provider and writes `~/.ai-memory/settings.json`; `Settings` writes the provider keys there too, along with the judge's key and knobs and the extractor's. The file is flat — a setting key is an environment variable name — and only the console's own lists are accepted, so a name the console does not own is refused by name, never written. Precedence is **real environment > that file > built-in default**: an `EMBEDDING_PROVIDER` exported in your shell — or in `.env`, which is a real env value — beats the file, and the card says which of the three is in play (ADR-0010).
 
-**What a save costs depends on the key.** The embedding settings (`EMBEDDING_PROVIDER`, the dim, the model, the base URL) take effect on the **next start** — the running process keeps its embedder (ADR-0009). A key, `MEMORY_JEV` / `MEMORY_JEV_MIN` / `JEV_ENDPOINT` / `JEV_MODEL`, or `ENABLE_EXTRACTOR` / `EXTRACTOR_MODEL` is **live on the next call**: those are read per use, not frozen at boot. The file is created `0600`, which is a POSIX mode — on Windows it is inert and the protection is your profile ACL. A saved key is never sent back in clear: the console shows `…` and its last four characters, and no response or error body carries more.
+**What a save costs depends on the key.** The embedding settings (`EMBEDDING_PROVIDER`, the dim, the model, the base URL) take effect on the **next start** — the running process keeps its embedder (ADR-0009). A key, `MEMORY_JEV` / `MEMORY_JEV_MIN` / `JEV_ENDPOINT` / `JEV_MODEL`, or `ENABLE_EXTRACTOR` / `EXTRACTOR_MODEL` is **live on the next call**: those are read per use, not frozen at boot. The file is created with POSIX mode `0600` through an explicit `chmod` (`writeFile`'s own mode would be masked by the umask). That mode does not exist on Windows: the platform has no permission bits for Node to set, and what actually scopes the file is the ACL it inherits from your user profile directory — the same inheritance `%APPDATA%` relies on — so on Windows the protection is account-scoped ACL, not a mode. A saved key is never sent back in clear: the console shows `…` and its last four characters, and no response or error body carries more.
 
 **If a value already sits in `.env`, the console cannot save over it.** The environment wins the merge, so the save is refused and names where the live value is; `adopt .env` is the way out. Adopt copies the values into `settings.json` first, then comments their `.env` lines out — never deletes them, never reorders the file — with `.env.bak` written once beforehand, so the pre-edit copy survives every later adopt. A line whose value cannot be read back exactly (a backslash the loader would expand, unusual quoting) is left in `.env` untouched and reported instead, because commenting it out would make a wrong `settings.json` the only copy.
 
@@ -290,6 +398,8 @@ Score = `0.6*bm25 + 0.25*recency + 0.15*strength` (`vector` weight 0 by default 
 **Relevance is ordered by coverage.** The score above decides *whether* a row is relevant; it cannot always decide *which* of two relevant rows was asked for. In Chinese the filler shares the question's subject matter rather than its function words — nine rows in a partition say 「项目 <project> 的约定」, so those words look important to BM25 and the row holding the marker scores 0.008 above the noise. So each candidate also gets a `coverage` — the share of the query's own words it holds, counting a matched two-character word once — and that value leads the sort, feeds the relevance gate (a row holding three quarters of the words is relevant whatever its score), and is the relevance term MMR and the token budget see ([ADR-0027](docs/adr/0027-cjk-relevance-by-coverage.md)). On the real-time bench this took Chinese recall@5 from 0.65 to 1.00 with the English shapes unchanged.
 
 **Coverage counts matched words, but weights them by rarity (ADR-0028).** For a corpus that is one ongoing conversation, coverage-as-a-count is backwards the other way: "What is Caroline's identity?" asks `{caroline, identity}`, and `caroline` sits in almost every chunk while the row that answers it says "transgender woman" — so half the store scores the same coverage as the answer and the ordering falls back on age and use. So the *sort* uses a df-weighted coverage (each asked word worth `log(1 + maxDf/df)` from `term_df`), while the *gate* still reads the unweighted share — a row holding one rare word would reach a weighted 1.0, and three-quarters-of-what-was-asked is the meaning the gate must keep. A second pass that expands on the top hits' shared terms (pseudo-relevance feedback) was built for the multi-hop remainder and **measured net-negative** — the merged rows crowd a fixed 800-token budget single-hop rows need (evidence-any 76 → 72%) — so it ships behind `MEMORY_PRF=on`, off by default, like the int8 shortlist. Measured on the model-free evidence ruler over all 152 LoCoMo questions, the weighted ranking plus a 1000-char chunk took evidence-all 57 → 66% and the honest current-tree LoCoMo accuracy 50.7 → 69.1% (same pinned reader).
+
+**A third candidate arm joins rows by their facets — measured null, off by default.** Every write already carries facet tags (`entity:` / `topic:` / `path:`, ADR-0011); P4 turned them into a real index — `memory_facets(facet, memory_id, namespace)`, a posting list maintained in the same transaction as the term postings on every path that can move facets (insert, bulk insert, supersede, a tags relabel, a rewrite), with a startup anti-join that self-heals rows missing postings (chunked past the zero-facet rows that would otherwise shadow an injured row forever) and an invariant test pinning *facet postings == the row's facet tags* ([ADR-0046](docs/adr/0046-facet-index-and-third-candidate-arm.md)). The store capability `facetCandidates` answers "same entity, this partition" whether or not any search flag is on — that seam is what P5's conflict window consumes. Retrieval itself reads it only behind `MEMORY_LINKS=on` (default **off**): the query goes through the same `deriveFacets`, the joined rows enter the pool with `vectorScore = 0` and must clear the same relevance gate as everyone else (no free channel), and the `entity` term in `explain` defaults to weight 0 — visible, never felt. Measured on the evidence ruler, one variable: evALL/evANY **66/77 both ways**, cat1 multi-hop unchanged at 13/56 — 143 of 152 LoCoMo questions derive zero facets (the derivation is deliberately narrow, ADR-0011), and of the 102 rows the arm did propose, 72 were already in the pool and 29 were gate-dropped; on the controlled comparison — one store, one ingest, only the flag flipped — **no question's final five blocks change** (the two fresh-ingest runs' per-question diffs are tie noise that A/B cannot isolate). A null is not a negative: the flag stays, the index stays (P5 needs the store half), and the knob is there for a corpus whose questions name things the way the derivation expects. [ADR-0046](docs/adr/0046-facet-index-and-third-candidate-arm.md)
 
 **An empty result explains itself.** "No memories matched" was one sentence for three different situations — the partition is empty, the caller is looking at the wrong partition, and the rows are there but the wording missed the gate — and the only move it teaches an agent is to reword and retry, which cannot work for the first two. One measured session spent 14 tool calls on a single question and the first 6 were reworded retries. An empty `SearchResult` now carries `diagnostics`: the threshold, the row count per searched partition, and the nearest misses that were rejected. The rendering lives in one place (`renderEmptySearch`), so the CLI, the MCP server (both the in-process and the daemon path) and the pi extension print the same explanation, and the last line is the one that ends the loop — `nothing was stored for this scope`, `rows exist but none shared a term with this query: different words, not a lower threshold`, or `rows exist but none matched: retry with threshold 0.52`. Three tails because there are three different next moves; the middle one exists because a query sharing no term with any of 363 rows still used to be told to lower a threshold that never ran. The first line stays `no memories matched` so callers that grep for it keep working, and a daemon built before this change still answers without the key, in which case every renderer falls back to the old one-liner ([ADR-0037](docs/adr/0037-explain-an-empty-search.md)).
 
@@ -423,6 +533,8 @@ keep 1.0 -> importance 0.90      keep 0.5 -> importance 0.65      keep 0.0 -> im
 
 A rejection is a verdict with one next move, never a bare no: the API answers `422 {error, curation}`, `memory_remember` returns `not stored (conversational): a correction without a replacement fact … — store the fact itself`, the CLI prints the advice and exits 1. `MEMORY_CURATE=off` restores the un-gated store per process. Measured by replaying all 515 rows of the audited store through the verdict: **68 rejected (13.2%), zero kills on the clean fixture set** ([ADR-0040](docs/adr/0040-writes-are-curated.md)).
 
+A drop leaves a trace. The verdict used to exist only in the response, so a note the filter refused was unrecoverable — the feedback "can you see why a note was dropped, or does the filter just leave no trace?" measured that gap, and it is real: `memory_events` (ADR-0045) keys every row by a memory id, and a write refused before the insert never had one. Since 2026-11-09 the refusal is recorded in its own `curation_drops` ledger *before* the throw — class, advice, path (`save` or `bulk` — an extractor refusal rides `save`, told apart by `origin`), origin, namespace, project, timestamp — with any secret-shaped span replaced by `[redacted]`, because the ledger describes the refusal instead of archiving it. Reads: `ai-memory drops`, `GET /drops`, `memory_drops`; the CLI's refusal line now names the command. Repeats of the same note collapse to one row carrying `count` and `firstAt`, which is exactly the shape the feedback asked for — a note that looked useless at 14:02 reads `×2` the moment the same error recurs, and the class in the ledger is what you would have searched for. Cap 1000 rows, newest wins. `MEMORY_CURATE=off` logs nothing: nothing is refused.
+
 **5. Write gate** (`jevWriteGate`, [ADR-0041](docs/adr/0041-the-write-gates-judgement-call-goes-to-the-model.md)) — the second LLM gate: the judgement call no regex settles, asked of the model for every write that survives curation. Curation's structural rules pass a config dump with no pipes and no colons; this gate asks two questions in one request — `keep` (the extractor's own durability question, now aimed at writes the extractor never saw) and `scaffold` (is this the agent's own instruction scaffolding or a session narration rather than knowledge about the world?). Below the floor (`MEMORY_WRITE_GATE_MIN`, default 0.5) an extractor-sourced write is refused as `low-value`; an explicit write is demoted, never refused — unless the caller named a kind or an importance, in which case the row stores as asked with a `judged:write-gate` tag, because the caller's own judgement wins. A clean verdict prices the derived importance (`importanceFor(keep)`, the extractor judge's mapping). Same endpoint and key as the jev judge, `MEMORY_WRITE_GATE=false` turns it off alone, and fail-open holds: no answer stores the write unjudged. Rows the extractor's jev already priced (`judged:jev`) never ask twice.
 
 Below `MEMORY_JEV_MIN` (default 0.5) the sentence is dropped. **Fail-open**: no key, a 401, or the API being down means the memory is stored *unjudged* rather than lost. A store that silently stops recording because a judge API is down is worse than one that occasionally keeps a mediocre fact.
@@ -448,12 +560,14 @@ Judge confidence outranks the regex importance: Jev read the whole sentence, the
 
 ## Lifecycle
 
-A store that only grows is not a memory, it is a log. Two passes share the same age column (`COALESCE(lastUsedAt, createdAt)`) and both refuse a row that is still being used:
+A store that only grows is not a memory, it is a log. Two passes share the same age clock (`COALESCE(lastUsedAt, createdAt)`) — recalling a memory resets it — and both refuse a row that is still earning its place:
 
-- **Archive (default).** `runDecay(store)` demotes rows that were written, never retrieved, are older than 30 days and whose judge-rated `importance` is under `0.6` to `status = archived`. The age window follows the row's *kind*: a `task` gets 7 days, a `note` 30, a `fact` 90, and the durable kinds (`decision`, `convention`, `gotcha`) are never archived at all — only supersede or an explicit forget removes them ([ADR-0021](docs/adr/0021-kind-decides-retention.md)). Archived rows are hidden from search but still readable through `includeArchived`, so this is reversible, and re-running it is a no-op. On a copy of a real 299-row store it archived 2 rows and pruned nothing — the two were a stale `current task:` note and a procedure for a UI that no longer exists.
+- **Archive (default).** `runDecay(store)` demotes rows that have gone *cold* to `status = archived`: past their kind's window (`task` 7 days, `note` 30, `fact` 90 — the window doubles as the decay half-life, no new global constant), with judge-rated `importance` under `0.6`, and a hotness `log1p(use_count) × exp(−ln2 · age / window)` below the keep line of one use one window ago. The counter is what replaced the old binary flag: `lastUsedAt !== null` used to mean *immortal*, which made one retrieval forever ago indistinguishable from one yesterday's-worth of uses; `reinforce` now ticks `use_count` on both stores. The durable kinds (`decision`, `convention`, `gotcha`) are still never archived at all — only supersede or an explicit forget removes them ([ADR-0021](docs/adr/0021-kind-decides-retention.md)), and the `importance < 0.6` floor survives the swap: a row the judge rated highly is never demoted by the clock alone. Archived rows are hidden from search but still readable through `includeArchived`, so this is reversible, and re-running it is a no-op. The measured number belongs to the rule it was measured under: on a copy of a real 299-row store the *stricter binary rule* archived 2 rows and pruned nothing in October 2026 — a stale `current task:` note and a procedure for a UI that no longer exists ([ADR-0016](docs/adr/0016-archive-first-decay.md)). The hotness rule's set is a superset — every never-used row it demoted, judged the same way at the same window, plus the rows that were retrieved once and forgotten since — and the new rule's number on that store copy has not been re-measured yet.
 - **Hard prune (opt-in).** `runDecay(store, { hard: true })` keeps the historical windows (episodic > 90d, working > 7d) and soft-deletes only when **both** `importance` and `strength` are at or below `0.5`. The floor moved 0.3 → 0.5 because the old rule could never fire: strength starts at importance, bottoms out at 0.4 in the real store, and only grows.
+- **Automatic maintenance (`MEMORY_MAINTAIN_HOURS`, default 24, `0` off).** The daemon — the server main entry, which is what `ai-memory daemon` runs — sweeps the reversible pass on that interval. Its entry point `runScheduledDecay(store)` takes no options bag at all, so the hard pass is unreachable from the scheduler *by signature*, not by convention: an unattended run can only ever archive. `last_maintenance_at` and the pass's result live in a small `store_meta` KV, so opening an overdue store (a daemon that was down for a week) fires a catch-up pass in the background — no request waits on a sweep — and every pass logs `ai-memory maintenance: archived N cold rows` to stderr ([ADR-0016 amendment](docs/adr/0016-archive-first-decay.md)). Since P8 the same pass carries a second step: the bucket-summary refresh (`ai-memory buckets: refreshed N, skipped M, dropped K` in the same log), which needs no embedder and no network — its own ≥10% threshold decides the work, so a tick where nothing drifted costs nothing ([ADR-0048](docs/adr/0048-bucket-summaries-and-the-local-embedder-preset.md)).
+- **Retroactive curation (`ai-memory triage`, diff first).** Decay handles rows that went cold; it does nothing for the junk admitted before the gates existed — 89% of the audited store had never been retrieved, and ADR-0040 originally refused to rewrite the stock. That decision was reversed on 2026-11-08 ([ADR-0040 amendment](docs/adr/0040-writes-are-curated.md)): `ai-memory triage` sweeps the whole store — every partition, archived rows and tombstones included — and runs the same zero-network `curate` verdict per row. The default run **writes nothing**: it reports `would archive N / would demote N / merge candidates M` with ids, classes and reasons, and `--apply` is the only mode that touches rows. Applying archives the hard junk classes by a status flip (never a hard delete — the row stays readable and restorable) and sinks the weak classes (`progress`, self-narration) to importance 0.35, the write-time demotion floor. The contracts outrank the regexes: durable kinds (`decision`/`convention`/`gotcha`), pinned rows, drafts, knowledge rows and tombstones are never touched; live rows sharing an `entity:*` facet and the same normalized text are **listed** as merge candidates and never merged — picking a survivor is reconcile's guarded decision (ADR-0015). Rows carrying no `judged:*` tag are counted (`unjudged`) but not tagged — whether that becomes one is ADR-0041's pending amendment. An `--apply` writes through the daemon when one answers (`POST /triage`, the same per-process snapshot-invalidation reason as `POST /decay`); a daemon too old for the route answers 404 and the pass runs in-process, printing a restart caveat on stderr in both output modes — stdout stays the payload.
 
-`memory_stats` (and the console's Stats view) reports `archived`, `archivedRatio`, `neverRetrieved` and `neverRetrievedRatio`, and the decay preview lists each candidate with the action it would take. Before v0.4 the store had 308 of 335 rows never retrieved and a decay rule that pruned one row in its whole history ([ADR-0016](docs/adr/0016-archive-first-decay.md)).
+`memory_stats` (and the console's Stats view) reports `archived`, `archivedRatio`, `neverRetrieved` and `neverRetrievedRatio`; the decay preview lists each candidate with the action it would take and its retrieval count, and the panel says when the automatic pass last ran and what it did. Since P5 it also reports `pendingConflicts` — live rows wearing a `conflict:<entity>` facet from a write whose judge was absent, listed with their pairs in the Stats view's pending-conflicts panel ([ADR-0047](docs/adr/0047-conflict-window-and-pending-conflicts.md)). Before v0.4 the store had 308 of 335 rows never retrieved and a decay rule that pruned one row in its whole history ([ADR-0016](docs/adr/0016-archive-first-decay.md)).
 
 Seeding is isolated: `npm run seed` writes to a fresh temp directory unless `MEMORY_DB_PATH` is set explicitly, so demo fixtures can no longer land in your real store (`tests/seed-isolation.test.ts`).
 
@@ -483,7 +597,8 @@ Both dimensions are filters everywhere: `list`, `search`, `brief`, `prune`, `sta
 - `SqliteVectorStore` via `node:sqlite` (`DatabaseSync`, Node 22+). Single file `memory.db` (WAL). `InMemoryVectorStore` is used in tests.
 - For `LanceDB`/`sqlite-vec`/`Qdrant`, implement `VectorStore` interface and inject via `new MemoryService({store: myStore})`.
 - **Vectors are float32 blobs, not JSON.** A row's embedding lives in `memory_vectors(memory_id, dim, vec BLOB, norm)`; `vectorSearch` scores `(id, vec, dim, norm)` first and only fetches full rows for the survivors. `memoryFromRow` hands back `embedding: []`; `getById`/`list` attach it when someone actually needs it. Older files are migrated on open, resumably, in batches of 5000 — measured 335 rows in 51 ms, 10k rows in 1.03 s ([ADR-0017](docs/adr/0017-vector-blob-layout.md)).
-- **Batch writes:** `store.insertMany`, `service.saveMany(inputs, { reconcile })` and `POST /memories/bulk` write one transaction and one embed batch. `reconcile` defaults to off in bulk mode — a 5-neighbour search per row would make a 10k import quadratic ([ADR-0018](docs/adr/0018-batch-writes-and-purge.md)).
+- **Batch writes:** `store.insertMany`, `service.saveMany(inputs, { reconcile, raw })` and `POST /memories/bulk` write one transaction and one embed batch. `reconcile` defaults to off in bulk mode — a 5-neighbour search per row would make a 10k import quadratic ([ADR-0018](docs/adr/0018-batch-writes-and-purge.md)). The cheap gates do run here (ADR-0018 amendment, 2026-11-07), in both branches (batch and `{reconcile: true}`): curation per row — rejected lines skip with `skipDetails` instead of killing or half-committing the batch, and `secret` plus empty text are refused even under `raw` — and exact-text duplicates fold on the derived `text_hash` column within one partition (namespace, project, type), against readable live rows only: tombstoned, archived and draft rows block nothing.
+- **Write history and two clocks (ADR-0045).** Every write point — insert, reinforce, supersede, archive — commits an append-only `memory_events` row (old/new/reason/model/at, mem0's history-table shape) **in the same transaction as its write**, and nothing ever deletes one: `purgeDeleted` removes the row and not the story, so `ai-memory get <id> --history` still answers for a purged id. Two clocks ride on the row itself: `valid_at` — when the fact became true, parsed from the text's own `(at:YYYY-MM-DD)` stamp (NULL when the text names no date, backfilled once in a single atomic migration like `text_hash` before it) — and `invalid_at`, stamped by the supersede's invalidation UPDATE; a plain forget leaves it NULL because "removed" and "stopped being true" are different facts. Supersede is one transaction now: successor's insert, old row's tombstone + `invalid_at`, both history rows, then `noteChange` on both ids so the partition cache never serves the dead row (ADR-0034/0035).
 - **Space:** `prune` is a soft delete and keeps the bytes. `store.purgeDeleted({ olderThanMs })` is the opt-in hard delete, and `ai-memory db compact [--purge <days>]` (or `POST /compact`) VACUUMs the file and reports the footprint (db + WAL + shm).
 
 ### Scale, measured
@@ -516,6 +631,8 @@ Search is no longer linear in partition size, which makes the 10^5 extrapolation
 
 **The 2048-dim column was attacked and the attack was documented as a miss.** An int8 shortlist (one signed byte per dimension plus a `maxAbs` scale, ranked on those bytes, with the shortlist re-scored exactly against the float32 blob) buys **1.45×** — 181.6 → 125.5 ms at 10,000 rows — for **+25% disk**, and lands at ~1.09 s at 10^5 rows. It is therefore **off by default** (`MEMORY_Q8=on` opts in). The phase split says why it stops there: reading four times fewer bytes per row saved 26 ms of 116 ms, and the rest is per-row object construction and the JOIN — costs that only fall if fewer *rows* are read. That reading also settles the int8 question: four times fewer bytes saved 26 ms of 116 ms, because the cost is touching the column at all, so a narrower blob could never get there — [ADR-0029](docs/adr/0029-partition-vector-cache.md) explains how the same measurement led to caching decodes instead. [ADR-0025](docs/adr/0025-int8-shortlist.md) · [ADR-0026](docs/adr/0026-int8-off-by-default.md)
 
+**Reading fewer rows, exactly: bucket summaries behind `MEMORY_BUCKET_PREFILTER=on` (default off).** One bucket = one (namespace, project) pair; each carries a summary row — a model-free abstract, the bucket's centroid (the mean of its own row vectors, no embedder, no network) plus the smallest radius that covers every row, and drift counters that every write bumps through the same `noteChange` the partition cache rides. The maintenance pass refreshes drifted buckets (≥10%, OpenViking's freshness ratio; small buckets always), and the vector arm — only when the flag is on — walks buckets by a *bound*: an upper bound on the cosine any of the bucket's rows can reach with the query, from the centroid cap geometry. A bucket is skipped only when its bound cannot reach the current top-20 floor, so the prefilter can cost time, never rows — the exactness ADR-0029's failed index lacked, held structurally instead of by measurement. Measured with `bench/bucket-prefilter.mjs` (real stack, 10,000 rows, 20 projects × 500, top-20, 60 queries): agreement with the full scan **100% ordered-equal on every corpus tried** — dense 384d, dense 2048d, and the hash embedder — while the vector arm went **2.21 → 0.41 ms (5.4×) at 384d** and **150.5 → 1.31 ms (115×) at 2048d** (the case the int8 shortlist could only reach 1.45× on, because it read fewer bytes instead of fewer rows). The shapes it cannot help are honest: one bucket per partition (the scale-bench and LoCoMo shape) is a no-op — `scale-bench --rows 4000 --dim 384 --ns 1` measured search p50 5.34 ms off vs 5.07 ms on, both far inside the 10.3 ms gate and the 10^5 projection at 125 ms against the 700 ms budget — and the hash embedder gains nothing (0.95×, its rows do not cluster) while agreeing exactly. `reembed` drops the summaries (a provider swap can keep the width, so the dim check alone would trust old-model geometry), rename/detach/forget/prune/purge strand none, and a bucket with writes since its refresh is scanned in full — a row written moments ago is never skipped. Searches over a wider population than the summaries describe — `includeArchived` / `includeDraft` / `includeDeleted` or an explicit `status` — fall back to the plain exact scan by construction, because a cap that does not cover archived rows' directions must not skip their bucket (found by independent review, pinned by test). [ADR-0048](docs/adr/0048-bucket-summaries-and-the-local-embedder-preset.md)
+
 **The lexical index was moved to FTS5, measured, and moved back.** With the vector phase down to ~1.4 ms, `lexicalCandidates` became the largest line item in a warm search, and SQLite ships FTS5 — Node's bundled build has it compiled in. An FTS5 table over the same token stream was built to be *exactly* equivalent to the hand-rolled postings (same ids, same scores, same filters, enforced by a test, including a repeated-word row to catch tf read as 1 and a `snake_case_ident` row to catch tokenizer drift), and it was **9.3× slower** on the query shape this retriever actually issues: 8.0 ms through the postings against 74.9 ms through FTS5 at 20,000 rows. The reason is structural rather than a tuning miss — `MATCH` has to scan for phrase matches to discover which rows hold a token, while an inverted index answers the same question with an equality lookup on a primary key, and doing the former once per token per row multiplies it. So the postings stay, and the negative result is written down: [ADR-0031](docs/adr/0031-no-fts5-lexical-index.md)
 
 ## Project layout
@@ -532,7 +649,7 @@ src/core/
   retrieval/            # hybrid, bm25, terms (index/query terms + coverage), mmr, tokens/budget, assemble, brief
   knowledge/            # sections, view (pages/links/neighbours), sync
   extraction/           # heuristic + optional LLM extractor
-  lifecycle/ decay.ts
+  lifecycle/ decay.ts, maintenance.ts (the MEMORY_MAINTAIN_HOURS sweep), triage.ts (the retroactive curate pass)
   judgment/             # jev write gate (optional, opt-in)
   graph.ts              # wiki graph: parsePage, buildGraph, suggestPages
   memoryService.ts
@@ -543,6 +660,7 @@ src/cli/                # the ai-memory command
 src/ui/                 # graph.html, graph.js — the vault graph, framed by the console
 tests/                  # vitest: store, retrieval, api, cli, knowledge, scale
 scripts/ seed.ts, cold-start.ts, wiki-ingest.ts, wiki-links.ts, scale-bench.mjs, realtime-bench.mjs
+bench/ bucket-prefilter.mjs (the ADR-0048 acceptance ruler), evhit.mjs, REPORT.md, vendored repos
 memory.db               # created on first run, gitignored
 ```
 
@@ -600,3 +718,13 @@ See `CONTEXT.md`. Canonical terms: **Memory**, **Episodic/Semantic/Procedural/Wo
 - `0037-explain-an-empty-search`
 - `0038-all-is-a-question-about-the-store`
 - `0039-an-empty-result-reports-the-partitions-it-did-not-read`
+- `0040-writes-are-curated`
+- `0041-the-write-gates-judgement-call-goes-to-the-model`
+- `0042-project-management-rides-the-dimension`
+- `0043-agent-chat-and-console-monochrome`
+- `0044-vault-graph-in-the-console`
+- `0045-write-history-and-two-clocks`
+- `0046-facet-index-and-third-candidate-arm`
+- `0047-conflict-window-and-pending-conflicts`
+- `0048-bucket-summaries-and-the-local-embedder-preset`
+- `0049-principal-and-the-local-boundary`

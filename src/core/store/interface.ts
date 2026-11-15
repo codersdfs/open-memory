@@ -1,6 +1,25 @@
-import type { KnowledgeEdge, Memory, MemoryInput } from "../types.js";
+import type { ChainView, KnowledgeEdge, Memory, MemoryEvent, MemoryInput, WriteEventMeta } from "../types.js";
+import type { CurationDrop, CurationDropInput } from "../write/curation.js";
+import type { CodebaseCapability } from "../codebase/types.js";
+import type { BucketRefreshReport } from "./buckets.js";
 
-export type { KnowledgeEdge };
+export type { ChainView, KnowledgeEdge, MemoryEvent };
+
+/**
+ * One bucket summary (P8, ADR-0048) as a read reports it — the mirror of a
+ * `memory_buckets` row without its embedding bytes. `project` is the slug or `null`
+ * for the unscoped backlog; `hasEmbedding` is false for a placeholder row a write
+ * created before any refresh pass reached it.
+ */
+export interface BucketSummaryInfo {
+  namespace: string;
+  project: string | null;
+  dim: number;
+  total: number;
+  pending: number;
+  hasEmbedding: boolean;
+  updatedAt: number;
+}
 
 /**
  * Lexical candidate hygiene at scale (ADR-0019), shared by both stores so their
@@ -44,6 +63,17 @@ export interface MemoryFilter {
    * chat memory must never merge into (or supersede) one.
    */
   knowledge?: string | null;
+  /**
+   * Facet slice (P5, ADR-0047). `undefined` → do not filter; a facet value → only
+   * rows whose tags carry it, matched case-insensitively the way the postings store
+   * them (`indexFacetsSync` lowercases). Read from the `memory_facets` postings on the
+   * SQL store and from the in-memory mirror, the same derived state `facetCandidates`
+   * ranks over — never from a scan of the tags column. This is the read side of the
+   * conflict window: the pair a `conflict:<entity>` marker names is one filtered read
+   * away. No `null` arm: "rows with no facet" is not a question P5 asks, and a tri-state
+   * nobody passes is a branch nobody tests.
+   */
+  facet?: string;
 }
 
 /**
@@ -118,6 +148,25 @@ export interface VectorStore {
    * `MemoryService.saveMany` falls back to a loop.
    */
   insertMany?(items: { input: MemoryInput; embedding: number[] }[]): Promise<Memory[]>;
+  /**
+   * Which of these `textHash` values already have a READABLE LIVE row in one
+   * partition — the same population `list()` shows by default: not tombstoned, not
+   * archived, not draft (ADR-0018 amendment 2026-11-07). A row outside that default
+   * population is what no ordinary search can return, so it must not block a
+   * re-import either; `project`/`type` scope the fold to the partition `reconcile`
+   * reads over, so one project's copy of a sentence never folds away another's
+   * (ADR-0020).
+   *
+   * Optional like the rest: a third-party store written before it keeps compiling,
+   * and `saveMany` then inserts every survivor as if it were new — it cannot know
+   * otherwise, and losing an import to an unknown store would be the worse error.
+   */
+  findExistingHashes?(opts: {
+    namespace: string;
+    hashes: string[];
+    project?: string | null;
+    type?: string;
+  }): Promise<Set<string>>;
   getById(id: string): Promise<Memory | null>;
   list(opts: {
     namespace: string;
@@ -132,6 +181,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
     /**
      * Skip the vector join. The knowledge index reads thousands of rows to build a
      * page tree and never looks at an embedding; attaching them is about 150 MB of
@@ -153,17 +203,27 @@ export interface VectorStore {
    * Patch the mutable metadata. `tags` and the knowledge columns are here because
    * a knowledge sync has to relabel an adopted pre-v0.7 row without re-embedding
    * it (ADR-0023) — the alternative was a second nearly identical method.
+   * `importance` is here because retroactive curation demotes a stock row's rank
+   * without re-judging it (ADR-0040 amendment 2026-11-08, `ai-memory triage`):
+   * the write-time ladder owns the value, triage only sinks an existing one.
    */
   updateMeta(id: string, patch: {
     status?: string;
     pin?: number;
     visibility?: string;
     isDeleted?: number;
+    importance?: number;
     tags?: string[];
     knowledgeId?: string | null;
     knowledgeSection?: string | null;
-  }): Promise<Memory | null>;
-  supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[]): Promise<Memory>;
+  }, meta?: WriteEventMeta): Promise<Memory | null>;
+  /**
+   * Retire `oldId` and store `newInput` in its place. `meta` is what the history row
+   * records about the decision (P6, ADR-0045): the reconcile reason and the judge
+   * that made the call. The invalidation (`is_deleted = 1`, `invalid_at = now`) and
+   * the supersede event land in one transaction with the successor's insert.
+   */
+  supersede(oldId: string, newInput: MemoryInput, newEmbedding: number[], meta?: WriteEventMeta): Promise<Memory>;
   // brute-force vector scan over namespace partition
   vectorSearch(opts: {
     namespace: string;
@@ -177,6 +237,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; vectorScore: number }[]>;
 
   /**
@@ -207,6 +268,7 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ memory: Memory; lexicalScore: number }[]>;
 
   /**
@@ -221,6 +283,35 @@ export interface VectorStore {
    * quantity.
    */
   termDf?(tokens: string[]): Promise<Map<string, number>>;
+
+  /**
+   * Facet candidates (P4, ADR-0046): rows of one partition whose stored `tags` share at
+   * least one of the given facets, most shared facets first, capped at `limit`.
+   * `sharedFacets` is the intersection that ranked the row — the same values a caller
+   * can recompute from `memory.tags`, returned because the store has already computed
+   * them for the ranking and a conflict marker (P5) will want the shared entity named.
+   *
+   * This is the store capability the facet arm reads when `MEMORY_LINKS=on`, and the
+   * one P5's conflict window consumes — the capability exists whether or not the search
+   * flag is on; the flag only decides whether *retrieval* reads it.
+   *
+   * Optional like `lexicalCandidates`: a third-party store keeps compiling, and the
+   * retriever then runs with two candidate arms exactly as before this landed.
+   */
+  facetCandidates?(opts: {
+    namespace: string;
+    facets: string[];
+    limit: number;
+    type?: string;
+    includeDeleted?: boolean;
+    status?: string;
+    includeArchived?: boolean;
+    includeDraft?: boolean;
+    project?: string | null;
+    kind?: string;
+    knowledge?: string | null;
+    facet?: string;
+  }): Promise<{ memory: Memory; sharedFacets: string[] }[]>;
 
   /**
    * How this query's cosines are distributed across one partition.
@@ -243,14 +334,55 @@ export interface VectorStore {
     project?: string | null;
     kind?: string;
     knowledge?: string | null;
+    facet?: string;
   }): Promise<{ median: number; count: number }>;
   /**
    * Retrieval reinforcement (R2): every id that came back above threshold gets a
-   * little stronger and its use clock reset. One UPDATE, no read-modify-write
+   * little stronger, its use clock reset, and — since the P2 hotness rule (ADR-0016
+   * amendment) — its `useCount` incremented. One UPDATE, no read-modify-write
    * race between the agents sharing this store.
    */
   reinforce(ids: string[]): Promise<number>;
   prune(opts: { olderThanMs: number; maxImportance: number; type?: string; kind?: string }): Promise<number>;
+
+  /**
+   * Store-level KV bookkeeping (P2, ADR-0016 amendment 2026-11-07): today only the
+   * maintenance scheduler's `last_maintenance_at` and its report — the file's own
+   * history, not any memory's, which is why it is a KV table and not a column.
+   * Optional like every late capability: a store that predates it keeps compiling,
+   * and the scheduler then runs on the timer alone, with no open-the-store-catch-up
+   * to lose (it cannot know it is overdue), and `/stats` shows the absence.
+   */
+  getMeta?(key: string): Promise<string | null>;
+  setMeta?(key: string, value: string): Promise<void>;
+
+  /**
+   * Rebuild the (namespace, project) bucket summaries whose drift crossed the refresh
+   * threshold (P8, ADR-0048): missing or stale-dim summaries and small buckets always,
+   * larger ones only when the pending share reached `BUCKET_REFRESH_RATIO` (0.10,
+   * OpenViking's freshness ratio). Needs NO embedder — the summary is the bucket's
+   * own centroid (mean row direction) plus the radius that covers every row, both
+   * read from the vectors already stored — so a refresh is pure local compute and
+   * the summary is always in the same space the queries are (a provider swap
+   * re-embeds the rows and drops the summaries with them).
+   *
+   * Called from the P2 maintenance pass (after the reversible decay, same serialized
+   * chain) and once at daemon boot when `MEMORY_BUCKET_PREFILTER=on`. Optional like
+   * every late capability: a store without it keeps compiling, and the service then
+   * reports the feature as unavailable instead of pretending.
+   */
+  refreshBucketSummaries?(opts?: { now?: number }): Promise<BucketRefreshReport>;
+
+  /** Every summary row, for tests and diagnostics — no embedding bytes, just the shape. */
+  bucketSummaries?(): Promise<BucketSummaryInfo[]>;
+
+  /**
+   * Drop every summary (P8, ADR-0048). `reembedAll` is the only caller: a provider swap
+   * can keep the old width (1536 → another 1536-d model), and a dim check alone would
+   * then serve old-model summary cosines against new-model queries. Dropped summaries
+   * are the safe state — every bucket scans in full until the next refresh rebuilds.
+   */
+  dropBucketSummaries?(): Promise<void>;
 
   /**
    * Reclaim file space. `prune` is a soft delete: the row, its postings and its
@@ -268,12 +400,55 @@ export interface VectorStore {
    * Optional in the same way `insertMany` is: a v0.3 store still compiles.
    */
   purgeDeleted?(opts: { olderThanMs: number }): Promise<number>;
+
+  /**
+   * The write history of one memory (P6, ADR-0045): the append-only `memory_events`
+   * rows for that id, oldest first. Events survive the row itself — `purgeDeleted`
+   * removes the memory and never its history, so a purged id still answers with the
+   * story of what happened to it. Optional like every late capability: a third-party
+   * store written before it keeps compiling, and `MemoryService.drill` then reports
+   * the chain without the events instead of pretending there were none.
+   */
+  history?(id: string): Promise<MemoryEvent[]>;
+  /**
+   * Record one write the curation filter refused (ADR-0040's observability amendment).
+   * Optional like every late capability: a store predating it compiles unchanged, and
+   * the drop simply leaves no trace — which is exactly the state the feedback named.
+   * The row is keyed by the text hash and carries a MASKED preview; it is never
+   * joined to a memory id, because a refused note has none.
+   */
+  recordCurationDrop?(drop: CurationDropInput): Promise<void>;
+
+  /**
+   * Read the drop ledger, one row per distinct refused note (newest preview, total
+   * refusal count, first-refusal time), newest first. Optional for the same reason.
+   */
+  curationDrops?(opts: { hash?: string; namespace?: string; junk?: string; since?: number; limit?: number }): Promise<CurationDrop[]>;
+
+  /**
+   * The live rows whose `supersedes_id` names this id — the forward half of the
+   * chain. Tombstones included on purpose: the rows that superseded this one are
+   * themselves retired the moment something supersedes them, so an includeDeleted
+   * filter would cut the chain off one hop in. Optional: without it, `drill` falls
+   * back to paging the partition and filtering (correct at any size, only slow —
+   * the same trade `listProjects` accepts).
+   */
+  successorsOf?(id: string): Promise<Memory[]>;
   /**
    * Knowledge index (ADR-0023). Optional: the capability arrived in v0.7 and a
    * v0.6 store must keep compiling. `MemoryService.syncKnowledge` reports the
    * missing capability instead of writing rows no one can link.
    */
   knowledge?: KnowledgeCapability;
+
+  /**
+   * Codebase index (ADR-0050). Optional like `knowledge`: a store written before it
+   * keeps compiling, and `MemoryService` reports the missing capability instead of
+   * pretending to index code. Scanning, parsing and edge resolution live in
+   * `codebase/sync.ts` — a store implements only the primitive persistence the sync
+   * and the read layer need, so two stores cannot disagree on what an edge means.
+   */
+  codebase?: CodebaseCapability;
 
   /**
    * Project management (ADR-0042), optional like every other late capability so a

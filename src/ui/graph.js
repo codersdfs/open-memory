@@ -6,6 +6,47 @@ const depthEl = document.getElementById("depth");
 const legendEl = document.getElementById("legend");
 const countEl = document.getElementById("count");
 
+// P7 (ADR-0049): every read/write route demands the daemon's principal token, and the
+// daemon serves that token to nobody — so this page authenticates the way the console
+// does: the operator pastes it once, it is kept in this origin's localStorage (shared
+// with the console that frames this page, so unlocking one unlocks both), and an absent
+// token simply means the gated requests answer 401 and the unlock form appears.
+const TOKEN_KEY = "ai-memory-principal";
+const principalToken = () => localStorage.getItem(TOKEN_KEY);
+const authHeaders = (extra = {}) => {
+  const t = principalToken();
+  return t ? { ...extra, "x-ai-memory-principal": t } : extra;
+};
+
+// The unlock form (ADR-0049): the daemon's 401 is the only thing that shows it. A pasted
+// token is probed against a gated route before it is stored, so a typo never persists;
+// success keeps it in this origin's localStorage and reloads into the graph.
+function renderLocked() {
+  side.innerHTML =
+    "<p class='muted'>This daemon is locked by its principal. Paste the token once —" +
+    " it stays in this browser (print it with: ai-memory principal reveal).</p>" +
+    "<input id='principal-input' type='password' spellcheck='false' placeholder='x-ai-memory-principal' />" +
+    "<p><button id='principal-unlock' class='btn' type='button'>unlock</button></p>" +
+    "<p id='principal-error' class='muted'></p>";
+  const input = side.querySelector("#principal-input");
+  const submit = () => {
+    const token = (input.value || "").trim();
+    const err = side.querySelector("#principal-error");
+    if (!token) return;
+    fetch("/namespaces", { headers: { "x-ai-memory-principal": token } }).then((r) => {
+      if (r.status === 401) {
+        err.textContent = "the daemon rejected that token";
+        return;
+      }
+      localStorage.setItem(TOKEN_KEY, token);
+      window.location.reload();
+    }).catch(() => { err.textContent = "the daemon is unreachable"; });
+  };
+  side.querySelector("#principal-unlock").addEventListener("click", submit);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  input.focus();
+}
+
 let g = { nodes: [], edges: [] };
 const pos = new Map();
 const view = { x: 0, y: 0, k: 1 };
@@ -40,7 +81,7 @@ applyTheme();
 // human, so it does not belong in SQLite with the memories. Keys are node ids,
 // which are vault-relative paths; a stale key is ignored, never fatal.
 function loadPos() {
-  fetch("/positions").then((r) => (r.ok ? r.json() : {})).then((o) => {
+  fetch("/positions", { headers: authHeaders() }).then((r) => (r.ok ? r.json() : {})).then((o) => {
     for (const [k, v] of Object.entries(o)) pos.set(k, v);
     layout();
   }).catch(() => {});
@@ -51,7 +92,7 @@ function savePos() {
   saveT = setTimeout(() => {
     for (const [slug, p] of pos) {
       fetch("/positions", {
-        method: "POST", headers: { "content-type": "application/json" },
+        method: "POST", headers: authHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ slug, x: Math.round(p.x), y: Math.round(p.y) }),
       }).catch(() => {});
     }
@@ -269,9 +310,16 @@ function toWorld(ev) {
   return { x: (ev.clientX - r.left - view.x) / view.k, y: (ev.clientY - r.top - view.y) / view.k };
 }
 
-fetch("/graph")
-  .then((r) => r.json())
+fetch("/graph", { headers: authHeaders() })
+  .then((r) => {
+    if (r.status === 401) {
+      renderLocked();
+      return null;
+    }
+    return r.json();
+  })
   .then((d) => {
+    if (!d) return; // 401: the unlock form is up; nothing to lay out
     g = d;
     adj = new Map(g.nodes.map((n) => [n.id, new Set()]));
     for (const e of g.edges) { adj.get(e.from)?.add(e.to); adj.get(e.to)?.add(e.from); }

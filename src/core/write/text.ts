@@ -1,9 +1,13 @@
 /**
- * Text primitives for the write path. Pure, synchronous, no dependencies.
+ * Text primitives for the write path. Pure, synchronous. The only import is
+ * `node:crypto`, and only for `textHash` — a hash is as deterministic as a regex,
+ * so the isolation contract (a gate you can test without a store) still holds.
  *
  * These are the measurements `reconciler.ts` decides on, so they are separated from
  * the decision itself: a gate you cannot test in isolation is a gate nobody can tune.
  */
+
+import { createHash } from "node:crypto";
 
 /** Function words that carry no topic. Small on purpose: an over-long list turns a
  * short sentence into zero tokens and every short sentence into every other one. */
@@ -38,6 +42,38 @@ export function normalizeText(text: string): string {
     .trim()
     .replace(TRAILING_PUNCT, "")
     .trim();
+}
+
+/**
+ * The exact-duplicate key (ADR-0018 amendment 2026-11-07). SHA-256 over the same
+ * comparison form `normalizeText` defines — the two strings reconcile would call
+ * an exact duplicate are one hash here — truncated to 32 hex chars, which collides
+ * about as often as the UUIDs the rows are keyed by and stores 20x smaller.
+ *
+ * Derived, never input: every write path that can change `text` recomputes it,
+ * because a hash that drifted from its row would suppress inserts of *other* rows.
+ */
+export function textHash(text: string): string {
+  return createHash("sha256").update(normalizeText(text)).digest("hex").slice(0, 32);
+}
+
+/**
+ * The event-time clock (`valid_at`, P6/ADR-0045) read back out of the text: the last
+ * `(at:YYYY-MM-DD)` stamp ADR-0015 put there. Last, not first — a merged supersede
+ * row (` (previously: …)`) can carry two stamps, and the one at the end is the
+ * writer's. Parsed on the local calendar, exactly the calendar `formatLocalDate`
+ * wrote it in (extractor.ts:90), so the round trip is the same day it stamped.
+ * NULL when the text names no date: a column that guessed would be worse than one
+ * that admits it does not know.
+ */
+export function extractValidAt(text: string): number | null {
+  const stamps = text.match(/\(at:(\d{4})-(\d{2})-(\d{2})\)/g);
+  if (!stamps || stamps.length === 0) return null;
+  const last = stamps[stamps.length - 1]!;
+  const m = /\(at:(\d{4})-(\d{2})-(\d{2})\)/.exec(last);
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isNaN(d.getTime()) ? null : d.getTime();
 }
 
 /**
@@ -96,7 +132,7 @@ const MERGE_MAX_CHARS = 600;
  * grows to three times its size on every rewrite.
  */
 const MERGE_MAX_OLD_RATIO = 2;
-const MERGE_MARKER = " (previously: ";
+export const MERGE_MARKER = " (previously: ";
 
 /**
  * The text a superseding row stores: the new claim, plus the old claim when the old one

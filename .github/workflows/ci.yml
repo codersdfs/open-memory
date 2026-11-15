@@ -43,8 +43,13 @@ jobs:
       - name: install the tarball and exercise it
         run: |
           set -euo pipefail
-          npm pack --pack-destination /tmp
-          npm i -g --prefix /tmp/inst /tmp/open-memory-*.tgz
+          # Ask npm what it wrote instead of naming the file: the tarball is
+          # `franklinww-open-memory-<version>.tgz`, so a glob on the bare
+          # `open-memory-*` matched nothing since the package was scoped and
+          # `npm i` then tried to open the literal pattern. Same trap this step
+          # already documents one line lower down.
+          TARBALL="/tmp/$(npm pack --json --pack-destination /tmp | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8'))[0].filename")"
+          npm i -g --prefix /tmp/inst "$TARBALL"
           export AI_MEMORY_HOME=/tmp/inst-store
           export PATH=/tmp/inst/bin:$PATH   # npm puts global bins in <prefix>/bin on POSIX
 
@@ -55,7 +60,9 @@ jobs:
           # A global install lands in <prefix>/lib/node_modules on POSIX and
           # <prefix>/node_modules on Windows, so ask npm where it went rather than
           # assuming — the first version of this step assumed, and stopped here.
-          PKG="$(npm root -g --prefix /tmp/inst)/open-memory"
+          # The install dir is the package name, which is scoped: derive it from
+          # the manifest rather than hard-coding either spelling.
+          PKG="$(npm root -g --prefix /tmp/inst)/$(node -p "require('./package.json').name")"
 
           # 2. the static UI shipped. It is served, not imported, so tsc does not
           #    carry it into dist — only the copy-ui build step does.

@@ -10,8 +10,14 @@ import path from "node:path";
  *  - **Markdown/instruction files** other agents maintain (CLAUDE.md, AGENTS.md,
  *    wayfinder notes), which carry durable project facts that were never in any store.
  *
- * Import is conservative and idempotent: it runs through the normal `save` path, so
- * near-duplicates collapse instead of doubling the store.
+ * Import is conservative and idempotent: it runs through `saveMany`, which since the
+ * ADR-0018 amendment (2026-11-07) applies the bulk curation gate and folds exact-text
+ * duplicates within one partition (in-batch and against readable live rows — same
+ * namespace, project and type) — re-importing the same file does not double the
+ * store, and a table row or a colon heading no longer slips past the door `save`
+ * guards. Near-duplicates are *not* folded: write-time reconcile stays opt-in
+ * (`--reconcile`), because the per-row neighbour search is exactly what a bulk load
+ * exists to avoid.
  */
 
 export interface ImportSource {

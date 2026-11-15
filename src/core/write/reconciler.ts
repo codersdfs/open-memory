@@ -3,14 +3,17 @@
  *
  * Pure. No store, no embedder, no network — the neighbours are handed in, the optional
  * judge is a function argument. That is what makes every rule testable without a
- * database, and what lets the caller keep the one vector query it already runs.
+ * database, and what lets the caller keep the one vector query it already runs. The one
+ * side-channel is observability, not decision input: a judge failure writes its running
+ * count to stderr (P5, ADR-0047) and tags the row, so a broken judge is visible without
+ * changing what the decision does.
  *
  * Deleting data is the one irreversible thing here, so the guards outrank the judgement:
  * pinned rows, episodic events and extractor-sliced sentences are never superseded.
  */
 
 import type { Memory, MemoryType } from "../types.js";
-import { buildTags, inheritFacets } from "./facets.js";
+import { appendTag, buildTags, facetTagsOf, inheritFacets } from "./facets.js";
 import { covers, lexicalSimilarity, mergeText, normalizeText, tokenize } from "./text.js";
 
 export type ReconcileAction = "insert" | "reinforce" | "supersede";
@@ -24,11 +27,28 @@ export type ReconcileReason =
   | "model-contradicts"
   | "model-unrelated"
   | "model-unavailable"
+  | "conflict-unjudged"
+  | "judge-failed"
   | "extractor-no-delete"
   | "episodic-no-delete"
   | "pinned-no-delete"
   | "typed-no-delete"
   | "disabled";
+
+/**
+ * The marker the conflict window (P5, ADR-0047) puts on unjudged contradiction pairs:
+ * `conflict:<entity>` in the facet vocabulary, so the pair is listable, countable and
+ * adjudicable instead of silently coexisting. The ADR-0041 amendment this lands with
+ * pins the boundary: a judge that was *asked and failed* reports itself
+ * (`judge-failed`, tag `judged:failed`) and never mints one — a failure admits no
+ * contradiction, it only admits it could not read the pair.
+ */
+export const CONFLICT_TAG_PREFIX = "conflict:";
+/** The tag a judge failure leaves on the row it could not judge (ADR-0041 amendment). */
+export const JUDGE_FAILED_TAG = "judged:failed";
+
+/** Every failure this process has seen, for the stderr line's running count. */
+let judgeFailures = 0;
 
 /** What a model may answer about an old/new pair. */
 export type Relation = "duplicate" | "refines" | "contradicts";
@@ -64,6 +84,14 @@ export interface Decision {
   tags: string[];
   /** Similarity to the winning neighbour, 0 when there was none. */
   lexical: number;
+  /**
+   * The conflict facet this decision minted (`conflict:<entity>`), present only when the
+   * judge was absent and the pair read as the same subject stated differently (P5,
+   * ADR-0047). `tags` already carries it for the incoming row; the caller uses this value
+   * to mark the *existing* row through `updateMeta`'s tags patch — the P4-maintained path
+   * — so its facet postings follow the column.
+   */
+  conflictFacet?: string;
 }
 
 /**
@@ -90,6 +118,51 @@ function growthCap(oldText: string): number {
 /** Only the two long-lived types may be superseded; `working` is scratch, `episodic` is an event. */
 function deletable(type: MemoryType | undefined): boolean {
   return type === "semantic" || type === "procedural";
+}
+
+/**
+ * The subject both texts name (P5, ADR-0047): the first `entity:` facet they share — the
+ * incoming row's own tags (the ones `buildTags` would store) against the neighbour's.
+ * Deliberately `entity:` only: a shared `topic:` says the two sentences are about the
+ * same *thing*, not that they speak of the same *subject*, and a conflict named after a
+ * topic would drag unrelated rows into one adjudication. `null` when neither text names
+ * an explicit entity or the names differ — then the pair keeps coexisting unmarked,
+ * because a marker with no subject cannot be adjudicated either.
+ */
+function sharedEntity(input: ReconcileInput, old: Memory): string | null {
+  const held = new Set(
+    facetTagsOf(old.tags)
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.startsWith("entity:"))
+  );
+  for (const facet of facetTagsOf(buildTags(input.text, input.callerTags))) {
+    const lower = facet.toLowerCase();
+    if (!lower.startsWith("entity:")) continue;
+    if (held.has(lower)) return lower.slice("entity:".length);
+  }
+  return null;
+}
+
+/**
+ * The conflict window's neighbour list (P5, ADR-0047): the three candidate arms deduped
+ * by id in arm order and capped. Arm order is priority — the same-type vector top-5 the
+ * write path has always run, then the facet arm (same `entity:` facet, any type), then
+ * the cross-type arm fills what is left — so the cap, when it bites, trims the weakest
+ * arm first. ≤10 is the whole point of the cap: the widened window must not turn every
+ * save into a wider scan than the guards can read.
+ */
+export function unionNeighbours(arms: Neighbour[][], cap: number): Neighbour[] {
+  const seen = new Set<string>();
+  const out: Neighbour[] = [];
+  for (const arm of arms) {
+    for (const n of arm) {
+      if (out.length >= cap) return out;
+      if (seen.has(n.memory.id)) continue;
+      seen.add(n.memory.id);
+      out.push(n);
+    }
+  }
+  return out;
 }
 
 /** The best neighbour that clears the gate. */
@@ -159,14 +232,42 @@ export async function reconcile(input: ReconcileInput): Promise<Decision> {
   // The new sentence states everything the old one did, and more — but only by a little.
   if (covers(old.text, input.text) && input.text.length <= growthCap(old.text)) return supersede("refinement");
 
-  if (!input.relation) return { ...insert, reason: "model-unavailable", lexical: hit.lexical };
+  if (!input.relation) {
+    // P5 (ADR-0047): the judge is *absent* — not configured, or configured without a key.
+    // This is the point the research notes name (reconciler.ts:162 used to coexist
+    // silently here). Reaching this line already establishes "different predicate": the
+    // same claim was folded at R1, a refinement superseded above, and the four no-delete
+    // guards had their say before this branch — a guarded pair keeps its guard's reason
+    // and never reaches the marker. What remains is the subject test, and a pair that
+    // names the same entity stores with a `conflict:<entity>` facet on both rows instead
+    // of a silent double write.
+    const entity = sharedEntity(input, old);
+    if (entity) {
+      const facet = CONFLICT_TAG_PREFIX + entity;
+      return {
+        ...insert,
+        reason: "conflict-unjudged",
+        conflictFacet: facet,
+        oldId: old.id,
+        tags: appendTag(tags, facet),
+        lexical: hit.lexical
+      };
+    }
+    return { ...insert, reason: "model-unavailable", lexical: hit.lexical };
+  }
 
   let relation: Relation | null = null;
   try {
     relation = await input.relation(old.text, input.text);
-  } catch {
-    // Fail-open: a judge that is down must not block or delete a write.
-    return { ...insert, reason: "model-unavailable", lexical: hit.lexical };
+  } catch (err) {
+    // Fail-open, but no longer silent (P5, ADR-0047 / ADR-0041 amendment): a judge that
+    // was asked and could not answer is a different fact from a judge nobody configured.
+    // The failure is counted on stderr and tagged, and it never mints a conflict marker —
+    // a failed call admits nothing about the pair except that it could not be read.
+    judgeFailures += 1;
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[reconcile] relation judge failed (${judgeFailures} this process): ${message}\n`);
+    return { ...insert, reason: "judge-failed", tags: appendTag(tags, JUDGE_FAILED_TAG), lexical: hit.lexical };
   }
   if (relation === "duplicate") {
     return { action: "reinforce", reason: "model-duplicate", oldId: old.id, text: old.text, tags, lexical: hit.lexical };

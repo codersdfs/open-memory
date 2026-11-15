@@ -72,6 +72,18 @@ async function shutdownDaemon(): Promise<void> {
   const client = new MemoryClient(defaultServerUrl(), SHUTDOWN_TIMEOUT_MS);
   const res = await client.post<unknown>("/admin/shutdown", {});
   if (!res.ok) {
+    if (res.status === 403) {
+      // The gate refused this client's key. Two known shapes: the daemon predates a
+      // `principal recover` in a way the file cannot explain (home mismatch), or the
+      // key file is simply not this daemon's. Either way the exit has to be named —
+      // before the repair lever existed this is where the break-glass flow died with
+      // the daemon unkillable by the commands that documented it.
+      throw new Error(
+        "the daemon refused to shut down (HTTP 403) — it did not accept this client's key; " +
+        "check that the CLI and the daemon read the same memory home (ai-memory principal status), " +
+        "or stop the daemon process manually and start a fresh one"
+      );
+    }
     throw new Error(
       res.status > 0 ? `the daemon refused to shut down (HTTP ${res.status})` : res.error
     );

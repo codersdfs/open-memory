@@ -8,7 +8,7 @@ import { Histogram } from '../components/Histogram';
 import { Panel } from '../components/Panel';
 import { StatCard } from '../components/StatCard';
 import { api } from '../lib/api';
-import type { DecayCandidate, EmbeddingInfo, EmbeddingPreset, ReembedJob, StatsResponse } from '../lib/api';
+import type { DecayCandidate, EmbeddingInfo, EmbeddingPreset, PendingConflict, ReembedJob, StatsResponse } from '../lib/api';
 import { absTime, bytes, relTime, score3, truncate } from '../lib/format';
 
 /**
@@ -18,12 +18,14 @@ import { absTime, bytes, relTime, score3, truncate } from '../lib/format';
  * saving — the store keeps no recall log, so any "tokens saved" would be invented.
  *
  * D7 — `decay` previews first: the candidate count and the exact predicates are stated in
- * the dialog, and the preview reads the same constants the prune does (src/core/stats.ts:18-20
- * mirrors src/core/lifecycle/decay.ts).
+ * the dialog, and the preview mirrors the same hotness rule the archive pass runs
+ * (src/core/stats.ts duplicates src/core/lifecycle/decay.ts on purpose — drift has to be
+ * visible). Since the 2026-11-07 amendment the pass is also automatic: the daemon sweeps
+ * `MEMORY_MAINTAIN_HOURS` apart, reversible pass only, and the panel says when it last did.
  */
 
 const PREDICATES =
-  'archive: never retrieved, older than 30 days, importance < 0.6 (status change only); hard prune (opt-in): episodic older than 90 days with importance and strength <= 0.5, working older than 7 days';
+  'archive: hotness log1p(uses)·exp(−ln2·age/window) under one-use-one-window (window per kind: task 7d, note 30d, fact 90d; durable kinds and importance ≥ 0.6 are never archived), status change only; hard prune (opt-in): episodic older than 90 days with importance and strength <= 0.5, working older than 7 days';
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -114,6 +116,10 @@ function FailedRows({ failed }: { failed: { id: string; error: string }[] }) {
 const PRESET_MODEL_ENV: Record<EmbeddingPreset['provider'], string | null> = {
   hash: null,
   openai: 'OPENAI_EMBED_MODEL',
+  // The model id is the endpoint's own (Ollama/LM Studio name their models); the
+  // console cannot guess it, so nothing is written and the server's preview names
+  // the variable when it is missing (ADR-0048).
+  'openai-local': null,
   nim: 'NIM_EMBED_MODEL',
 };
 
@@ -121,10 +127,14 @@ const PRESET_MODEL_ENV: Record<EmbeddingPreset['provider'], string | null> = {
  * The body `POST /embedding` takes is the environment-variable vocabulary, not a key: a
  * preset becomes `EMBEDDING_PROVIDER` + `EMBEDDING_DIM` + the provider's model variable.
  * `EMBEDDING_DIM` is always sent — the write is a patch, and a width left over from the
- * previous provider would be the one field that could make the next start refuse.
+ * previous provider would be the one field that could make the next start refuse — with
+ * one exception: `dim === 0` (openai-local) is the preset saying "no width of its own",
+ * so the field is omitted and the user's `EMBEDDING_DIM` setting decides; the server
+ * previews the patch and names the variable when it is missing.
  */
 function presetPatch(p: EmbeddingPreset): Record<string, string> {
-  const patch: Record<string, string> = { EMBEDDING_PROVIDER: p.provider, EMBEDDING_DIM: String(p.dim) };
+  const patch: Record<string, string> = { EMBEDDING_PROVIDER: p.provider };
+  if (p.dim > 0) patch.EMBEDDING_DIM = String(p.dim);
   const modelEnv = PRESET_MODEL_ENV[p.provider];
   if (modelEnv !== null && p.model !== null) patch[modelEnv] = p.model;
   return patch;
@@ -366,8 +376,14 @@ function EmbeddingsCard() {
                       className="mono"
                       style={{ display: 'block', fontSize: 11, color: 'var(--dim)', fontVariantNumeric: 'tabular-nums' }}
                     >
-                      {p.model ?? '—'} · {p.dim}d
+                      {p.model ?? '—'} · {p.dim > 0 ? `${p.dim}d` : 'set EMBEDDING_DIM'}
                     </span>
+                    {p.provider === 'openai-local' ? (
+                      <span style={{ display: 'block', marginTop: 2, fontSize: 11, color: 'var(--dim)', lineHeight: 1.5 }}>
+                        local OpenAI-compatible endpoint (Ollama, LM Studio): set OPENAI_BASE_URL, OPENAI_EMBED_MODEL and
+                        EMBEDDING_DIM in Settings first. key optional — empty sends no Authorization header.
+                      </span>
+                    ) : null}
                     {missingKey ? (
                       <span style={{ display: 'block', marginTop: 2, fontSize: 11, color: 'var(--warn)' }}>
                         needs {p.keyEnv} in the environment, not here
@@ -631,6 +647,60 @@ export default function StatsView({ namespace }: { namespace: string }) {
   if (stats === null) return null;
 
   const candidates = stats.decayCandidates;
+  const conflicts = stats.pendingConflictRows;
+
+  const conflictColumns: Column<PendingConflict>[] = [
+    {
+      key: 'conflicts',
+      header: 'conflict',
+      width: '1%',
+      mono: true,
+      render: (row) => (
+        <span title={row.conflicts.join(' · ')} style={{ fontSize: 11, color: 'var(--warn)' }}>
+          {truncate(row.conflicts.join(' · '), 22)}
+        </span>
+      ),
+    },
+    {
+      key: 'text',
+      header: 'text',
+      render: (row) => (
+        <span title={row.text} style={{ fontSize: 12, color: 'var(--fg)' }}>
+          {truncate(row.text, 88)}
+        </span>
+      ),
+    },
+    {
+      key: 'type',
+      header: 'type',
+      width: '1%',
+      render: (row) => (
+        <span style={{ fontSize: 11, color: 'var(--dim)' }}>{row.type}</span>
+      ),
+    },
+    {
+      key: 'created',
+      header: 'created',
+      width: '1%',
+      mono: true,
+      render: (row) => (
+        <span title={absTime(row.createdAt)} style={{ fontSize: 11, color: 'var(--dim)' }}>
+          {relTime(row.createdAt)}
+        </span>
+      ),
+    },
+    {
+      key: 'id',
+      header: 'id',
+      mono: true,
+      width: '1%',
+      render: (row) => (
+        <span title={row.id} style={{ fontSize: 10, color: 'var(--dim)' }}>
+          {truncate(row.id, 14)}
+        </span>
+      ),
+    },
+  ];
 
   const columns: Column<DecayCandidate>[] = [
     {
@@ -690,6 +760,18 @@ export default function StatsView({ namespace }: { namespace: string }) {
       render: (row) => <span style={{ fontSize: 11 }}>{score3(row.strength)}</span>,
     },
     {
+      key: 'uses',
+      header: 'uses',
+      width: '1%',
+      align: 'right',
+      mono: true,
+      render: (row) => (
+        <span title={row.useCount === 0 ? 'never retrieved above threshold — the hotness rule has nothing to weigh' : `${row.useCount} retrievals`} style={{ fontSize: 11 }}>
+          {row.useCount}
+        </span>
+      ),
+    },
+    {
       key: 'text',
       header: 'text',
       render: (row) => (
@@ -708,6 +790,11 @@ export default function StatsView({ namespace }: { namespace: string }) {
         <StatCard label="pinned" value={stats.pinned} />
         <StatCard label="reinforced" value={stats.reinforced} sub="retrieved, or stronger than written" />
         <StatCard label="never used" value={stats.neverUsed} />
+        <StatCard
+          label="pending conflicts"
+          value={stats.pendingConflicts}
+          sub="stored while the judge was away — P5"
+        />
         <StatCard
           label="supersedes links / heads"
           value={`${stats.supersedesLinks} / ${stats.supersedeHeads}`}
@@ -742,6 +829,27 @@ export default function StatsView({ namespace }: { namespace: string }) {
 
       <EmbeddingsCard />
 
+      {/* P5 (ADR-0047): writes stored while the relation judge was absent, wearing a
+          `conflict:<entity>` facet on both sides of the pair. Read-only on purpose — the
+          adjudication itself is a supersede or a tag strip, and both of those stay in the
+          memories view where the whole row is visible. */}
+      <Panel
+        title="pending conflicts"
+        subtitle={`${stats.pendingConflicts} row${stats.pendingConflicts === 1 ? '' : 's'} in ${stats.namespace} — same entity, different claim, never judged`}
+      >
+        <DataTable
+          rows={conflicts}
+          columns={conflictColumns}
+          rowKey={(row) => row.id}
+          empty={
+            <Empty
+              title="nothing awaiting adjudication"
+              body="no row carries a conflict:* facet right now — pairs the write path could not judge either superseded, coexisted unmarked, or were judged."
+            />
+          }
+        />
+      </Panel>
+
       <Panel
         title="decay"
         subtitle={`preview: ${candidates.length} candidate row${candidates.length === 1 ? '' : 's'} in ${stats.namespace}`}
@@ -775,6 +883,17 @@ export default function StatsView({ namespace }: { namespace: string }) {
             {decayError}
           </div>
         ) : null}
+        <div className="hairline" style={{ marginBottom: 12, padding: '7px 9px', fontSize: 11, color: 'var(--dim)' }}>
+          automatic maintenance (reversible pass only):{' '}
+          {stats.lastMaintenanceAt === null ? (
+            <span className="mono">never</span>
+          ) : (
+            <span className="mono" title={absTime(stats.lastMaintenanceAt)}>
+              {relTime(stats.lastMaintenanceAt)}
+            </span>
+          )}
+          {stats.lastMaintenanceResult !== null ? <>, ran {stats.lastMaintenanceResult}</> : null}
+        </div>
         <DataTable
           rows={candidates}
           columns={columns}
@@ -782,7 +901,7 @@ export default function StatsView({ namespace }: { namespace: string }) {
           empty={
             <Empty
               title="nothing to archive"
-              body="no row matches the decay predicates right now — nothing here is both old, never retrieved and weak."
+              body="no row matches the decay predicates right now — nothing here is cold past its window, or the clock says it was used too recently, or it is durable, or it is important."
             />
           }
         />

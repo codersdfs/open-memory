@@ -21,7 +21,7 @@ The 13 rows that still pass are short sentences with a terminator and no structu
 
 ## Dates
 
-A relative time word ("yesterday", "last month") decays with the reader; an absolute date does not. `extract(turnText, referenceDate)` resolves the relative word against the moment the turn was said and stamps `(at:YYYY-MM-DD)` into the stored text plus an `at:` tag, because the term index and `LIKE` both search `text`, not tags. `MemoryService.extractAndSave(text, namespace, referenceDate?)` passes the caller's date through; omitting it means "now", which is what every current caller does. `src/adapters/inject.ts` renders that date next to the memory (`- (where/type) [YYYY-MM-DD] text`) for episodic and semantic rows only — a procedure does not become truer by being dated.
+A relative time word ("yesterday", "last month") decays with the reader; an absolute date does not. `extract(turnText, referenceDate)` resolves the relative word against the moment the turn was said and stamps `(at:YYYY-MM-DD)` into the stored text plus an `at:` tag, because the term index and `LIKE` both search `text`, not tags. `MemoryService.extractAndSave(text, namespace, referenceDate?)` passes the caller's date through; omitting it means "now", which is what every current caller does. `src/adapters/inject.ts` renders that date next to the memory (`- (where/type) [YYYY-MM-DD] text`) for episodic and semantic rows only — a procedure does not become truer by being dated. Since 2026-11-08 the stamp is also read back out into a column at write time (`valid_at`, the event-time clock of [ADR-0045](0045-write-history-and-two-clocks.md)) — the text stays the truth, the column is the timeline.
 
 ## Facets
 

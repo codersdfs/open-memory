@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { Badge } from '../components/Badge';
 import { BudgetBar } from '../components/BudgetBar';
 import { Empty } from '../components/Empty';
 import { KeyboardHint } from '../components/KeyboardHint';
-import { Panel } from '../components/Panel';
 import { RangeField } from '../components/RangeField';
 import { ScoreBar } from '../components/ScoreBar';
+import { Badge } from '../components/Badge';
+import { IconChevronDown, IconChevronUp, IconSearch } from '../components/Icons';
 import { api } from '../lib/api';
 import type { MemoryType, SearchResult, SearchResultItem } from '../lib/api';
 import { FLOOR_PRESETS, explainSegments } from '../lib/score';
@@ -14,13 +14,17 @@ import { useRoute } from '../router';
 
 /**
  * D4 — the explain payload is the interface. Every number on this screen comes from
- * the response (`tokensUsed`, `tokensUsed`/`budgetTokens` on the request, `explain`,
- * `strength`, `lastUsedAt`); nothing here is a saving, a latency or a confidence.
+ * the response (`tokensUsed`, `budgetTokens` on the request, `explain`, `strength`,
+ * `lastUsedAt`, `diagnostics`); nothing here is a saving, a latency or a confidence.
  *
  * D10 — the whole view state (query, filters, sliders) lives in the hash, so a refresh
  * restores it. The hash is the single source of truth for the inputs: `setParams` writes
  * it and the `hashchange` the router listens for feeds the value back, which is why no
  * local copy of the query exists to drift.
+ *
+ * ADR-0043 presentation: one search hero, pill filters, hits as rows in one list, and
+ * the gate's rejected candidates folded under a "below floor" ghost — ADR-0037's
+ * near-misses are the honest version of "no results".
  */
 
 /** The `/` shortcut target. A stable id is what makes "focus the search field" a one-liner. */
@@ -76,47 +80,34 @@ function SkeletonBar({ width, height = 8 }: { width: string; height?: number }) 
   );
 }
 
-/** One hit: the decomposition, the text, then the metadata row. The id is last so it never
+/** One hit row: the decomposition, the text, then the metadata. The id is last so it never
  *  pushes the badges around, and it is selectable because copying it is the point. */
 function Hit({ hit }: { hit: SearchResultItem }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 9, padding: '12px 14px' }}>
-      {hit.explain ? (
-        <ScoreBar segments={explainSegments(hit.explain)} total={hit.score} />
-      ) : (
-        // The server only omits `explain` if it was not asked for; the score is still real.
-        <div className="mono" style={{ fontSize: 13, color: 'var(--fg)' }}>
-          {score3(hit.score)}
-        </div>
-      )}
-
-      <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--fg)' }} title={hit.text}>
-        {truncate(hit.text, 260)}
-      </div>
-
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-        <Badge>{hit.type}</Badge>
+    <div className="hit">
+      <div className="hit-head">
+        <span className={`tdot ${hit.type}`} aria-hidden="true" />
+        <span className="mono" style={{ fontSize: 11, color: 'var(--dim)' }}>
+          {hit.type}
+        </span>
+        {hit.kind ? <span className="chip">{hit.kind}</span> : null}
         {hit.status !== 'active' ? <Badge kind="warn">{hit.status}</Badge> : null}
-        {hit.pin ? <Badge kind="accent">pinned</Badge> : null}
-        <span className="mono" style={{ fontSize: 10, color: 'var(--dim)' }}>
-          imp {score3(hit.importance)}
-        </span>
-        <span className="mono" style={{ fontSize: 10, color: 'var(--dim)' }}>
-          str {score3(hit.strength)}
-        </span>
-        <span title={absTime(hit.lastUsedAt)} style={{ fontSize: 11, color: 'var(--dim)' }}>
+        {hit.pin === 1 ? <Badge kind="accent">pinned</Badge> : null}
+        <span className="spacer" />
+        <span className="hit-meta" title={absTime(hit.lastUsedAt)}>
           {relTime(hit.lastUsedAt)}
         </span>
-        {hit.strength > 0.5 ? (
-          <span style={{ fontSize: 10, color: 'var(--faint)' }}>reinforced</span>
-        ) : null}
-        <span
-          className="mono"
-          title={hit.id}
-          style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--faint)' }}
-        >
-          {hit.id}
-        </span>
+        <span className="hit-score">{score3(hit.score)}</span>
+      </div>
+      <div className="hit-text" title={hit.text}>
+        {truncate(hit.text, 320)}
+      </div>
+      {hit.explain ? <ScoreBar segments={explainSegments(hit.explain)} total={hit.score} /> : null}
+      <div className="legend">
+        <span>imp {score3(hit.importance)}</span>
+        <span>str {score3(hit.strength)}</span>
+        {hit.strength > 0.5 ? <span>reinforced</span> : null}
+        <span style={{ marginLeft: 'auto' }}>{hit.id}</span>
       </div>
     </div>
   );
@@ -148,6 +139,7 @@ export default function RecallView({ namespace }: { namespace: string }) {
   const [result, setResult] = useState<SearchResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [showNear, setShowNear] = useState(false);
 
   // A ref keeps the document-level listener stable without re-registering it per keystroke.
   const submitRef = useRef<() => void>(() => {});
@@ -216,116 +208,126 @@ export default function RecallView({ namespace }: { namespace: string }) {
     };
   }, [submitted, run, namespace, typeFilter, k, threshold, budget]);
 
-  const lowerPresets = FLOOR_PRESETS.filter((p) => p.value < threshold);
   const hits = result?.memories ?? [];
+  const near = result?.diagnostics?.nearMisses ?? [];
+  const nearFloor = result?.diagnostics?.threshold ?? threshold;
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Panel title="recall" subtitle={namespace}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-            <div className="field" style={{ flex: '1 1 320px' }}>
-              <span>query</span>
-              <input
-                id={QUERY_ID}
-                value={query}
-                spellCheck={false}
-                aria-label="Query"
-                placeholder="what did we decide about…"
-                onChange={(e) => setParams({ q: e.currentTarget.value === '' ? undefined : e.currentTarget.value })}
-              />
-            </div>
-
-            <div className="field">
-              <span>type</span>
-              <select
-                value={typeFilter ?? ''}
-                aria-label="Type"
-                onChange={(e) => setParams({ t: e.currentTarget.value === '' ? undefined : e.currentTarget.value })}
-              >
-                <option value="">all types</option>
-                {TYPE_OPTIONS.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <button type="button" className="btn btn-primary" onClick={() => submitRef.current()}>
-              search
-            </button>
-
-            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
-              <KeyboardHint keys={['/']} />
-              <span style={{ fontSize: 10, color: 'var(--faint)' }}>focus</span>
-              <KeyboardHint keys={['⌘', '↵']} />
-              <span style={{ fontSize: 10, color: 'var(--faint)' }}>search</span>
-            </div>
-          </div>
-
-          <div style={{ display: 'grid', gap: 10, gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))' }}>
-            <RangeField label="k" min={1} max={20} step={1} value={k} onChange={(v) => setParams({ k: v })} />
-            <RangeField
-              label="threshold"
-              min={0}
-              max={1}
-              step={0.02}
-              value={threshold}
-              onChange={(v) => setParams({ th: v })}
-              format={score3}
-            />
-            <RangeField
-              label="budgetTokens"
-              min={100}
-              max={4000}
-              step={100}
-              value={budget}
-              onChange={(v) => setParams({ bt: v })}
-              format={(v) => String(v)}
-            />
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: 'var(--faint)' }}>
-              floor presets
-            </span>
-            {FLOOR_PRESETS.map((p) => (
-              <button
-                key={p.key}
-                type="button"
-                className="btn"
-                aria-pressed={threshold === p.value}
-                title={`set the floor to ${score3(p.value)}`}
-                onClick={() => setParams({ th: p.value })}
-              >
-                {p.label} {score3(p.value)}
-              </button>
-            ))}
-          </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div>
+        <div style={{ fontSize: 15, fontWeight: 600 }}>Recall</div>
+        <div className="mono" style={{ marginTop: 3, fontSize: 11, color: 'var(--faint)' }}>
+          hybrid retrieval · bm25 + vector + recency + strength · hard token budget
         </div>
-      </Panel>
+      </div>
+
+      <form
+        className="search-hero"
+        onSubmit={(e) => {
+          e.preventDefault();
+          submitRef.current();
+        }}
+      >
+        <IconSearch size={14} />
+        <input
+          id={QUERY_ID}
+          value={query}
+          spellCheck={false}
+          aria-label="Query"
+          placeholder="search memory…"
+          onChange={(e) => setParams({ q: e.currentTarget.value === '' ? undefined : e.currentTarget.value })}
+        />
+        <KeyboardHint keys={['⌘', '↵']} />
+      </form>
+
+      <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+        <span className="legend">
+          <span>type</span>
+        </span>
+        <button
+          type="button"
+          className="pill"
+          aria-pressed={typeFilter === undefined}
+          onClick={() => setParams({ t: undefined, id: undefined })}
+        >
+          all
+        </button>
+        {TYPE_OPTIONS.map((t) => (
+          <button
+            key={t}
+            type="button"
+            className="pill"
+            aria-pressed={typeFilter === t}
+            onClick={() => setParams({ t: t, id: undefined })}
+          >
+            {t}
+          </button>
+        ))}
+        <span className="spacer" style={{ flex: 1 }} />
+        <span className="legend">
+          <span>floor</span>
+        </span>
+        {FLOOR_PRESETS.map((p) => (
+          <button
+            key={p.key}
+            type="button"
+            className="pill mono"
+            aria-pressed={threshold === p.value}
+            title={`set the floor to ${score3(p.value)}`}
+            onClick={() => setParams({ th: p.value })}
+          >
+            {p.label} {score3(p.value)}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: 'grid', gap: 10, gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+        <RangeField label="k" min={1} max={20} step={1} value={k} onChange={(v) => setParams({ k: v })} />
+        <RangeField
+          label="threshold"
+          min={0}
+          max={1}
+          step={0.02}
+          value={threshold}
+          onChange={(v) => setParams({ th: v })}
+          format={score3}
+        />
+        <RangeField
+          label="budgetTokens"
+          min={100}
+          max={4000}
+          step={100}
+          value={budget}
+          onChange={(v) => setParams({ bt: v })}
+          format={(v) => String(v)}
+        />
+      </div>
+
+      <div className="row" style={{ gap: 6 }}>
+        <KeyboardHint keys={['/']} />
+        <span style={{ fontSize: 10, color: 'var(--faint)' }}>focus</span>
+      </div>
 
       {error !== null ? (
-        <Panel title="search failed">
-          <div className="mono" style={{ fontSize: 12, lineHeight: 1.6, color: 'var(--danger)', whiteSpace: 'pre-wrap' }}>
-            {error}
-          </div>
-        </Panel>
+        <div
+          role="alert"
+          className="mono"
+          style={{ fontSize: 12, lineHeight: 1.6, color: 'var(--danger)', whiteSpace: 'pre-wrap' }}
+        >
+          {error}
+        </div>
       ) : null}
 
       {loading ? (
-        <Panel title="hits" subtitle={`searching “${truncate(submitted, 40)}”`}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {[0, 1, 2].map((i) => (
-              <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-                <SkeletonBar width="72%" />
-                <SkeletonBar width="100%" height={6} />
-                <SkeletonBar width="34%" height={6} />
-              </div>
-            ))}
-          </div>
-        </Panel>
+        <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {[0, 1, 2].map((i) => (
+            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+              <SkeletonBar width="72%" />
+              <SkeletonBar width="100%" height={6} />
+              <SkeletonBar width="34%" height={6} />
+            </div>
+          ))}
+        </div>
       ) : null}
 
       {!loading && submitted === '' ? (
@@ -333,47 +335,53 @@ export default function RecallView({ namespace }: { namespace: string }) {
       ) : null}
 
       {!loading && result !== null ? (
-        <Panel
-          title="budget"
-          subtitle={`${hits.length} ${hits.length === 1 ? 'hit' : 'hits'} for “${truncate(submitted, 40)}”`}
-        >
-          {/* `budgetTokens` is a request field — the response carries `tokensUsed`, not the
-              budget it was measured against — so the budget shown is the one that was sent. */}
-          <BudgetBar used={result.tokensUsed} budget={budget} truncated={result.truncated} summary={result.summary} />
-        </Panel>
-      ) : null}
+        <>
+          <div className="row" style={{ gap: 10 }}>
+            <span className="mono" style={{ fontSize: 11, color: 'var(--faint)' }}>
+              {hits.length} {hits.length === 1 ? 'hit' : 'hits'} for “{truncate(submitted, 40)}”
+            </span>
+            <BudgetBar used={result.tokensUsed} budget={budget} truncated={result.truncated} summary={result.summary} />
+          </div>
 
-      {!loading && result !== null && hits.length === 0 ? (
-        <Empty
-          title="nothing cleared the floor"
-          body="empty is the designed answer, not a failure."
-          action={
-            <>
-              <span className="mono" style={{ fontSize: 11, color: 'var(--fg)' }}>
-                floor {score3(threshold)}
-              </span>
-              {lowerPresets.length > 0 ? (
-                lowerPresets.map((p) => (
-                  <button key={p.key} type="button" className="btn" onClick={() => setParams({ th: p.value })}>
-                    try {p.label} {score3(p.value)}
+          {hits.length === 0 ? (
+            <Empty
+              title="nothing cleared the floor"
+              body="empty is the designed answer, not a failure."
+              action={
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg)' }}>
+                  floor {score3(threshold)} — try a lower preset above
+                </span>
+              }
+            />
+          ) : (
+            <div className="list">
+              {hits.map((hit) => (
+                <Hit key={hit.id} hit={hit} />
+              ))}
+              {near.length > 0 ? (
+                <div style={{ borderTop: '1px solid var(--hairline)', padding: '10px 15px' }}>
+                  <button type="button" className="ghost" onClick={() => setShowNear(!showNear)}>
+                    {showNear ? <IconChevronUp size={12} /> : <IconChevronDown size={12} />}
+                    {near.length} below floor {score3(nearFloor)}
+                    {showNear ? ' · hide' : ' · show'}
                   </button>
-                ))
-              ) : (
-                <span style={{ fontSize: 11, color: 'var(--dim)' }}>try a lower preset</span>
-              )}
-            </>
-          }
-        />
-      ) : null}
-
-      {!loading && hits.length > 0 ? (
-        <section className="card" style={{ padding: 0 }}>
-          {hits.map((hit, i) => (
-            <div key={hit.id} style={{ borderTop: i === 0 ? undefined : '1px solid var(--hairline)' }}>
-              <Hit hit={hit} />
+                  {showNear ? (
+                    <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {near.slice(0, 5).map((nm, i) => (
+                        <div key={i} className="hit is-dim" style={{ padding: '8px 10px', border: '1px solid var(--hairline)', borderRadius: 'var(--radius-sm)' }}>
+                          <div className="hit-head">
+                            <span className="hit-meta">relevance {score3(nm.relevance)}</span>
+                          </div>
+                          <div className="hit-text">{truncate(nm.text, 240)}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
-          ))}
-        </section>
+          )}
+        </>
       ) : null}
     </div>
   );

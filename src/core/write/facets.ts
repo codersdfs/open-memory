@@ -7,7 +7,15 @@
  * version chain readable as one entity rather than N unrelated sentences.
  */
 
-export const FACET_PREFIXES = ["entity:", "topic:", "path:"] as const;
+/**
+ * `conflict:` (P5, ADR-0047) is a facet the write path mints, never the text: reconcile
+ * stamps a pair whose judge was absent and whose texts read as the same subject stated
+ * differently. It lives in the prefix vocabulary so the marker lands in `memory_facets`
+ * through the same invariant as every other facet — postings count the facet tags the
+ * row carries — and so a facet-filtered read (`MemoryFilter.facet`) can list the pending
+ * pairs. `deriveFacets` never emits it; only the conflict path does.
+ */
+export const FACET_PREFIXES = ["entity:", "topic:", "path:", "conflict:"] as const;
 export const MAX_TAGS = 8;
 
 const MAX_FACET_VALUE = 40;
@@ -210,6 +218,58 @@ export function buildTags(text: string, callerTags?: string[]): string[] {
 }
 
 /**
+ * The tags of a row that are facets — the exact set the `memory_facets` index mirrors
+ * (P4, ADR-0046). The store's write paths, the backfill and the invariant test all read
+ * their facet set through this one function, so the index and the tags column cannot
+ * disagree about what a facet is.
+ */
+export function facetTagsOf(tags?: string[]): string[] {
+  return (tags ?? []).filter(
+    (t): t is string => typeof t === "string" && FACET_PREFIXES.some((p) => t.toLowerCase().startsWith(p))
+  );
+}
+
+/**
+ * Tags after a rewrite (`updateEmbedding` — reembed, knowledge sync). The caller's
+ * plain tags are the caller's own convention and survive; the facets follow the text,
+ * because a facet was derived from the sentence the row used to be and a row whose
+ * text moved is about different things now.
+ *
+ * The cap's ordering is lossless-first, and that is why the conflict markers (P5,
+ * ADR-0047) go ahead of everything: a `conflict:*` tag describes a relationship between
+ * two rows, not the sentence this row carries, so a rewrite can never re-derive it —
+ * while the `entity:`/`topic:`/`path:` facets and any plain notes are recomputable or
+ * re-derivable from what the row now says. On a full row the cap must spend the
+ * reproducible tags first; putting the marker in the plain group (ordered after the
+ * derived facets) made an 8-tag row drop its pending adjudication on reembed, which is
+ * exactly the loss "markers survive a rewrite" exists to forbid.
+ */
+export function rederiveTags(previous: string[] | undefined, text: string): string[] {
+  const markers: string[] = [];
+  const plain: string[] = [];
+  for (const raw of previous ?? []) {
+    const tag = String(raw ?? "").trim();
+    if (!tag) continue;
+    const lower = tag.toLowerCase();
+    if (lower.startsWith("conflict:")) markers.push(tag);
+    else if (!FACET_PREFIXES.some((p) => lower.startsWith(p))) plain.push(tag);
+    // text-derived facets (entity:/topic:/path:) are dropped here — they re-derive below.
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  // Markers first, then the re-derived facets, then the caller's plain tags — so
+  // `slice(MAX_TAGS)` can only ever cost a tag the row can get back, never the one
+  // decision-made marker it cannot.
+  for (const tag of [...markers, ...deriveFacets(text), ...plain]) {
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+  }
+  return out.slice(0, MAX_TAGS);
+}
+
+/**
  * Facets a successor keeps from the row it replaced. `entity:` and `topic:` describe the
  * subject and survive a rewrite; `path:` describes the sentence that happened to mention
  * a file, so it is not inherited.
@@ -233,4 +293,19 @@ export function inheritFacets(oldTags: string[] | undefined, newTags: string[]):
     out.push(tag);
   }
   return out.slice(0, MAX_TAGS);
+}
+
+/**
+ * One deliberate relabel (P5, ADR-0047): append `tag` to a row's tags, deduped
+ * case-insensitively, and deliberately **not** capped. `MAX_TAGS` is the cap the write-
+ * time derivations spend so a full tag list drops free-form notes before join keys; a
+ * relabel that appended a marker by dropping an existing facet would break the join the
+ * row was reached by. The caller owns where the list goes — for the conflict marker that
+ * is `updateMeta`'s tags patch, which reindexes the postings in the same transaction.
+ */
+export function appendTag(tags: string[] | undefined, tag: string): string[] {
+  const list = tags ?? [];
+  const key = tag.toLowerCase();
+  if (list.some((t) => String(t ?? "").toLowerCase() === key)) return list;
+  return [...list, tag];
 }

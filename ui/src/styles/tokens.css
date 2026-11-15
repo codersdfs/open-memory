@@ -1,50 +1,70 @@
-/* D1 — one token set, two value blocks. Dark is Vantablack (default), light is Paper. */
+/* ADR-0043 — one token set, two value blocks, the Codex monochrome system.
+   Dark is near-black graphite (default); light is paper white. Accent is the ink
+   itself: a filled control is fg-on-surface inverted, never a hue. The four type
+   hues (--t-*) are the only colour that carries meaning — they mark memory types
+   in dots and legends, nothing else. Legacy names (--hairline, --accent, …) stay
+   so the views and components that read them keep working; only their values moved. */
 
 :root {
-  --radius: 8px;
-  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-sm: 7px;
+  --radius-lg: 14px;
   --motion: 150ms cubic-bezier(.2, .8, .2, 1);
   --motion-slow: 220ms cubic-bezier(.2, .8, .2, 1);
-  --font-ui: ui-sans-serif, "SF Pro Display", Geist, "Segoe UI", system-ui, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+  --font-ui: ui-sans-serif, system-ui, "Segoe UI", "SF Pro Text", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SF Mono", "JetBrains Mono", Consolas, monospace;
   --font-serif: "Iowan Old Style", "Newsreader", Georgia, serif;
 }
 
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --bg: #08090B;
-  --panel: #0E1013;
-  --panel-2: #14171C;
-  --hairline: rgba(255, 255, 255, .06);
-  --hairline-strong: rgba(255, 255, 255, .11);
-  --fg: #E9EBEF;
-  --dim: #8A9099;
-  --faint: #5A6068;
-  --accent: #8FA6FF;
-  --accent-dim: rgba(143, 166, 255, .16);
-  --ok: #57C99A;
-  --warn: #E3B341;
-  --danger: #F0616D;
-  --shadow: 0 24px 48px -24px rgba(0, 0, 0, .6);
+  --bg: #0D0D0E;
+  --panel: #131315;
+  --panel-2: #1A1A1D;
+  --hairline: #26262B;
+  --hairline-strong: #303036;
+  --fg: #ECECEE;
+  --dim: #9A9AA3;
+  --faint: #606168;
+  /* Accent = ink. Filled controls are fg-on-surface inverted; pressed/active states
+     read as brighter strokes, not colours. */
+  --accent: #ECECEE;
+  --accent-dim: rgba(236, 236, 238, .08);
+  --on-accent: #0D0D0E;
+  --ok: #3ECF8E;
+  --warn: #E0AF68;
+  --danger: #F47067;
+  /* Memory-type hues: the only colour with meaning (dots, legends, nothing else). */
+  --t-sem: #7AA2F7;
+  --t-epi: #E0AF68;
+  --t-pro: #4FD6BE;
+  --t-work: #9AA0B0;
+  --shadow: 0 16px 40px -28px rgba(0, 0, 0, .8);
+  --ring: 0 0 0 3px rgba(236, 236, 238, .07);
 }
 
 :root[data-theme='light'] {
   color-scheme: light;
 
-  --bg: #FBFAF7;
-  --panel: #FFFFFF;
-  --panel-2: #F5F3EE;
-  --hairline: rgba(0, 0, 0, .07);
-  --hairline-strong: rgba(0, 0, 0, .14);
-  --fg: #17181A;
-  --dim: #6F6D68;
-  --faint: #9C9A94;
-  --accent: #2F5D50;
-  --accent-dim: rgba(47, 93, 80, .12);
-  --ok: #2E7D5B;
-  --warn: #8A6A15;
-  --danger: #B3261E;
-  /* Paper has no shadow: separation is a hairline, per D2. */
-  --shadow: 0 0 0 1px var(--hairline-strong);
+  --bg: #FFFFFF;
+  --panel: #FAFAF9;
+  --panel-2: #F4F4F2;
+  --hairline: #E7E7E4;
+  --hairline-strong: #D9D9D6;
+  --fg: #18181B;
+  --dim: #6E6E76;
+  --faint: #A1A1AA;
+  --accent: #18181B;
+  --accent-dim: rgba(24, 24, 27, .06);
+  --on-accent: #FFFFFF;
+  --ok: #0F8A62;
+  --warn: #9A6700;
+  --danger: #CF222E;
+  --t-sem: #5B70D6;
+  --t-epi: #9A6700;
+  --t-pro: #0E8A80;
+  --t-work: #8B8D98;
+  --shadow: 0 1px 2px rgba(20, 18, 12, .05);
+  --ring: 0 0 0 3px rgba(24, 24, 27, .06);
 }

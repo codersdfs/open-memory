@@ -10,6 +10,7 @@
 import type { Memory, MemoryStatus, MemoryType } from "./types.js";
 import { KINDS, STATUSES, TYPES } from "./types.js";
 import { isDurableKind, KIND_RETENTION_MS } from "./write/kind.js";
+import { facetTagsOf } from "./write/facets.js";
 
 /** Median of the values, 0 when there are none. Even counts average the middle pair. */
 export function median(values: number[]): number {
@@ -31,6 +32,19 @@ const LOW_IMPORTANCE = 0.5;
 const ARCHIVE_AGE_MS = 30 * DAY_MS;
 const ARCHIVE_IMPORTANCE_BELOW = 0.6;
 
+/**
+ * The P2 hotness rule (ADR-0016 amendment, 2026-11-07), mirrored here for the
+ * preview — same deliberate duplication as the constants above, so a change to
+ * `decay.ts` drifts the preview *visibly* instead of silently agreeing.
+ * `log1p(use_count) × exp(−ln2 · age / window)`, half-life = the kind's window,
+ * age from the last activity; keep line = one use one window past.
+ */
+function hotness(useCount: number, ageMs: number, halfLifeMs: number): number {
+  return Math.log1p(useCount) * Math.exp(-Math.LN2 * (ageMs / halfLifeMs));
+}
+/** Same derivation as `decay.ts:HOTNESS_KEEP`: `log1p(1) · exp(−ln2)` = `ln2/2`. */
+const ARCHIVE_HOTNESS_KEEP = Math.LN2 / 2;
+
 const STRENGTH_BUCKETS = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1"];
 const AGE_BUCKETS = ["<1d", "1-7d", "7-30d", "30-90d", ">90d"];
 
@@ -46,6 +60,8 @@ export interface DecayCandidate {
   createdAt: number;
   importance: number;
   strength: number;
+  /** Above-threshold retrievals so far — the number the hotness preview reads (P2). */
+  useCount: number;
   isDeleted: number;
   text: string;
   /**
@@ -53,6 +69,16 @@ export interface DecayCandidate {
    * `prune` only happens in the opt-in `hard` pass.
    */
   action: "archive" | "prune";
+}
+
+/** One side of an unjudged contradiction pair (P5, ADR-0047), as the console reads it. */
+export interface PendingConflict {
+  id: string;
+  type: MemoryType;
+  createdAt: number;
+  text: string;
+  /** The `conflict:*` facets the row carries — the entity(ies) the pair was named after. */
+  conflicts: string[];
 }
 
 export interface StatsSummary {
@@ -74,6 +100,15 @@ export interface StatsSummary {
   strength: StatsBucket[];
   age: StatsBucket[];
   decayCandidates: DecayCandidate[];
+  /**
+   * P5 (ADR-0047): readable-live rows wearing a `conflict:*` facet — writes stored while
+   * the relation judge was absent, waiting on an adjudication. Counted over the
+   * population `list()` shows by default (active, not tombstoned): a marker on a
+   * tombstone names a pair that no longer exists. The rows themselves follow so the
+   * console's pending panel groups the pairs without a second read.
+   */
+  pendingConflicts: number;
+  pendingConflictRows: PendingConflict[];
   textChars: number;
   /** `length / 4`, the same heuristic the budget uses. A size, never a "saving". */
   textTokensEstimate: number;
@@ -96,6 +131,7 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
   const strength = STRENGTH_BUCKETS.map((label) => ({ label, count: 0 }));
   const age = AGE_BUCKETS.map((label) => ({ label, count: 0 }));
   const decayCandidates: DecayCandidate[] = [];
+  const pendingConflictRows: PendingConflict[] = [];
   const byVectorDim: Record<string, number> = {};
   const heads = new Set<string>();
   let pins = 0, deleted = 0, active = 0, reinforced = 0, neverUsed = 0, supersedesLinks = 0, textChars = 0;
@@ -128,6 +164,17 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
     age[aIdx]!.count++;
 
     if (m.isDeleted) continue;
+    // P5 (ADR-0047): the pending-conflict queue. Only active rows count — an archived
+    // row is out of every read the panel could adjudicate through, and a tombstone
+    // already left above. The facet values come from the row's own tags through the
+    // same `facetTagsOf` the invariant and the postings read, so the count, the panel
+    // and the index cannot disagree about what a marker is.
+    const conflicts = facetTagsOf(m.tags)
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.startsWith("conflict:"));
+    if (conflicts.length > 0 && m.status === "active") {
+      pendingConflictRows.push({ id: m.id, type: m.type, createdAt: m.createdAt, text: m.text, conflicts });
+    }
     // Mirrors src/core/lifecycle/decay.ts in its own order: the hard pass prunes, the
     // default pass archives. A row both would touch is listed once, as a prune, because
     // that is the stronger claim an operator has to opt into.
@@ -137,15 +184,20 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
       : m.type === "working" && ageMs > WORKING_DECAY_MS;
     // ADR-0023: knowledge rows follow their file, not the clock, so the preview must
     // not advertise them as decay candidates the archive pass deliberately skips.
-    const archiveStale = m.knowledgeId === null && !isDurableKind(m.kind) && m.status === "active" && m.lastUsedAt === null
-      && now - m.createdAt > (KIND_RETENTION_MS[m.kind] ?? ARCHIVE_AGE_MS)
+    // P2 (ADR-0016 amendment): the binary "never retrieved" test is gone — the row is
+    // a candidate when its hotness fell under the keep line past its kind's window.
+    const window = KIND_RETENTION_MS[m.kind] ?? ARCHIVE_AGE_MS;
+    const clock = m.lastUsedAt ?? m.createdAt;
+    const archiveStale = m.knowledgeId === null && !isDurableKind(m.kind) && m.status === "active"
+      && now - clock > window
+      && hotness(m.useCount, now - clock, window) < ARCHIVE_HOTNESS_KEEP
       && m.importance < ARCHIVE_IMPORTANCE_BELOW;
     const hardStaleRow = m.knowledgeId === null && hardStale;
     const action: DecayCandidate["action"] | null = hardStaleRow ? "prune" : archiveStale ? "archive" : null;
     if (action) {
       decayCandidates.push({
         id: m.id, type: m.type, createdAt: m.createdAt, importance: m.importance,
-        strength: m.strength, isDeleted: m.isDeleted, text: m.text.slice(0, 120), action
+        strength: m.strength, useCount: m.useCount, isDeleted: m.isDeleted, text: m.text.slice(0, 120), action
       });
     }
   }
@@ -153,6 +205,7 @@ export function summarize(memories: Memory[], now: number): StatsSummary {
   return {
     total: memories.length, byType, byStatus, byKind, byProject, active, deleted, pinned: pins,
     reinforced, neverUsed, supersedesLinks, supersedeHeads: heads.size,
-    strength, age, decayCandidates, textChars, textTokensEstimate: Math.round(textChars / 4), byVectorDim
+    strength, age, decayCandidates, pendingConflicts: pendingConflictRows.length, pendingConflictRows,
+    textChars, textTokensEstimate: Math.round(textChars / 4), byVectorDim
   };
 }

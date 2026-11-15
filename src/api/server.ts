@@ -6,8 +6,13 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, normalize } from "node:path";
 import { MemoryService, CurationRejected, type SaveInput } from "../core/memoryService.js";
+import { ADVICE } from "../core/write/curation.js";
 import { stripEmbedding, TYPES, STATUSES, KINDS, type MemoryType, type MemoryKind, type MemoryStatus } from "../core/types.js";
-import { isScope, resolveReadScope, resolveWriteKey } from "../core/scope.js";
+import { isScope, resolveReadScope, resolveScopeKeys, resolveWriteKey } from "../core/scope.js";
+import {
+  PRINCIPAL_HEADER, isPrincipalNamespace, findForeignNamespace, readPrincipal, sameToken,
+  type Principal, type PrincipalBinding,
+} from "../core/principal.js";
 import { appVersion } from "../version.js";
 import { createEmbeddingProvider, EMBEDDING_PRESETS, previewEmbedding, type EmbeddingProvider } from "../core/embedding/index.js";
 import { reembedAll, type ReembedResult } from "../core/embedding/reembed.js";
@@ -17,6 +22,7 @@ import {
 } from "../core/settings.js";
 import { envFilePath } from "../core/envFile.js";
 import { validateJevKey } from "../core/judgment/judge.js";
+import { agentStatus, agentChat, AgentNoModel } from "./agent.js";
 
 // Resolved relative to this file, so the built layout must keep `src/api/` next to
 // `src/ui/` — which is why the build copies the static UI into `dist/src/ui` rather
@@ -64,19 +70,48 @@ function boolish(v: unknown): boolean {
 }
 const bad = (why: string) => ({ status: 400, body: { error: why } });
 
+/** The 403 for a namespace naming a segment this principal does not own (ADR-0049). */
+function foreignNamespaceError(ns: string, principal: PrincipalBinding) {
+  return {
+    status: 403,
+    error:
+      `namespace "${ns}" is outside this principal ("${principal.user}") — the daemon serves one ` +
+      `principal and files partitions under its segment; if the store moved machines, ` +
+      `re-bind with: ai-memory principal recover --from-db`,
+  };
+}
+
 /**
  * Which partition a write lands in. An explicit `namespace` still wins. A caller naming
  * `agent`/`scope` gets that one layer through `resolveWriteKey` — never the shared one.
  * A caller naming neither keeps the v0.2.0 legacy partition. Namespace is an daemon
  * internal here, so dropping `agent`/`scope` sent every scoped write to `default:default`
  * while the daemon-less path honoured it.
+ *
+ * P7 (ADR-0049): with a principal bound, the user segment is server-owned. An explicit
+ * namespace naming a foreign segment is refused with 403 — an explicit partition name is
+ * a promise about where a row lives, and the daemon neither honours another principal's
+ * segment nor quietly relabels the request. Scope the caller leaves unpinned resolves
+ * with the principal's segment, so what the caller's env says never survives the wire.
+ * The result is a union now; every caller checks for `status`.
  */
-function createNamespace(body: Record<string, unknown>): string {
+function createNamespace(
+  body: Record<string, unknown>,
+  principal: PrincipalBinding | null
+): { namespace: string } | { status: number; error: string } {
   const explicit = str(body.namespace, 200, 1);
-  if (explicit) return explicit;
+  if (explicit) {
+    if (principal && !isPrincipalNamespace(explicit, principal.user)) {
+      return foreignNamespaceError(explicit, principal);
+    }
+    return { namespace: explicit };
+  }
   const agent = str(body.agent, 200, 1) ?? undefined;
   const scope = isScope(body.scope) ? body.scope : undefined;
-  return agent || scope ? resolveWriteKey({ agent, scope }) : "default:default";
+  if (agent || scope) {
+    return { namespace: resolveWriteKey({ agent, scope, user: principal?.user }) };
+  }
+  return { namespace: "default:default" };
 }
 
 /**
@@ -93,16 +128,40 @@ function createNamespace(body: Record<string, unknown>): string {
  */
 async function searchScope(
   q: Record<string, unknown>,
-  service: MemoryService
-): Promise<{ namespace?: string; namespaces?: string[] }> {
+  service: MemoryService,
+  principal: PrincipalBinding | null
+): Promise<{ namespace?: string; namespaces?: string[] } | { status: number; error: string }> {
   const listed = str(q.namespaces, 2000, 1)?.split(",").map((s) => s.trim()).filter(Boolean);
-  if (listed && listed.length > 0) return { namespaces: listed };
+  if (listed && listed.length > 0) {
+    // A list is one read: one out-of-bounds entry refuses the whole request, because a
+    // partial answer to a question the caller asked is the lie a boundary must not tell.
+    if (principal) {
+      const foreign = findForeignNamespace(listed, principal.user);
+      if (foreign) return foreignNamespaceError(foreign, principal);
+    }
+    return { namespaces: listed };
+  }
   const explicit = str(q.namespace, 200, 1);
-  if (explicit) return { namespace: explicit };
+  if (explicit) {
+    if (principal && !isPrincipalNamespace(explicit, principal.user)) {
+      return foreignNamespaceError(explicit, principal);
+    }
+    return { namespace: explicit };
+  }
   const agent = str(q.agent, 200, 1) ?? undefined;
   const scope = isScope(q.scope) ? q.scope : undefined;
   const all = boolish(q.all);
   if (agent || scope || all) {
+    if (principal) {
+      // The user segment is the principal's, never the ambient env of this process:
+      // `all` enumerates the store filtered by it, and agent/scope resolves the
+      // read fan-out (own + shared + legacy) from it.
+      if (all) {
+        const { namespaces } = await resolveReadScope({ all: true }, service.store, principal.user);
+        return { namespaces };
+      }
+      return { namespaces: resolveScopeKeys({ agent, scope: scope ?? "private", user: principal.user }) };
+    }
     const { namespaces } = await resolveReadScope({ agent, scope, all }, service.store);
     return { namespaces };
   }
@@ -116,13 +175,19 @@ function knowledgeScope(scope: { namespace?: string; namespaces?: string[] }): {
     : { namespace: scope.namespace ?? "default:default" };
 }
 
-function parseCreate(body: Record<string, unknown>) {  const text = str(body.text, 5000, 1);
+function parseCreate(body: Record<string, unknown>, principal: PrincipalBinding | null) {
+  const text = str(body.text, 5000, 1);
   if (!text) return bad("text required (1-5000 chars)");
   const type = enumOf(body.type, TYPES);
   if (!type) return bad(`type must be one of ${TYPES.join("|")}`);
+  const ns = createNamespace(body, principal);
+  // The route contract is `{status, body}` for refusals (bad() below); the namespace
+  // error arrives as `{status, error}` and is re-wrapped here so every caller — the
+  // bulk route included, which spreads `body` and adds its row `index` — sees one shape.
+  if ("status" in ns) return { status: ns.status, body: { error: ns.error } };
   return {
     data: {
-      namespace: createNamespace(body),
+      namespace: ns.namespace,
       type: type as MemoryType,
       text,
       // ADR-0020/0021. Omitted means "let the store decide": project falls back to the
@@ -141,14 +206,17 @@ function parseCreate(body: Record<string, unknown>) {  const text = str(body.tex
   };
 }
 
-async function parseSearch(q: Record<string, unknown>, service: MemoryService) {
+async function parseSearch(q: Record<string, unknown>, service: MemoryService, principal: PrincipalBinding | null) {
   const query = str(q.query, 2000, 1);
   if (!query) return bad("query required");
+  const scope = await searchScope(q, service, principal);
+  // Same re-wrap as parseCreate: the route reads `{status, body}` for refusals.
+  if ("status" in scope) return { status: scope.status, body: { error: scope.error } };
   return {
     data: {
       query,
       // Overrides `namespace`, and resolves `agent`/`scope`/`all` when it is absent.
-      ...(await searchScope(q, service)),
+      ...scope,
       type: enumOf(q.type, TYPES),
       project: q.project === undefined ? undefined : q.project === null ? null : String(q.project),
       kind: enumOf(q.kind, KINDS) as MemoryKind | undefined,
@@ -177,9 +245,27 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
 }
 
-export async function buildServer(opts?: { dbPath?: string; service?: MemoryService; onShutdown?: () => void }) {
+export async function buildServer(opts?: {
+  dbPath?: string;
+  service?: MemoryService;
+  onShutdown?: () => void;
+  /** Env the agent routes read (ADR-0043). Defaults to the merged seam; tests inject a
+   *  fixed one so "no key" and "mock endpoint" are facts of the test, not of the machine. */
+  agentEnv?: NodeJS.ProcessEnv;
+  /**
+   * P7 (ADR-0049): the principal this server requires on every read/write route —
+   * token in `PRINCIPAL_HEADER`, user segment owned server-side. The daemon main block
+   * is what loads or creates the key file and binds it here; `undefined`/`null` builds
+   * the ungated server the tests and library embedders have always built, because a
+   * gate over a token nobody holds is a 401 generator, not a boundary — the boundary
+   * lives where the key file does.
+   */
+  principal?: PrincipalBinding | null;
+}) {
   const service = opts?.service ?? new MemoryService({ dbPath: opts?.dbPath });
   await service.init();
+  const agentEnv = opts?.agentEnv ?? runtimeEnv();
+  const principal = opts?.principal ?? null;
 
   // How the process stops, as a callback because a test has to prove the route reached
   // it without the runner dying. The default is the real thing: drop the listener first,
@@ -191,7 +277,7 @@ export async function buildServer(opts?: { dbPath?: string; service?: MemoryServ
   });
 
   const app: Server = createServer((req, res) => {
-    void handle(req, res, service, shutdown).catch((e) => {
+    void handle(req, res, service, shutdown, agentEnv, principal).catch((e) => {
       const status = e instanceof SyntaxError ? 400 : 500;
       send(res, status, { error: e instanceof Error ? e.message : String(e) });
     });
@@ -219,7 +305,14 @@ function send(res: ServerResponse, status: number, body: unknown) {
   res.end(data);
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, service: MemoryService, shutdown: () => void) {
+async function handle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  service: MemoryService,
+  shutdown: () => void,
+  agentEnv: NodeJS.ProcessEnv,
+  principal: PrincipalBinding | null
+) {
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
   const method = req.method ?? "GET";
@@ -240,6 +333,48 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     if (foreign) return send(res, foreign.status, { error: foreign.error });
   }
 
+  // P7 (ADR-0049): the principal gate. Every read/write route demands the daemon's
+  // token; what stays open is `/health` (the liveness probe the CLI and `daemon restart`
+  // decide on — it names no partition) and the static documents, which are code and
+  // markup and carry no secret — the console authenticates like every other client, and
+  // nothing served here to an unauthenticated reader contains the token. No token is
+  // 401; a token that is not this daemon's is 403 — the difference is the one an
+  // operator can act on (did the client read the key file at all, vs is a foreign
+  // principal knocking).
+  if (principal && !gateExempt(path, method)) {
+    const presented = req.headers[PRINCIPAL_HEADER];
+    if (typeof presented !== "string" || presented.length === 0) {
+      return send(res, 401, {
+        error:
+          `principal token required — send the daemon's key in the ${PRINCIPAL_HEADER} header ` +
+          `(key file: ${principal.path ?? "the memory home"})`,
+      });
+    }
+    if (!sameToken(presented, principal.token)) {
+      // The key file may have been re-issued under this daemon (`principal recover`):
+      // the running process still holds the old binding while the file holds the new
+      // token. The shutdown route is the repair lever — a caller presenting the file's
+      // *current* token is the account owner (only the owning OS account can read the
+      // file), so it may stop the daemon for the re-bind — while every other route
+      // refuses with the one message that names the way out, because a new-token
+      // request against the old binding would be enforced under the old user segment.
+      const reissued = (await readPrincipal())?.token;
+      if (reissued !== undefined && sameToken(presented, reissued)) {
+        if (path === "/admin/shutdown" && method === "POST") {
+          return shutdownRoute(req, res, shutdown);
+        }
+        return send(res, 403, {
+          error:
+            "the key file has been re-issued since this daemon started — restart it to pick up " +
+            "the new binding: ai-memory daemon restart",
+        });
+      }
+      return send(res, 403, {
+        error: `principal token mismatch — this daemon serves one principal ("${principal.user}")`,
+      });
+    }
+  }
+
   if (path === "/health") {
     // `version` is what lets a CLI notice a daemon left running from an older
     // install. Reachability alone is not enough: a stale daemon answers /health
@@ -251,8 +386,29 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       version: await appVersion(),
     });
   }
+  // ADR-0043 — the console agent. Same-origin only in practice (tier A gates the POST);
+  // the loop executes the store's own gates, and without a key it says so rather than
+  // pretending: 501 `no-model` is what the console's local mode keys off.
+  if (path === "/agent/status" && method === "GET") {
+    return send(res, 200, agentStatus(agentEnv));
+  }
+  if (path === "/agent/chat" && method === "POST") {
+    const body = await readJson(req);
+    if (!Array.isArray(body.messages)) return send(res, 400, { error: "messages required" });
+    try {
+      return send(res, 200, await agentChat(service, body, { env: agentEnv }));
+    } catch (e) {
+      if (e instanceof AgentNoModel) {
+        return send(res, 501, { error: "no-model", hint: "set OPENAI_API_KEY (Settings → credentials, or .env) and restart the daemon" });
+      }
+      return send(res, 502, { error: e instanceof Error ? e.message : String(e) });
+    }
+  }
   if (path === "/stats" && method === "GET") {
     const ns = str(q.namespace, 200, 1) ?? "default:default";
+    if (principal && !isPrincipalNamespace(ns, principal.user)) {
+      return send(res, 403, foreignNamespaceError(ns, principal));
+    }
     const total = (await service.list({ namespace: ns, limit: 1 })).total;
     const byType: Record<string, number> = {};
     for (const t of TYPES) byType[t] = (await service.list({ namespace: ns, type: t as MemoryType, limit: 1 })).total;
@@ -266,14 +422,31 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     const rows = (await service.list({ namespace: ns, includeDeleted: true, limit: STATS_ROW_CAP })).memories;
     const { total: _rows, byType: _byType, ...full } = summarize(rows, Date.now());
     const dbPath = (service as unknown as { dbPath?: string }).dbPath ?? null;
-    return send(res, 200, { ...base, rowsScanned: _rows, ...full, dbPath, dbBytes: dbPath ? await fileSize(dbPath) : null });
+    // P2 (ADR-0016 amendment): the decay panel has to say when the automatic pass
+    // last ran and what it did. The bookkeeping lives in `store_meta`, not in this
+    // process, because "overdue since when" survives restarts — and `null` here
+    // means "never", which is the honest answer on a store without the KV.
+    const { LAST_MAINTENANCE_AT_KEY, LAST_MAINTENANCE_RESULT_KEY } = await import("../core/lifecycle/maintenance.js");
+    const lastAt = await service.store.getMeta?.(LAST_MAINTENANCE_AT_KEY);
+    const lastResult = await service.store.getMeta?.(LAST_MAINTENANCE_RESULT_KEY);
+    return send(res, 200, {
+      ...base, rowsScanned: _rows, ...full, dbPath, dbBytes: dbPath ? await fileSize(dbPath) : null,
+      lastMaintenanceAt: lastAt === null || lastAt === undefined ? null : Number(lastAt),
+      lastMaintenanceResult: lastResult ?? null
+    });
   }
   if (path === "/namespaces" && method === "GET") {
     // The partitions a namespace picker has to offer. `includeDeleted` on purpose:
     // a partition holding only tombstones reads as empty everywhere else, and
     // "why is my picker missing the namespace I saved into" is the confusion this
     // route exists to remove. No query params, no writes — the store decides.
-    return send(res, 200, { namespaces: await service.store.distinctNamespaces({ includeDeleted: true }) });
+    // P7 (ADR-0049): a picker offering partitions the caller cannot open is noise
+    // plus a directory of other segments, so a bound principal sees its own
+    // segment's partitions and the legacy one — the same set its reads fan out over.
+    const held = await service.store.distinctNamespaces({ includeDeleted: true });
+    return send(res, 200, {
+      namespaces: principal ? held.filter((ns) => isPrincipalNamespace(ns, principal.user)) : held,
+    });
   }
   // The embedding switch (ticket 015, ADR-0009). The console may *write* the switch;
   // it may not *become* it: the running embedder is frozen at construction, so an
@@ -400,18 +573,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   // the loopback address is answered as if the route were not there: a 403 would confirm
   // it is, and this is not a route to advertise.
   if (path === "/admin/shutdown" && method === "POST") {
-    // The peer is settled above, before the Origin tier, so a non-loopback caller is 404 by
-    // now. A loopback peer is still only half the question: a page open in the user's own
-    // browser is one too. Its `Origin` was already refused above if it named another
-    // machine; what is left is this route's own JSON requirement (tier B).
-    const refused = notJsonProblem(req);
-    if (refused) return send(res, refused.status, { error: refused.error });
-    res.writeHead(204);
-    res.end();
-    // `finish`, not the end of this function: the 204 has to leave before the listener
-    // carrying it goes away.
-    res.on("finish", shutdown);
-    return;
+    return shutdownRoute(req, res, shutdown);
   }
 
   if (path === "/embedding/reembed" && method === "GET") {
@@ -471,6 +633,18 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, { ...report, affected: report.archived + report.pruned });
   }
 
+  // Retroactive curation over the stock (ADR-0040 amendment, P3). Same reason this
+  // route must live in the daemon as /decay: the decoded partition snapshots are
+  // invalidated per process (ADR-0034's changes log), so an archive/demote written
+  // from another process would leave this daemon scoring dead rows as live until
+  // restart. The body is `{apply?: boolean}` — absent/false keeps the diff-first
+  // default and writes nothing.
+  if (path === "/triage" && method === "POST") {
+    const body = await readJson(req);
+    const { runTriage } = await import("../core/lifecycle/triage.js");
+    return send(res, 200, await runTriage(service.store, { apply: body.apply === true }));
+  }
+
   if (path === "/compact" && method === "POST") {
     // Soft delete keeps the bytes: this is the operator's one lever that gives them
     // back. Optional on the store, so a store without a file to rewrite answers 501
@@ -485,7 +659,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
   if (path === "/brief" && (method === "GET" || method === "POST")) {
     const body = method === "POST" ? await readJson(req) : {};
     const qq: Record<string, unknown> = { ...q, ...body };
-    const scope = await searchScope(qq, service);
+    const scope = await searchScope(qq, service, principal);
+    if ("status" in scope) return send(res, scope.status, { error: scope.error });
     const sinceDays = num(qq.sinceDays, 1, 3650);
     const brief = await service.brief({
       ...(scope.namespaces ? { namespaces: scope.namespaces } : { namespace: scope.namespace }),
@@ -516,7 +691,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
         project,
         note,
         agent: str(body.agent, 200, 1) ?? undefined,
-        user: str(body.user, 200, 1) ?? undefined
+        // P7 (ADR-0049): the marker row lands in the shared layer of the user segment —
+        // the one field here that decides a partition. With a principal bound the
+        // caller does not pick it; the overwrite is the whole point of the segment.
+        user: principal ? principal.user : (str(body.user, 200, 1) ?? undefined)
       });
       return send(res, out.created ? 201 : 200, out);
     } catch (e) {
@@ -560,12 +738,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, report);
   }
   if (path === "/knowledge" && method === "GET") {
-    return send(res, 200, await service.knowledge(knowledgeScope(await searchScope(q, service))));
+    const scope = await searchScope(q, service, principal);
+    if ("status" in scope) return send(res, scope.status, { error: scope.error });
+    return send(res, 200, await service.knowledge(knowledgeScope(scope)));
   }
   const knowledgeDetail = path.match(/^\/knowledge\/([^/]+)(\/neighbors)?$/);
   if (knowledgeDetail && method === "GET") {
     const id = decodeURIComponent(knowledgeDetail[1]!);
-    const opts = knowledgeScope(await searchScope(q, service));
+    const scope = await searchScope(q, service, principal);
+    if ("status" in scope) return send(res, scope.status, { error: scope.error });
+    const opts = knowledgeScope(scope);
     if (knowledgeDetail[2]) {
       const depth = num(q.depth, 1, 3) ?? 1;
       return send(res, 200, await service.knowledgeNeighbors({ ...opts, id, depth }));
@@ -575,12 +757,45 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     return send(res, 200, page);
   }
 
+  // Codebase index (ADR-0050). `index` is the only writer, exactly like the vault
+  // sync above; the reads answer out of the derived tables, never off the files.
+  if (path === "/codebase/index" && method === "POST") {
+    const body = await readJson(req);
+    const report = await service.codebaseSync({
+      root: body.dir === undefined ? undefined : String(body.dir),
+      project: body.project === undefined ? undefined : body.project === null ? null : String(body.project),
+      dryRun: body.dryRun === true
+    });
+    return send(res, 200, report);
+  }
+  if (path === "/codebase/search" && method === "GET") {
+    const query = str(q.q);
+    if (!query) return send(res, 400, { error: "codebase search: q is required" });
+    const result = await service.codebaseSearch({
+      query,
+      k: num(q.k, 1, 100),
+      budgetTokens: num(q.budget, 1, 100000),
+      project: q.project ?? null
+    });
+    return send(res, 200, result);
+  }
+  const codebaseDetail = path.match(/^\/codebase\/symbol\/([^/]+)$/);
+  if (codebaseDetail && method === "GET") {
+    const id = decodeURIComponent(codebaseDetail[1]!);
+    const detail = await service.codebaseSymbol({ idOrName: id, project: q.project ?? null });
+    if (!detail) return send(res, 404, { error: `unknown codebase symbol: ${id}` });
+    return send(res, 200, detail);
+  }
+  if (path === "/codebase" && method === "DELETE") {
+    return send(res, 200, await service.codebaseForget({ project: q.project ?? null }));
+  }
+
   // Must precede the `/memories/:id` route below: that pattern also matches
   // "/memories/search", so a GET would be read as "fetch the memory whose id is
   // search" and answer 404 — which is exactly what `search` did whenever a
   // daemon was running, while the daemon-less path and `POST` kept working.
   if (/^\/memories\/search$/.test(path)) {
-    const p = await parseSearch(method === "GET" ? q : await readJson(req), service);
+    const p = await parseSearch(method === "GET" ? q : await readJson(req), service, principal);
     if ("status" in p) return send(res, p.status, p.body);
     const result = await service.search(p.data);
     return send(res, 200, wantsEmbedding(q) ? result : { ...result, memories: result.memories.map(stripEmbedding) });
@@ -596,14 +811,21 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     if (items.length > BULK_LIMIT) return send(res, 413, { error: `too many items (max ${BULK_LIMIT} per request)` });
     const parsed: SaveInput[] = [];
     for (let i = 0; i < items.length; i++) {
-      const p = parseCreate(items[i]);
+      const p = parseCreate(items[i], principal);
       // A bad row fails the request by index rather than being skipped: a partial
       // import that reports success is how a re-run ends up with duplicates.
       if ("status" in p) return send(res, p.status, { ...p.body, index: i });
       parsed.push(p.data);
     }
-    const { memories } = await service.saveMany(parsed, { reconcile: body.reconcile === true });
-    return send(res, 201, { saved: memories.length, ids: memories.map((m) => m.id) });
+    // The bulk gate (ADR-0018 amendment, 2026-11-07): curation runs on every item at
+    // zero network cost and rejected or folded rows come back per row in
+    // `skipDetails` — `raw: true` excuses every reject except `secret` and except
+    // empty text, and skips demotion; exact duplicates fold on every path.
+    const { memories, skipped, skipDetails } = await service.saveMany(parsed, {
+      reconcile: body.reconcile === true,
+      raw: body.raw === true
+    });
+    return send(res, 201, { saved: memories.length, ids: memories.map((m) => m.id), skipped, skipDetails });
   }
 
   const mem = new RegExp("^/memories(/[^/]+)?(/supersede)?$").exec(path);
@@ -611,19 +833,33 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     const id = mem[1] ? decodeURIComponent(mem[1].slice(1)) : null;
     if (id && mem[2] && method === "POST") {
       const body = await readJson(req);
-      const p = parseCreate(body);
+      const p = parseCreate(body, principal);
       if ("status" in p) return send(res, p.status, p.body);
       // A replacement belongs in the partition of the memory it replaces. Over the daemon
       // the CLI sends no namespace, so the create default moved the new row out of the
       // partition the old one lived in, while the in-process path kept it.
+      // P7 (ADR-0049): a bound principal also reads the old row's partition before it
+      // lets a supersede touch it — an id is an address, and the segment it resolves to
+      // is checked like any other.
+      const old = await service.get(id);
+      if (principal && old && !isPrincipalNamespace(old.namespace, principal.user)) {
+        return send(res, 403, foreignNamespaceError(old.namespace, principal));
+      }
       if (!str(body.namespace, 200, 1) && !str(body.agent, 200, 1) && !isScope(body.scope)) {
-        const old = await service.get(id);
         if (old) p.data.namespace = old.namespace;
       }
       return send(res, 201, await service.supersede(id, p.data));
     }
     if (id && !mem[2] && method === "PATCH") {
       const body = await readJson(req);
+      // P7 (ADR-0049): the boundary is the row's own partition — updateMeta takes an id,
+      // so the check rides a lookup of the row the patch would land on.
+      if (principal) {
+        const existing = await service.get(id);
+        if (existing && !isPrincipalNamespace(existing.namespace, principal.user)) {
+          return send(res, 403, foreignNamespaceError(existing.namespace, principal));
+        }
+      }
       // `isDeleted` is how `restore` reaches the tombstone; without it the daemon
       // silently answered "ok" while leaving the row soft-deleted.
       const isDeleted = body.isDeleted === undefined || body.isDeleted === null ? undefined : body.isDeleted ? 1 : 0;
@@ -639,16 +875,44 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       return updated ? send(res, 200, updated) : send(res, 404, { error: "not found" });
     }
     if (id && !mem[2] && method === "GET") {
+      // The chain walk (P6, ADR-0045) is explicit: `?drill=1` returns the whole
+      // supersede chain plus the row's write history. A bare GET keeps answering
+      // with the row alone — a chain nobody asked for is context the caller must
+      // pay for, and the search path carries only the one-hop predecessor pointer.
+      if (boolish(q.drill)) {
+        const view = await service.drill(id);
+        if (principal && view.memory && !isPrincipalNamespace(view.memory.namespace, principal.user)) {
+          return send(res, 403, foreignNamespaceError(view.memory.namespace, principal));
+        }
+        return send(res, 200, wantsEmbedding(q) ? view : {
+          ...view,
+          ...(view.memory ? { memory: stripEmbedding(view.memory) } : {}),
+          ancestors: view.ancestors.map(stripEmbedding),
+          successors: view.successors.map(stripEmbedding)
+        });
+      }
       const found = await service.get(id);
       if (!found) return send(res, 404, { error: "not found" });
+      if (principal && !isPrincipalNamespace(found.namespace, principal.user)) {
+        return send(res, 403, foreignNamespaceError(found.namespace, principal));
+      }
       return send(res, 200, wantsEmbedding(q) ? found : stripEmbedding(found));
     }
     if (id && !mem[2] && method === "DELETE") {
+      // P7 (ADR-0049): same by-id check as PATCH — a delete is a write to the row's
+      // partition. An unknown id keeps today's no-op `{ok:true}` (the store's soft
+      // delete never checked existence either).
+      if (principal) {
+        const existing = await service.get(id);
+        if (existing && !isPrincipalNamespace(existing.namespace, principal.user)) {
+          return send(res, 403, foreignNamespaceError(existing.namespace, principal));
+        }
+      }
       await service.delete(id);
       return send(res, 200, { ok: true });
     }
     if (!id && method === "POST") {
-      const p = parseCreate(await readJson(req));
+      const p = parseCreate(await readJson(req), principal);
       if ("status" in p) return send(res, p.status, p.body);
       try {
         return send(res, 201, await service.save(p.data));
@@ -660,8 +924,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
       }
     }
     if (!id && method === "GET") {
+      const listedNamespace = str(q.namespace, 200, 1);
+      if (principal && listedNamespace && !isPrincipalNamespace(listedNamespace, principal.user)) {
+        return send(res, 403, foreignNamespaceError(listedNamespace, principal));
+      }
       const listed = await service.list({
-        namespace: str(q.namespace, 200, 1) ?? "default:default",
+        namespace: listedNamespace ?? "default:default",
         type: enumOf(q.type, TYPES),
         project: q.project === undefined ? undefined : q.project === null ? null : String(q.project),
         kind: enumOf(q.kind, KINDS),
@@ -681,8 +949,38 @@ async function handle(req: IncomingMessage, res: ServerResponse, service: Memory
     const body = await readJson(req);
     const text = str(body.text ?? body.turnText, 20000, 1);
     if (!text) return send(res, 400, { error: "text required" });
-    const { memories, rejected } = await service.extractAndSave(text, str(body.namespace, 200, 1) ?? "default:default");
+    const namespace = str(body.namespace, 200, 1) ?? "default:default";
+    if (principal && !isPrincipalNamespace(namespace, principal.user)) {
+      return send(res, 403, foreignNamespaceError(namespace, principal));
+    }
+    const { memories, rejected } = await service.extractAndSave(text, namespace);
     return send(res, 200, { extracted: memories.length, rejected, memories });
+  }
+
+// The drop ledger (ADR-0040 observability): what the filter refused and why, after
+  // the 422 that said so has been discarded. Read-only, and `text` asks about one exact
+  // note — folded on its hash, so the answer to "did the next run hit the same error" is
+  // a count and a first-refusal time rather than a re-run of the write.
+  // Namespaces are principal-gated both ways: the query may not read another user's
+  // refusals, and the rows returned are filtered, because one bulk import can span
+  // partitions and a leaked preview is still a leak.
+  if (path === "/drops" && method === "GET") {
+    const ns = str(q.namespace, 200, 1);
+    if (ns && principal && !isPrincipalNamespace(ns, principal.user)) {
+      return send(res, 403, foreignNamespaceError(ns, principal));
+    }
+    const junk = q.junk === undefined ? undefined : enumOf(String(q.junk), Object.keys(ADVICE));
+    if (q.junk !== undefined && !junk) return send(res, 400, { error: `unknown junk class: ${String(q.junk)}` });
+    const drops = await service.curationDrops({
+      text: str(q.text, 5000, 1) ?? undefined,
+      namespace: ns ?? undefined,
+      junk,
+      since: num(q.since, 0, Number.MAX_SAFE_INTEGER),
+      limit: num(q.limit, 1, 500) ?? 50
+    });
+    return send(res, 200, {
+      drops: principal ? drops.filter((d) => isPrincipalNamespace(d.namespace, principal.user)) : drops
+    });
   }
 
   // pi's own session timeline. Read-only and unindexed: the files are the source of
@@ -858,6 +1156,46 @@ async function guardSettingsWrite(
     return { ok: false, status: 400, error: e instanceof Error ? e.message : "bad settings" };
   }
   return { ok: true, preview };
+}
+
+/**
+ * The shutdown route's body, shared by the normal path and the re-issued-key repair
+ * path (the gate above). A loopback peer's `Origin` was already refused by tier A if it
+ * named another machine; what is left is this route's own JSON requirement (tier B).
+ */
+function shutdownRoute(req: IncomingMessage, res: ServerResponse, shutdown: () => void) {
+  const refused = notJsonProblem(req);
+  if (refused) return send(res, refused.status, { error: refused.error });
+  res.writeHead(204);
+  res.end();
+  // `finish`, not the end of the caller: the 204 has to leave before the listener
+  // carrying it goes away.
+  res.on("finish", shutdown);
+}
+
+/**
+ * What a tokenless caller may still reach (ADR-0049): `/health` — the liveness probe
+ * the CLI's daemon-vs-in-process decision and `daemon restart`'s poll both depend on,
+ * and which names no partition — and, for safe methods only, the static documents:
+ * the console shell under `/` and `/app`, plus assets. Those are code and markup, not
+ * store data, and they carry no secret: the console authenticates like every other
+ * client (its 401 gate, `PrincipalGate`), so an unauthenticated GET of any served page
+ * yields nothing that mints a header. Everything dotted must not be a data route: the
+ * four id-bearing GET prefixes are spelled out, so a session id or a knowledge slug
+ * that happens to contain a dot never reads as a static file.
+ */
+function gateExempt(path: string, method: string): boolean {
+  if (path === "/health") return true;
+  if (method !== "GET" && method !== "HEAD") return false;
+  if (path === "/" || path === "/app" || path.startsWith("/app/")) return true;
+  const last = path.slice(path.lastIndexOf("/") + 1);
+  if (!last.includes(".")) return false;
+  return (
+    !path.startsWith("/memories/") &&
+    !path.startsWith("/sessions/") &&
+    !path.startsWith("/knowledge/") &&
+    !path.startsWith("/projects/")
+  );
 }
 
 /**
@@ -1055,7 +1393,21 @@ try {
 if (runsAsMain) {
   const port = Number(process.env.PORT ?? process.env.MEMORY_PORT ?? 3000);
   const host = process.env.HOST ?? "127.0.0.1";
-  const { app } = await buildServer();
+  // P7 (ADR-0049): the daemon binds its one principal before it listens — this block is
+  // the only place the key file and the listener meet, which is what makes the gate a
+  // fact of the daemon rather than a convention. A home the key cannot be written into
+  // is a daemon that cannot honestly start: refusing here names the path instead of
+  // serving an ungated store.
+  const { loadOrCreatePrincipal } = await import("../core/principal.js");
+  let principal: Principal;
+  try {
+    principal = await loadOrCreatePrincipal();
+  } catch (e) {
+    console.error(`ai-memory cannot bind its principal key: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  console.log(`ai-memory principal: "${principal.user}" — key at ${principal.path}`);
+  const { app, service } = await buildServer({ principal });
   // Without this, a port clash is an unhandled 'error' event: the process dies
   // silently in the background and whoever spawned it just sees a timeout.
   app.on("error", (e: NodeJS.ErrnoException) => {
@@ -1064,4 +1416,26 @@ if (runsAsMain) {
     process.exit(1);
   });
   app.listen(port, host, () => console.log(`ai-memory → http://${host}:${port}`));
+  // P2 (ADR-0016 amendment): forgetting now has a trigger. `MEMORY_MAINTAIN_HOURS`
+  // (default 24, `0` off) drives a timer over the *reversible* pass only — the
+  // scheduler's entry point has no `hard` in its signature to pass. The call
+  // returns synchronously: an overdue store is caught up in the background and
+  // no request ever waits on a sweep. This block is the daemon too: `daemon
+  // restart` execs exactly this file.
+  const { startMaintenance } = await import("../core/lifecycle/maintenance.js");
+  startMaintenance(service.store, {
+    // P8 (ADR-0048): the bucket refresh rides the P2 scheduler — same serialized
+    // chain, after the reversible decay, its own ≥10% threshold deciding the work.
+    // The service returns null when MEMORY_BUCKET_PREFILTER is off (the default),
+    // which the hook logs as nothing.
+    refreshBuckets: () => service.refreshBucketSummaries()
+  });
+  // P8 (ADR-0048): warm the summaries at boot, so enabling the flag takes one
+  // restart rather than one restart plus up to a full maintenance interval of
+  // full scans. The refresh's own thresholds make this a no-op — zero embed
+  // calls — when every summary is already fresh; a failure costs one stderr
+  // line, and the searches it would have served were full scans anyway.
+  void service.refreshBucketSummaries().catch((e: unknown) => {
+    console.error(`ai-memory buckets: boot warm failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
 }

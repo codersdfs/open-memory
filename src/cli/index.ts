@@ -10,10 +10,13 @@ import { createEmbeddingProvider } from "../core/embedding/index.js";
 import { runtimeEnv } from "../core/settings.js";
 import { reembedAll } from "../core/embedding/reembed.js";
 import { appVersion } from "../version.js";
-import type { BriefResult, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
+import type { BriefResult, ChainView, Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import type { ProjectSummary } from "../core/store/interface.js";
 import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/view.js";
+import type { TriageReport } from "../core/lifecycle/triage.js";
+import type { CurationDrop } from "../core/write/curation.js";
 import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
+import type { CodebaseSearchResult, CodebaseSymbolDetail, CodebaseSyncReport } from "../core/codebase/types.js";
 import { isKind, KINDS, stripEmbedding } from "../core/types.js";
 import { renderEmptySearch } from "../core/retrieval/explain.js";
 import { CurationRejected, renderVerdict } from "../core/write/curation.js";
@@ -40,7 +43,8 @@ Memory
   search <query>         --k 5 --threshold 0.35 --budget 800 --scope private|shared --type t --kind k --project p
   brief                  what this project already decided: conventions, decisions, gotchas, open, recent
                          --budget 600 --since 14 --project p
-  get <id>               print one memory
+  get <id>               print one memory; --history walks the whole supersede chain
+                         plus the write history (ADR-0045) — never part of search
   list                   --limit 20 --type t --kind k --project p --status active
   forget <id...>         soft delete (kept, restorable)
   restore <id...>        undo a forget
@@ -48,19 +52,33 @@ Memory
   meta <id>              --status active|draft|archived --pin 0|1
   stats                  counts per type for the resolved scope(s)
   decay                  apply lifecycle decay / pruning
+  triage                 retroactive curation over the stock (ADR-0040 amendment):
+                         dry-run diff by default — would archive / would demote /
+                         merge candidates; --apply writes. Never deletes.
   extract <text>         pull candidate memories out of free text and save them
+  drops                  why writes got refused: the curation drop ledger (ADR-0040)
+                         --text "<the note>" narrows to one note (with repeat count);
+                         --junk <class> --limit N --json
   reembed                rewrite every stored vector with the current embedder
   knowledge              ls | show <id> | neighbors <id> | sync | link <from> <to>
                          markdown pages as linked knowledge: --dir <vault> --depth 1 --dry-run
   project list | init | rename | forget
                          manage projects: init [slug] [--note "..."], rename <from> <to> [--merge],
                          forget <slug> [--detach] (default forget soft-deletes, restorable)
+  codebase index | search <q> | symbol <name> | forget
+                         the repository's code as memory (ADR-0050): --dir <root> --dry-run --project p,
+                         search/symbol read the derived index; edges carry evidence (import | re-export |
+                         local | name-match | alias)
 
 Setup & introspection
   setup                  create the memory home dir; --copy-db migrates the old store; --link registers agents
   db info                which store would be used, and why
   db compact             VACUUM the store file: give back what soft delete kept
   daemon restart         stop the running daemon and start a fresh one
+  principal              the identity this machine's daemon serves (ADR-0049):
+                         status (default) | recover --from-db — re-bind the user
+                         segment from the store's own partitions after a lost key |
+                         reveal — print the token (the console's unlock gate takes it)
   mcp                    run the MCP stdio server (agents spawn this)
   inject                 read a hook payload on stdin, print context for this turn
   agent <sub>            init | list | status | doctor | link | unlink (per-agent integration)
@@ -196,7 +214,10 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
   if (await r.useDaemon()) {
     const res = await r.client().post<unknown>("/memories", payload);
     if (!res.ok) {
-      ctx.err(`save: ${res.error}`);
+      // A curation refusal arrives as its verdict text. The ledger keeps it, so point
+      // at the place that can show it again after the caller has dropped the answer.
+      const refused = res.error.startsWith("not stored ");
+      ctx.err(`save: ${res.error}${refused ? " (logged: ai-memory drops)" : ""}`);
       return 1;
     }
     const mem = unwrapMemory<Memory>(res.data);
@@ -221,7 +242,9 @@ async function cmdSave(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pr
     // The advice is the output: "not stored (table-row): store the fact the row
     // states, in a sentence" is a usable answer, "Error: ..." is not.
     if (e instanceof CurationRejected) {
-      ctx.err(`save: ${renderVerdict(e.verdict)}`);
+      // The refusal is only an answer while the caller is holding it; the ledger keeps
+      // it, so point at the place that can show it again on the next run.
+      ctx.err(`save: ${renderVerdict(e.verdict)} (logged: ai-memory drops)`);
       return 1;
     }
     throw e;
@@ -362,11 +385,24 @@ async function cmdGet(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pro
     ctx.err("get: id required");
     return 2;
   }
+  // P6 (ADR-0045): --history walks the whole supersede chain and prints the row's
+  // write history. Explicit, never a search side effect — a chain the caller did
+  // not ask for is context the caller must pay for reading.
+  const history = flagBool(a, "history");
   if (await r.useDaemon()) {
-    const res = await r.client().get<unknown>(`/memories/${encodeURIComponent(id)}`);
+    const res = await r.client().get<unknown>(`/memories/${encodeURIComponent(id)}${history ? "?drill=1" : ""}`);
     if (!res.ok) {
       ctx.err(`get: ${res.error}`);
       return 1;
+    }
+    if (history) {
+      const view = unwrapChainView(res.data);
+      if (!view.memory && view.events.length === 0) {
+        ctx.err(`get: no memory ${id}`);
+        return 1;
+      }
+      ctx.out(ctx.json ? JSON.stringify(view, null, 2) : renderChainView(view, ctx));
+      return 0;
     }
     let mem: Memory;
     try {
@@ -379,6 +415,15 @@ async function cmdGet(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pro
     return 0;
   }
   const svc = await r.service();
+  if (history) {
+    const view = await svc.drill(id);
+    if (!view.memory && view.events.length === 0) {
+      ctx.err(`get: no memory ${id}`);
+      return 1;
+    }
+    ctx.out(ctx.json ? JSON.stringify(view, null, 2) : renderChainView(view, ctx));
+    return 0;
+  }
   const mem = (await svc.get(id)) ?? null;
   if (!mem) {
     ctx.err(`get: no memory ${id}`);
@@ -386,6 +431,36 @@ async function cmdGet(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Pro
   }
   ctx.out(ctx.json ? JSON.stringify(mem, null, 2) : renderOne(mem));
   return 0;
+}
+
+/** The drill payload over the wire is the ChainView itself (no envelope to unwrap). */
+function unwrapChainView(data: unknown): ChainView {
+  const v = data as ChainView;
+  if (!v || typeof v !== "object" || !Array.isArray(v.ancestors) || !Array.isArray(v.events)) {
+    throw new Error("unexpected drill response");
+  }
+  return v;
+}
+
+function renderChainView(view: ChainView, ctx: Ctx): string {
+  const lines: string[] = [];
+  if (view.memory) lines.push(renderOne(view.memory));
+  else lines.push(`${"(purged)"}: the row is gone; its history survived it (ADR-0045)`);
+  const brief = (m: Memory, role: string) =>
+    `${role} ${m.id} [${m.isDeleted ? "tombstone" : m.status}] ${m.text.replace(/\s+/g, " ").slice(0, 100)}${m.text.length > 100 ? "…" : ""}`;
+  for (const a of view.ancestors) lines.push(`  ← ${brief(a, "superseded by this row:")}`);
+  for (const s of view.successors) lines.push(`  → ${brief(s, "supersedes this row:")}`);
+  if (view.events.length > 0) {
+    lines.push("  events:");
+    for (const e of view.events) {
+      const what = [e.reason, e.model].filter(Boolean).join(" / ");
+      lines.push(
+        `    ${new Date(e.at).toISOString()} ${e.event}${what ? ` (${what})` : ""}${e.newValue ? ` — ${e.newValue.replace(/\s+/g, " ").slice(0, 80)}` : ""}`
+      );
+    }
+  }
+  void ctx;
+  return lines.join("\n");
 }
 
 function renderOne(m: Memory): string {
@@ -648,6 +723,58 @@ async function cmdDecay(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): P
   return 0;
 }
 
+/**
+ * `ai-memory triage` — the retroactive half of the write contract (ADR-0040
+ * amendment 2026-11-08, P3 of the memory-systems research). Diff first: the
+ * default run writes nothing, `--apply` is the only mode that touches rows, and
+ * nothing here can hard-delete — junk leaves the pools by a status flip.
+ *
+ * The write goes through the daemon when one answers, exactly like `decay`
+ * (POST /triage): the decoded partition snapshots are invalidated per process
+ * (ADR-0034's changes log), so an apply has to run inside the daemon that serves
+ * the reads — written from here, that daemon would keep scoring archived and
+ * demoted rows as live until restart. A daemon older than the route answers 404
+ * and the identical code runs in-process — the `knowledge sync` fallback, safe
+ * because the write path is the same — and then the stderr note is what tells the
+ * caller why the running daemon must be restarted. The note rides stderr in BOTH
+ * output modes: stdout is the payload, and a script consuming `--json` must not
+ * lose the warning with it.
+ */
+async function cmdTriage(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const apply = flagBool(a, "apply") === true;
+  const { runTriage, renderTriageReport } = await import("../core/lifecycle/triage.js");
+
+  if (await r.useDaemon()) {
+    const res = await r.client().post<TriageReport>("/triage", { apply });
+    if (res.ok) {
+      // The daemon wrote (or diffed) itself: its own noteChange expired its
+      // snapshots, so nothing here needs the restart caveat.
+      if (ctx.json) ctx.out(JSON.stringify(res.data, null, 2));
+      else ctx.out(renderTriageReport(res.data));
+      return 0;
+    }
+    if (!/not found/i.test(res.error)) {
+      ctx.err(`triage: ${res.error}`);
+      return 1;
+    }
+    // A daemon from before the route existed: fall through, the write path is
+    // the same code, and the note below covers the cache it cannot invalidate.
+  }
+
+  const svc = await r.service();
+  const report = await runTriage(svc.store as never, { apply });
+  if (ctx.json) ctx.out(JSON.stringify(report, null, 2));
+  else ctx.out(renderTriageReport(report));
+  if (report.applied && report.archives.length + report.demotions.length > 0) {
+    ctx.err(
+      "note: the rows were written from this process; a daemon serving this store keeps its " +
+      "own decoded partitions — restart it (`ai-memory daemon restart`) so it serves the " +
+      "triaged rows, not cached ones."
+    );
+  }
+  return 0;
+}
+
 async function cmdExtract(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
   const text = queryText(a, "text") ?? a.positionals.join(" ").trim();
   if (!text) {
@@ -670,6 +797,63 @@ async function cmdExtract(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>):
   const { memories, rejected } = await svc.extractAndSave(text, namespace);
   const out = { extracted: memories.length, rejected, memories };
   ctx.out(ctx.json ? JSON.stringify(out, null, 2) : `extracted ${memories.length}${rejected ? `, rejected ${rejected}` : ""}`);
+  return 0;
+}
+
+/**
+ * `ai-memory drops` — the write-time filter's side of the ledger (ADR-0040
+ * observability amendment). Answers the question a refused save cannot: the 422 told
+ * you WHY this note was not stored, and by the next run that response is gone. With
+ * `--text` it answers about one exact note, folded on its hash, so "seems useless until
+ * the next run hits the same error" reads as `x3 since <date>` instead of nothing.
+ * Fetched one partition at a time because the store keys drops by namespace.
+ */
+async function cmdDrops(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const text = flagString(a, "text");
+  const junk = flagString(a, "junk");
+  const limit = flagNumber(a, "limit");
+  const { namespaces } = await resolveNamespaces(r, a);
+  const drops: CurationDrop[] = [];
+
+  if (!flagBool(a, "all") && (await r.useDaemon())) {
+    const client = r.client();
+    for (const ns of namespaces) {
+      const res = await client.get<{ drops: CurationDrop[] }>(
+        "/drops" + MemoryClient.query({ namespace: ns, text, junk, limit })
+      );
+      if (!res.ok) {
+        ctx.err(`drops: ${res.error}`);
+        return 1;
+      }
+      drops.push(...(res.data.drops ?? []));
+    }
+  } else {
+    const svc = await r.service();
+    for (const ns of namespaces) {
+      drops.push(...(await svc.curationDrops({ namespace: ns, text, junk, limit })));
+    }
+  }
+
+  // One page per partition, so re-order across them into the scope-wide newest-first
+  // sequence the caller asked for and apply their cap after the merge, not before.
+  drops.sort((x, y) => y.at - x.at || x.namespace.localeCompare(y.namespace));
+  const page = limit ? drops.slice(0, limit) : drops;
+  if (ctx.json) {
+    ctx.out(JSON.stringify({ drops: page, scopes: namespaces }, null, 2));
+    return 0;
+  }
+  if (page.length === 0) {
+    ctx.out(text ? `no drops recorded for that note in ${namespaces.join(", ")}` : `no drops recorded in ${namespaces.join(", ")}`);
+    return 0;
+  }
+  const showNs = namespaces.length > 1;
+  ctx.out(`drops: ${page.length} refused note(s) in ${namespaces.join(", ")}`);
+  for (const d of page) {
+    const when = new Date(d.at).toISOString().slice(0, 16).replace("T", " ");
+    const repeat = d.count > 1 ? ` x${d.count} since ${new Date(d.firstAt).toISOString().slice(0, 10)}` : "";
+    const where = showNs ? ` [${d.namespace}]` : "";
+    ctx.out(`  ${when} ${d.junk}${repeat}${where}: ${d.preview}${d.advice ? ` — ${d.advice}` : ""}`);
+  }
   return 0;
 }
 
@@ -808,6 +992,164 @@ function printSync(ctx: Ctx, report: SyncKnowledgeReport): void {
       `${report.inserted} new, ${report.updated} updated, ${report.unchanged} unchanged, ` +
       `${report.removed} removed, ${report.adopted} adopted, ${report.dangling} dangling link(s)`
   );
+}
+
+async function cmdCodebase(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const which = a.positionals[0] ?? "index";
+  const projectFlag = flagString(a, "project");
+  const projectArg = projectFlag === undefined ? {} : { project: projectFlag };
+
+  if (which === "index") {
+    const dir = flagString(a, "dir");
+    const dryRun = flagBool(a, "dry-run");
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const res = await r.client().post<CodebaseSyncReport>("/codebase/index", { dir, dryRun, ...projectArg });
+      if (res.ok) return printCodebaseSync(ctx, res.data), 0;
+      // A daemon older than the route answers 404; the write path is identical
+      // in-process, so falling back beats telling the operator to restart (the
+      // same trade cmdKnowledge makes for the vault sync).
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase index: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printCodebaseSync(ctx, await svc.codebaseSync({ root: dir, dryRun, ...projectArg }));
+    return 0;
+  }
+
+  if (which === "search") {
+    const query = a.positionals[1];
+    if (!query) {
+      ctx.err("codebase search: <query> required");
+      return 2;
+    }
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const params = new URLSearchParams({ q: query });
+      const k = flagNumber(a, "k");
+      const budget = flagNumber(a, "budget");
+      if (k !== undefined) params.set("k", String(k));
+      if (budget !== undefined) params.set("budget", String(budget));
+      if (projectFlag !== undefined) params.set("project", projectFlag);
+      const res = await r.client().get<CodebaseSearchResult>(`/codebase/search?${params}`);
+      if (res.ok) return printCodebaseSearch(ctx, query, res.data), 0;
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase search: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printCodebaseSearch(ctx, query, await svc.codebaseSearch({ query, k: flagNumber(a, "k"), budgetTokens: flagNumber(a, "budget"), ...projectArg }));
+    return 0;
+  }
+
+  if (which === "symbol") {
+    const name = a.positionals[1];
+    if (!name) {
+      ctx.err("codebase symbol: <name> required");
+      return 2;
+    }
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const params = new URLSearchParams();
+      if (projectFlag !== undefined) params.set("project", projectFlag);
+      const qs = params.size > 0 ? `?${params}` : "";
+      const res = await r.client().get<CodebaseSymbolDetail>(`/codebase/symbol/${encodeURIComponent(name)}${qs}`);
+      if (res.ok) return printCodebaseSymbol(ctx, res.data), 0;
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase symbol: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    const detail = await svc.codebaseSymbol({ idOrName: name, ...projectArg });
+    if (!detail) {
+      ctx.err(`codebase symbol: no symbol "${name}"`);
+      return 1;
+    }
+    printCodebaseSymbol(ctx, detail);
+    return 0;
+  }
+
+  if (which === "forget") {
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const params = new URLSearchParams();
+      if (projectFlag !== undefined) params.set("project", projectFlag);
+      const qs = params.size > 0 ? `?${params}` : "";
+      const res = await r.client().del<{ project: string; symbols: number }>(`/codebase${qs}`);
+      if (res.ok) return printCodebaseForget(ctx, res.data), 0;
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase forget: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printCodebaseForget(ctx, await svc.codebaseForget(projectArg));
+    return 0;
+  }
+
+  ctx.err(`codebase: unknown subcommand "${which}" (expected: index | search | symbol | forget)`);
+  return 2;
+}
+
+function printCodebaseSync(ctx: Ctx, report: CodebaseSyncReport): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(report, null, 2));
+    return;
+  }
+  const head = report.dryRun ? "dry run — nothing written" : "indexed";
+  ctx.out(
+    `${head} ${report.project} (${report.root}): ${report.files} file(s) scanned → ` +
+      `${report.indexed} re-indexed, ${report.skipped} unchanged, ${report.removed} removed, ` +
+      `${report.parseErrors} parse error(s); ${report.symbols} symbol(s), ${report.edges} edge(s) ` +
+      `written in ${report.durationMs}ms`
+  );
+}
+
+function printCodebaseSearch(ctx: Ctx, query: string, result: CodebaseSearchResult): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (result.symbols.length === 0) {
+    ctx.out(`no symbols matching "${query}" — run \`ai-memory codebase index\` first`);
+    return;
+  }
+  for (const s of result.symbols) {
+    const flags = [s.kind, s.exported ? "exported" : "internal", `in=${s.fanIn}`, s.score.toFixed(2)].join(", ");
+    ctx.out(`${s.qualifiedName} (${flags}) ${s.path}:${s.lineStart ?? 0}${s.signature ? ` — ${s.signature}` : ""}`);
+  }
+  ctx.out(`tokens: ${result.tokensUsed}${result.truncated ? " (truncated)" : ""}`);
+}
+
+function printCodebaseSymbol(ctx: Ctx, detail: CodebaseSymbolDetail): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(detail, null, 2));
+    return;
+  }
+  const s = detail.symbol;
+  const flags = [s.kind, s.exported ? "exported" : "internal", `in=${s.fanIn}`].join(", ");
+  ctx.out(`${s.qualifiedName} (${flags}) ${s.path}:${s.lineStart ?? 0}${s.signature ? ` — ${s.signature}` : ""}`);
+  if (detail.importers.length > 0) ctx.out(`imported by: ${detail.importers.map((m) => m.path).join(", ")}`);
+  if (detail.callers.length > 0) {
+    ctx.out(`callers:`);
+    for (const m of detail.callers) ctx.out(`  ${m.qualifiedName} (${m.path}:${m.lineStart ?? 0})`);
+  }
+  if (detail.callees.length > 0) {
+    ctx.out(`callees:`);
+    for (const m of detail.callees) ctx.out(`  ${m.qualifiedName} (${m.path}:${m.lineStart ?? 0})`);
+  }
+}
+
+function printCodebaseForget(ctx: Ctx, out: { project: string; symbols: number }): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(out, null, 2));
+    return;
+  }
+  ctx.out(`forgot the code index of ${out.project} (${out.symbols} symbol row(s)) — the files were never touched`);
 }
 
 function printIndex(ctx: Ctx, index: KnowledgeIndexView): number {
@@ -1123,6 +1465,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdBrief(runner, ctx, a);
       case "knowledge":
         return await cmdKnowledge(runner, ctx, a);
+      case "codebase":
+      case "cb":
+        return await cmdCodebase(runner, ctx, a);
       case "project":
       case "projects":
         return await cmdProject(runner, ctx, a);
@@ -1130,8 +1475,13 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdStats(runner, ctx, a);
       case "decay":
         return await cmdDecay(runner, ctx, a);
+      case "triage":
+        return await cmdTriage(runner, ctx, a);
       case "extract":
         return await cmdExtract(runner, ctx, a);
+      case "drops":
+      case "dropped":
+        return await cmdDrops(runner, ctx, a);
       case "reembed":
         return await cmdReembed(runner, ctx, a);
       case "setup":
@@ -1141,6 +1491,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       case "daemon": {
         const { runDaemonCommand } = await import("./daemon.js");
         return await runDaemonCommand(a.positionals, ctx);
+      }
+      case "principal": {
+        const { runPrincipalCommand } = await import("./principal.js");
+        return await runPrincipalCommand(a.positionals, a.flags, ctx);
       }
       case "mcp": {
         const { runMcpServer } = await import("../mcp/server.js");

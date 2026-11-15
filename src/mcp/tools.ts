@@ -2,6 +2,7 @@ import type { MemoryService } from "../core/memoryService.js";
 import type { Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import { stripEmbedding } from "../core/types.js";
 import { renderEmptySearch } from "../core/retrieval/explain.js";
+import { renderCodeSymbol } from "../core/codebase/view.js";
 import { CurationRejected, renderVerdict } from "../core/write/curation.js";
 import { resolveAgent, resolveReadScope, resolveRequestScope, resolveWriteKey, type MemoryScope } from "../core/scope.js";
 
@@ -182,6 +183,47 @@ export const MEMORY_TOOLS: McpTool[] = [
     }
   },
   {
+    name: "codebase_index",
+    description:
+      "Index this repository's code into memory: files, symbols (functions, classes, methods, types), imports and call references. TypeScript/JavaScript, Go, Java, C#, Rust and Kotlin; zero dependencies, incremental by content hash. Run it before codebase_search / codebase_symbol, and re-run it after significant edits.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dir: { type: "string", description: "Repository root (default: the git root this server runs in)." },
+        project: PROJECT_PROP,
+        dryRun: { type: "boolean", description: "Report what would change without writing." }
+      }
+    }
+  },
+  {
+    name: "codebase_search",
+    description:
+      "Search indexed code symbols by name or signature (exact > prefix > substring), deterministic and under a hard token budget. Index first with codebase_index. Answers \"where does X live\" and \"which symbols mention X\".",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Symbol name, prefix, or signature fragment." },
+        k: { type: "integer", description: "Max symbols (default 5)." },
+        budgetTokens: { type: "integer", description: "Hard token cap (default 800)." },
+        project: PROJECT_PROP
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "codebase_symbol",
+    description:
+      "One symbol's detail: signature, location, which files import it, and its callers and callees. Edges carry evidence — import/re-export/local/alias are exact, name-match is heuristic. A symbol id from codebase_search is exact; a bare name resolves only when unique.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Symbol id (preferred) or exact name." },
+        project: PROJECT_PROP
+      },
+      required: ["name"]
+    }
+  },
+  {
     name: "memory_stats",
     description:
       "Counts per scope and type, including archived rows and rows that have never been retrieved, plus which embedding provider is in use.",
@@ -189,7 +231,22 @@ export const MEMORY_TOOLS: McpTool[] = [
       type: "object",
       properties: { scope: SCOPE_PROP, all: { type: "boolean" } }
     }
-  }
+  },
+  {
+    name: "memory_drops",
+    description:
+      "Read the curation drop ledger: every write the store refused, its junk class and its advice, plus how many times the same note has now been refused and when the first refusal fell. Call it when a note you expected is missing — a rejected save leaves a trace, so 'seems useless until the next run hits the same error' is a query, not a guess. Pass `text` to ask about one exact note.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: SCOPE_PROP,
+        all: { type: "boolean" },
+        text: { type: "string", description: "Only drops of this exact note (folded on its text hash, with the repeat count)." },
+        junk: { type: "string", description: "Only drops of this junk class, e.g. 'conversational' or 'secret'." },
+        limit: { type: "integer", description: "Default 20." }
+      }
+    }
+  },
 ];
 
 export interface McpToolResult {
@@ -309,7 +366,7 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
           // advice is the whole point — "store the fact itself" is an instruction the
           // model can act on in its next call, which is why this is not isError.
           if (e instanceof CurationRejected) {
-            return { text: renderVerdict(e.verdict), structured: { stored: false, curation: e.verdict } };
+            return { text: `${renderVerdict(e.verdict)} (memory_drops re-reads this later)`, structured: { stored: false, curation: e.verdict } };
           }
           throw e;
         }
@@ -405,6 +462,51 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
         if (!memory) return { text: `no memory ${id}`, structured: null, isError: true };
         await ctx.service.delete(id);
         return { text: `forgot ${id}`, structured: { id, deleted: true } };
+      }
+
+      case "memory_drops": {
+        // Same read-scope resolution as memory_stats: the ledger is per partition, and
+        // another agent's refusals are not this agent's to read unless it asks for all.
+        const { namespaces } = await resolveReadScope(
+          {
+            agent: ctx.defaultAgent,
+            scope: asScope(args.scope) ?? ctx.defaultScope,
+            all: args.all === true
+          },
+          ctx.service.store
+        );
+        const rawLimit = args.limit === undefined ? 20 : Number(args.limit);
+        if (!Number.isFinite(rawLimit)) {
+          return { text: "memory_drops: limit must be a finite number", structured: null, isError: true };
+        }
+        const limit = Math.max(1, Math.min(1000, Math.floor(rawLimit)));
+        const drops: import("../core/write/curation.js").CurationDrop[] = [];
+        for (const ns of namespaces) {
+          drops.push(...(await ctx.service.curationDrops({
+            namespace: ns,
+            text: args.text === undefined ? undefined : String(args.text),
+            junk: args.junk === undefined ? undefined : String(args.junk),
+            limit
+          })));
+        }
+        // Merged across partitions, so re-order newest-first and apply the cap once here
+        // rather than handing back `limit` rows per scope.
+        drops.sort((a, b) => b.at - a.at || a.namespace.localeCompare(b.namespace));
+        const page = drops.slice(0, limit);
+        if (page.length === 0) {
+          return {
+            text: args.text
+              ? "no drops recorded for that note — either it was stored, or nothing was ever tried with that exact text"
+              : "the drop ledger is empty: no write has been refused by the curation filter",
+            structured: { drops: [] }
+          };
+        }
+        const lines = page.map((d) => {
+          const when = new Date(d.at).toISOString().slice(0, 16).replace("T", " ");
+          const repeat = d.count > 1 ? ` x${d.count} since ${new Date(d.firstAt).toISOString().slice(0, 10)}` : "";
+          return `- ${when} ${d.junk}${repeat} [${d.namespace}]: ${d.preview} — ${d.advice}`;
+        });
+        return { text: `drop ledger (${page.length}):\n${lines.join("\n")}`, structured: { drops: page } };
       }
 
       case "memory_stats": {
@@ -575,6 +677,54 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
                   .join("\n"),
           structured: { projects }
         };
+      }
+
+      case "codebase_index": {
+        const report = await ctx.service.codebaseSync({
+          root: args.dir === undefined ? undefined : String(args.dir),
+          project: args.project === undefined || args.project === null ? undefined : String(args.project),
+          dryRun: args.dryRun === true
+        });
+        const head = report.dryRun ? "dry run — nothing written" : "indexed";
+        return {
+          text:
+            `${head} ${report.project} (${report.root}): ${report.files} file(s) scanned → ` +
+            `${report.indexed} re-indexed, ${report.skipped} unchanged, ${report.removed} removed, ` +
+            `${report.parseErrors} parse error(s); ${report.symbols} symbol(s), ${report.edges} edge(s) written in ${report.durationMs}ms`,
+          structured: report
+        };
+      }
+
+      case "codebase_search": {
+        const query = String(args.query ?? "").trim();
+        if (!query) return { text: "codebase_search: query is required", structured: null, isError: true };
+        const result = await ctx.service.codebaseSearch({
+          query,
+          k: args.k === undefined ? undefined : Number(args.k),
+          budgetTokens: args.budgetTokens === undefined ? undefined : Number(args.budgetTokens),
+          project: args.project === undefined || args.project === null ? undefined : String(args.project)
+        });
+        const text =
+          result.symbols.length === 0
+            ? `no symbols matching "${query}" in ${result.project} — run codebase_index if the repository is not indexed yet`
+            : result.symbols.map((s) => renderCodeSymbol(s, s.score)).join("\n") +
+              `\ntokens: ${result.tokensUsed}${result.truncated ? " (truncated)" : ""}`;
+        return { text, structured: result };
+      }
+
+      case "codebase_symbol": {
+        const name = String(args.name ?? "").trim();
+        if (!name) return { text: "codebase_symbol: name is required", structured: null, isError: true };
+        const detail = await ctx.service.codebaseSymbol({
+          idOrName: name,
+          project: args.project === undefined || args.project === null ? undefined : String(args.project)
+        });
+        if (!detail) return { text: `no symbol "${name}" — codebase_search finds candidates`, structured: null, isError: true };
+        const lines = [renderCodeSymbol(detail.symbol)];
+        if (detail.importers.length > 0) lines.push(`imported by: ${detail.importers.map((m) => m.path).join(", ")}`);
+        if (detail.callers.length > 0) lines.push(`callers: ${detail.callers.map((m) => renderCodeSymbol(m)).join("; ")}`);
+        if (detail.callees.length > 0) lines.push(`callees: ${detail.callees.map((m) => renderCodeSymbol(m)).join("; ")}`);
+        return { text: lines.join("\n"), structured: detail };
       }
 
       default:
