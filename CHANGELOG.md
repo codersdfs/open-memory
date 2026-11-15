@@ -3,8 +3,48 @@
 Notable changes. The package is `@franklinww/open-memory` (the bare `open-memory` name was
 rejected by npm as too similar to the existing `openmemory`); the command stays `ai-memory`.
 
-Prereleases (`-beta.N`) may still move the HTTP and MCP surfaces between builds. The
+Prereleases (`-beta.N`) may still move the HTTP, MCP, and console UI surfaces between builds. The
 on-disk format is the part that does not.
+
+## Unreleased
+
+### Added
+
+- **Codebase memory** ([ADR-0050](docs/adr/0050-codebase-memory-derived-index.md)): the
+  repository's code — files, symbols, imports, call references — indexed into `memory.db` as
+  derived state, parsed by a zero-dependency structural scanner (TypeScript/JavaScript). MCP
+  tools `codebase_index` / `codebase_search` / `codebase_symbol`, CLI `ai-memory codebase
+  index | search | symbol | forget`, HTTP `POST /codebase/index`, `GET /codebase/search`,
+  `GET /codebase/symbol/:id`, `DELETE /codebase`. Incremental by content hash and idempotent;
+  symbol search is deterministic (exact > prefix > substring) under the hard token budget;
+  every edge carries its evidence (`import` / `re-export` / `local` / `name-match`), and
+  ambiguous names build no edge at all.
+- **Codebase memory Phase 1 — TS/JS graph correctness**
+  ([ledger](docs/superpowers/plans/2026-11-14-codebase-phase1-ledger.md)): method-level call edges
+  resolve through type bindings, `this`, and one field hop (`ctx.service.method()`); test-harness
+  callbacks (`it`/`test`/`describe`/`beforeEach`/`afterEach`/`beforeAll`/`afterAll`) contribute
+  references attributed to the file's module node; tsconfig/jsconfig `paths` aliases resolve with a
+  fifth evidence value, `alias`, longest-prefix first; dynamic `import()` and `require()` build
+  module-to-module edges; re-export chains follow 4 hops with a cycle guard; NodeNext `.js`
+  specifiers land on `.ts`/`.tsx` (without this the entire `src/**` import graph was empty); and
+  `fields`/`re_exports` persist on the file row so an incremental sync resolves chains through files
+  it did not re-parse. Fixed during review: a changed file destroyed inbound edges it did not own
+  (fan-in fell to 0 and never recovered) — changed files now delete only their own outbound edges.
+- **Codebase memory Phase 2 — five more languages behind a grammar registry**
+  ([ledger](docs/superpowers/plans/2026-11-14-codebase-phase2-ledger.md)): `LanguageGrammar`
+  (`src/core/codebase/languages/`) owns each language's blanker, declaration grammar and
+  `resolveImport`; **Go, Java, C#, Rust and Kotlin** join TypeScript/JavaScript, with Go's `go.mod`
+  module prefix, Java/Kotlin packages-to-directories, Rust `crate::`/`super::`/`self::` cargo paths,
+  and namespace/package-qualified names. `code_files.language` and `code_symbols.language` stamp
+  which scanner wrote each row (old rows backfill to `typescript`), so a mixed index stays
+  auditable. Measured on a real mixed corpus — 1,121 files (949 TS / 151 Rust / 21 Go, 11.7 MB,
+  12,484 symbols, 21,699 edges) index in 2.2 s, one-file increment in 0.7 s; the project-wide
+  `fan_in` recompute was the whole cost (a correlated subquery, 33 s → 3 s).
+- **Codebase memory roadmap** ([docs/roadmap-codebase-memory.md](docs/roadmap-codebase-memory.md)):
+  the four-phase plan for what lands next — TS/JS correctness (method-level callers, test
+  callbacks, tsconfig aliases), the per-language grammar registry and the brace family
+  (Go/Java/C#/Rust/Kotlin), Python plus an opt-in tree-sitter backend, then graph quality
+  (symbol embeddings off by default, console graph view, monorepos, `codebase_brief`).
 
 ## 0.4.0-beta.3 — 2026-11-09
 
@@ -68,6 +108,16 @@ an independent review cycle.
   where every tool call executes the store's own gates; the vault graph renders partitions on a
   canvas; Graph/Memories/Recall move to the monochrome token set. `501 no-model` keys the
   console's local mode.
+
+### Changed
+
+- **Agent console polish (prerelease)** ([ADR-0043](docs/adr/0043-agent-chat-and-console-monochrome.md)).
+  The conversation is centered and keeps reading position;
+  threads are namespaced and carry bounded text history into the LLM tool loop; Recall typing no
+  longer rewrites the URL on every keystroke; the prompt composer drops suggestion chips, header,
+  mode chip, hints, and counter for a clean textarea plus a compact 76×34 Send button (68×32 on
+  mobile) with hover, active, busy, and disabled states. `ui/agent-mock.html` is a fixture-only
+  preview; no daemon, retrieval, storage, or API behavior changed.
 
 ### Fixed
 

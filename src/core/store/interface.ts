@@ -1,5 +1,6 @@
 import type { ChainView, KnowledgeEdge, Memory, MemoryEvent, MemoryInput, WriteEventMeta } from "../types.js";
 import type { CurationDrop, CurationDropInput } from "../write/curation.js";
+import type { CodebaseCapability } from "../codebase/types.js";
 import type { BucketRefreshReport } from "./buckets.js";
 
 export type { ChainView, KnowledgeEdge, MemoryEvent };
@@ -439,6 +440,15 @@ export interface VectorStore {
    * missing capability instead of writing rows no one can link.
    */
   knowledge?: KnowledgeCapability;
+
+  /**
+   * Codebase index (ADR-0050). Optional like `knowledge`: a store written before it
+   * keeps compiling, and `MemoryService` reports the missing capability instead of
+   * pretending to index code. Scanning, parsing and edge resolution live in
+   * `codebase/sync.ts` — a store implements only the primitive persistence the sync
+   * and the read layer need, so two stores cannot disagree on what an edge means.
+   */
+  codebase?: CodebaseCapability;
 
   /**
    * Project management (ADR-0042), optional like every other late capability so a

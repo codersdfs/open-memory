@@ -16,6 +16,7 @@ import type { KnowledgeIndexView, KnowledgePageView } from "../core/knowledge/vi
 import type { TriageReport } from "../core/lifecycle/triage.js";
 import type { CurationDrop } from "../core/write/curation.js";
 import type { SyncKnowledgeReport } from "../core/knowledge/sync.js";
+import type { CodebaseSearchResult, CodebaseSymbolDetail, CodebaseSyncReport } from "../core/codebase/types.js";
 import { isKind, KINDS, stripEmbedding } from "../core/types.js";
 import { renderEmptySearch } from "../core/retrieval/explain.js";
 import { CurationRejected, renderVerdict } from "../core/write/curation.js";
@@ -64,6 +65,10 @@ Memory
   project list | init | rename | forget
                          manage projects: init [slug] [--note "..."], rename <from> <to> [--merge],
                          forget <slug> [--detach] (default forget soft-deletes, restorable)
+  codebase index | search <q> | symbol <name> | forget
+                         the repository's code as memory (ADR-0050): --dir <root> --dry-run --project p,
+                         search/symbol read the derived index; edges carry evidence (import | re-export |
+                         local | name-match | alias)
 
 Setup & introspection
   setup                  create the memory home dir; --copy-db migrates the old store; --link registers agents
@@ -989,6 +994,164 @@ function printSync(ctx: Ctx, report: SyncKnowledgeReport): void {
   );
 }
 
+async function cmdCodebase(r: Runner, ctx: Ctx, a: ReturnType<typeof parseArgs>): Promise<number> {
+  const which = a.positionals[0] ?? "index";
+  const projectFlag = flagString(a, "project");
+  const projectArg = projectFlag === undefined ? {} : { project: projectFlag };
+
+  if (which === "index") {
+    const dir = flagString(a, "dir");
+    const dryRun = flagBool(a, "dry-run");
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const res = await r.client().post<CodebaseSyncReport>("/codebase/index", { dir, dryRun, ...projectArg });
+      if (res.ok) return printCodebaseSync(ctx, res.data), 0;
+      // A daemon older than the route answers 404; the write path is identical
+      // in-process, so falling back beats telling the operator to restart (the
+      // same trade cmdKnowledge makes for the vault sync).
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase index: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printCodebaseSync(ctx, await svc.codebaseSync({ root: dir, dryRun, ...projectArg }));
+    return 0;
+  }
+
+  if (which === "search") {
+    const query = a.positionals[1];
+    if (!query) {
+      ctx.err("codebase search: <query> required");
+      return 2;
+    }
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const params = new URLSearchParams({ q: query });
+      const k = flagNumber(a, "k");
+      const budget = flagNumber(a, "budget");
+      if (k !== undefined) params.set("k", String(k));
+      if (budget !== undefined) params.set("budget", String(budget));
+      if (projectFlag !== undefined) params.set("project", projectFlag);
+      const res = await r.client().get<CodebaseSearchResult>(`/codebase/search?${params}`);
+      if (res.ok) return printCodebaseSearch(ctx, query, res.data), 0;
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase search: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printCodebaseSearch(ctx, query, await svc.codebaseSearch({ query, k: flagNumber(a, "k"), budgetTokens: flagNumber(a, "budget"), ...projectArg }));
+    return 0;
+  }
+
+  if (which === "symbol") {
+    const name = a.positionals[1];
+    if (!name) {
+      ctx.err("codebase symbol: <name> required");
+      return 2;
+    }
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const params = new URLSearchParams();
+      if (projectFlag !== undefined) params.set("project", projectFlag);
+      const qs = params.size > 0 ? `?${params}` : "";
+      const res = await r.client().get<CodebaseSymbolDetail>(`/codebase/symbol/${encodeURIComponent(name)}${qs}`);
+      if (res.ok) return printCodebaseSymbol(ctx, res.data), 0;
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase symbol: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    const detail = await svc.codebaseSymbol({ idOrName: name, ...projectArg });
+    if (!detail) {
+      ctx.err(`codebase symbol: no symbol "${name}"`);
+      return 1;
+    }
+    printCodebaseSymbol(ctx, detail);
+    return 0;
+  }
+
+  if (which === "forget") {
+    const onDaemon = await r.useDaemon();
+    if (onDaemon) {
+      const params = new URLSearchParams();
+      if (projectFlag !== undefined) params.set("project", projectFlag);
+      const qs = params.size > 0 ? `?${params}` : "";
+      const res = await r.client().del<{ project: string; symbols: number }>(`/codebase${qs}`);
+      if (res.ok) return printCodebaseForget(ctx, res.data), 0;
+      if (!/not found/i.test(res.error)) {
+        ctx.err(`codebase forget: ${res.error}`);
+        return 1;
+      }
+    }
+    const svc = await r.service();
+    printCodebaseForget(ctx, await svc.codebaseForget(projectArg));
+    return 0;
+  }
+
+  ctx.err(`codebase: unknown subcommand "${which}" (expected: index | search | symbol | forget)`);
+  return 2;
+}
+
+function printCodebaseSync(ctx: Ctx, report: CodebaseSyncReport): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(report, null, 2));
+    return;
+  }
+  const head = report.dryRun ? "dry run — nothing written" : "indexed";
+  ctx.out(
+    `${head} ${report.project} (${report.root}): ${report.files} file(s) scanned → ` +
+      `${report.indexed} re-indexed, ${report.skipped} unchanged, ${report.removed} removed, ` +
+      `${report.parseErrors} parse error(s); ${report.symbols} symbol(s), ${report.edges} edge(s) ` +
+      `written in ${report.durationMs}ms`
+  );
+}
+
+function printCodebaseSearch(ctx: Ctx, query: string, result: CodebaseSearchResult): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (result.symbols.length === 0) {
+    ctx.out(`no symbols matching "${query}" — run \`ai-memory codebase index\` first`);
+    return;
+  }
+  for (const s of result.symbols) {
+    const flags = [s.kind, s.exported ? "exported" : "internal", `in=${s.fanIn}`, s.score.toFixed(2)].join(", ");
+    ctx.out(`${s.qualifiedName} (${flags}) ${s.path}:${s.lineStart ?? 0}${s.signature ? ` — ${s.signature}` : ""}`);
+  }
+  ctx.out(`tokens: ${result.tokensUsed}${result.truncated ? " (truncated)" : ""}`);
+}
+
+function printCodebaseSymbol(ctx: Ctx, detail: CodebaseSymbolDetail): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(detail, null, 2));
+    return;
+  }
+  const s = detail.symbol;
+  const flags = [s.kind, s.exported ? "exported" : "internal", `in=${s.fanIn}`].join(", ");
+  ctx.out(`${s.qualifiedName} (${flags}) ${s.path}:${s.lineStart ?? 0}${s.signature ? ` — ${s.signature}` : ""}`);
+  if (detail.importers.length > 0) ctx.out(`imported by: ${detail.importers.map((m) => m.path).join(", ")}`);
+  if (detail.callers.length > 0) {
+    ctx.out(`callers:`);
+    for (const m of detail.callers) ctx.out(`  ${m.qualifiedName} (${m.path}:${m.lineStart ?? 0})`);
+  }
+  if (detail.callees.length > 0) {
+    ctx.out(`callees:`);
+    for (const m of detail.callees) ctx.out(`  ${m.qualifiedName} (${m.path}:${m.lineStart ?? 0})`);
+  }
+}
+
+function printCodebaseForget(ctx: Ctx, out: { project: string; symbols: number }): void {
+  if (ctx.json) {
+    ctx.out(JSON.stringify(out, null, 2));
+    return;
+  }
+  ctx.out(`forgot the code index of ${out.project} (${out.symbols} symbol row(s)) — the files were never touched`);
+}
+
 function printIndex(ctx: Ctx, index: KnowledgeIndexView): number {
   if (ctx.json) {
     ctx.out(JSON.stringify(index, null, 2));
@@ -1302,6 +1465,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return await cmdBrief(runner, ctx, a);
       case "knowledge":
         return await cmdKnowledge(runner, ctx, a);
+      case "codebase":
+      case "cb":
+        return await cmdCodebase(runner, ctx, a);
       case "project":
       case "projects":
         return await cmdProject(runner, ctx, a);

@@ -35,6 +35,15 @@ _wslsetup.sh
 agent-integration-plan.md
 context-diet-plan.md
 remote-pc-herdr.md
+# A memory export of the real store: 380 KB of actual user memories. Debug input,
+# never an artifact — one `git add -A` away from being public, and git history is
+# forever. The same class of accident as the personal notes above, one level worse.
+memlist-sample.json
+# `undefined/<name>.db` is what a path-resolution failure writes when a DB path
+# computes to undefined; the .db inside is already ignored, the dir must not
+# outlive the probe that made it.
+undefined/
+.zcode/
 
 # the console's toolchain: dev-only, never published (ADR-0007/0008)
 ui/node_modules/

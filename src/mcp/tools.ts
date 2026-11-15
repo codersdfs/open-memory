@@ -2,6 +2,7 @@ import type { MemoryService } from "../core/memoryService.js";
 import type { Memory, MemoryKind, MemoryType, SearchResult } from "../core/types.js";
 import { stripEmbedding } from "../core/types.js";
 import { renderEmptySearch } from "../core/retrieval/explain.js";
+import { renderCodeSymbol } from "../core/codebase/view.js";
 import { CurationRejected, renderVerdict } from "../core/write/curation.js";
 import { resolveAgent, resolveReadScope, resolveRequestScope, resolveWriteKey, type MemoryScope } from "../core/scope.js";
 
@@ -179,6 +180,47 @@ export const MEMORY_TOOLS: McpTool[] = [
         merge: { type: "boolean", description: "rename only: allow moving onto a slug that already holds rows, folding the two together." },
         detach: { type: "boolean", description: "forget only: unscope the rows (project = null) instead of soft-deleting them." }
       }
+    }
+  },
+  {
+    name: "codebase_index",
+    description:
+      "Index this repository's code into memory: files, symbols (functions, classes, methods, types), imports and call references. TypeScript/JavaScript, Go, Java, C#, Rust and Kotlin; zero dependencies, incremental by content hash. Run it before codebase_search / codebase_symbol, and re-run it after significant edits.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dir: { type: "string", description: "Repository root (default: the git root this server runs in)." },
+        project: PROJECT_PROP,
+        dryRun: { type: "boolean", description: "Report what would change without writing." }
+      }
+    }
+  },
+  {
+    name: "codebase_search",
+    description:
+      "Search indexed code symbols by name or signature (exact > prefix > substring), deterministic and under a hard token budget. Index first with codebase_index. Answers \"where does X live\" and \"which symbols mention X\".",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Symbol name, prefix, or signature fragment." },
+        k: { type: "integer", description: "Max symbols (default 5)." },
+        budgetTokens: { type: "integer", description: "Hard token cap (default 800)." },
+        project: PROJECT_PROP
+      },
+      required: ["query"]
+    }
+  },
+  {
+    name: "codebase_symbol",
+    description:
+      "One symbol's detail: signature, location, which files import it, and its callers and callees. Edges carry evidence — import/re-export/local/alias are exact, name-match is heuristic. A symbol id from codebase_search is exact; a bare name resolves only when unique.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Symbol id (preferred) or exact name." },
+        project: PROJECT_PROP
+      },
+      required: ["name"]
     }
   },
   {
@@ -635,6 +677,54 @@ export async function callTool(ctx: ToolContext, name: string, args: Record<stri
                   .join("\n"),
           structured: { projects }
         };
+      }
+
+      case "codebase_index": {
+        const report = await ctx.service.codebaseSync({
+          root: args.dir === undefined ? undefined : String(args.dir),
+          project: args.project === undefined || args.project === null ? undefined : String(args.project),
+          dryRun: args.dryRun === true
+        });
+        const head = report.dryRun ? "dry run — nothing written" : "indexed";
+        return {
+          text:
+            `${head} ${report.project} (${report.root}): ${report.files} file(s) scanned → ` +
+            `${report.indexed} re-indexed, ${report.skipped} unchanged, ${report.removed} removed, ` +
+            `${report.parseErrors} parse error(s); ${report.symbols} symbol(s), ${report.edges} edge(s) written in ${report.durationMs}ms`,
+          structured: report
+        };
+      }
+
+      case "codebase_search": {
+        const query = String(args.query ?? "").trim();
+        if (!query) return { text: "codebase_search: query is required", structured: null, isError: true };
+        const result = await ctx.service.codebaseSearch({
+          query,
+          k: args.k === undefined ? undefined : Number(args.k),
+          budgetTokens: args.budgetTokens === undefined ? undefined : Number(args.budgetTokens),
+          project: args.project === undefined || args.project === null ? undefined : String(args.project)
+        });
+        const text =
+          result.symbols.length === 0
+            ? `no symbols matching "${query}" in ${result.project} — run codebase_index if the repository is not indexed yet`
+            : result.symbols.map((s) => renderCodeSymbol(s, s.score)).join("\n") +
+              `\ntokens: ${result.tokensUsed}${result.truncated ? " (truncated)" : ""}`;
+        return { text, structured: result };
+      }
+
+      case "codebase_symbol": {
+        const name = String(args.name ?? "").trim();
+        if (!name) return { text: "codebase_symbol: name is required", structured: null, isError: true };
+        const detail = await ctx.service.codebaseSymbol({
+          idOrName: name,
+          project: args.project === undefined || args.project === null ? undefined : String(args.project)
+        });
+        if (!detail) return { text: `no symbol "${name}" — codebase_search finds candidates`, structured: null, isError: true };
+        const lines = [renderCodeSymbol(detail.symbol)];
+        if (detail.importers.length > 0) lines.push(`imported by: ${detail.importers.map((m) => m.path).join(", ")}`);
+        if (detail.callers.length > 0) lines.push(`callers: ${detail.callers.map((m) => renderCodeSymbol(m)).join("; ")}`);
+        if (detail.callees.length > 0) lines.push(`callees: ${detail.callees.map((m) => renderCodeSymbol(m)).join("; ")}`);
+        return { text: lines.join("\n"), structured: detail };
       }
 
       default:

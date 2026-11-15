@@ -124,6 +124,10 @@ set to the agent id — that variable is what puts a write in the right partitio
 - **MCP tools** — `memory_search`, `memory_remember`, `memory_list`, `memory_get`,
   `memory_forget`, `memory_stats`. Every tool takes an explicit `scope`, so the agent
   decides private vs shared per call. This is the one to prefer.
+- **Codebase tools** — `codebase_index`, `codebase_search`, `codebase_symbol` (ADR-0050),
+  project-scoped instead of scope-scoped: they answer about the repository the server
+  runs in. `codebase_index` first (`--dry-run` on the CLI to preview); the reads are
+  deterministic and budgeted like every other tool.
 
 ## 6. You are writing the agent
 

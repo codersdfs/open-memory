@@ -16,6 +16,9 @@ import { deriveKind, KIND_IMPORTANCE } from "./write/kind.js";
 import { assembleBrief } from "./retrieval/brief.js";
 import { neighborsOf, knowledgeIndex, knowledgePages, type KnowledgeIndexView, type KnowledgePageView } from "./knowledge/view.js";
 import { syncKnowledge, type SyncKnowledgeOptions, type SyncKnowledgeReport } from "./knowledge/sync.js";
+import { syncCodebase, type SyncCodebaseOptions } from "./codebase/sync.js";
+import { codebaseSearch, codebaseSymbolDetail } from "./codebase/view.js";
+import type { CodebaseSearchResult, CodebaseSymbolDetail, CodebaseSyncReport } from "./codebase/types.js";
 import type { BriefOptions, BriefResult } from "./types.js";
 import { reconcile, unionNeighbours, DEFAULT_THRESHOLDS, type Decision, type RelationJudge } from "./write/reconciler.js";
 import { curate, CurationRejected, DEMOTE_IMPORTANCE, DEMOTE_KIND, ADVICE, renderVerdict, redactSecrets, DROP_PREVIEW_CHARS, type CurationDrop, type CurationDropInput, type CurationVerdict } from "./write/curation.js";
@@ -957,6 +960,47 @@ export class MemoryService {
       : opts.namespace
         ? [opts.namespace]
         : resolveScopeKeys({ agent: opts.agent, scope: opts.scope ?? undefined });
+  }
+
+  // ---- Codebase memory (ADR-0050). The sync is the only writer, the reads are
+  // deterministic and budgeted; a store without the capability is reported as
+  // missing, never faked. The project rides the same resolution order as every
+  // write: explicit → MEMORY_PROJECT → the git root of the process.
+
+  private codebaseProject(explicit?: string | null): string {
+    const project = resolveProject(explicit).project;
+    if (!project) {
+      throw new Error("codebase memory: no project resolved — pass project explicitly or run inside a git checkout");
+    }
+    return project;
+  }
+
+  async codebaseSync(opts: SyncCodebaseOptions = {}): Promise<CodebaseSyncReport> {
+    return syncCodebase({ store: this.store }, opts);
+  }
+
+  async codebaseSearch(opts: { query: string; project?: string | null; k?: number; budgetTokens?: number }): Promise<CodebaseSearchResult> {
+    return codebaseSearch(this.store, {
+      project: this.codebaseProject(opts.project),
+      query: opts.query,
+      k: opts.k,
+      budgetTokens: opts.budgetTokens
+    });
+  }
+
+  async codebaseSymbol(opts: { idOrName: string; project?: string | null }): Promise<CodebaseSymbolDetail | null> {
+    return codebaseSymbolDetail(this.store, {
+      project: this.codebaseProject(opts.project),
+      idOrName: opts.idOrName
+    });
+  }
+
+  async codebaseForget(opts: { project?: string | null } = {}): Promise<{ project: string; symbols: number }> {
+    const project = this.codebaseProject(opts.project);
+    const cap = this.store.codebase;
+    if (!cap) throw new Error("codebase memory: this store does not implement the codebase capability");
+    const symbols = await cap.codeForget(project);
+    return { project, symbols };
   }
 
   async updateMeta(

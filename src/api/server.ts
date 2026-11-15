@@ -757,6 +757,39 @@ async function handle(
     return send(res, 200, page);
   }
 
+  // Codebase index (ADR-0050). `index` is the only writer, exactly like the vault
+  // sync above; the reads answer out of the derived tables, never off the files.
+  if (path === "/codebase/index" && method === "POST") {
+    const body = await readJson(req);
+    const report = await service.codebaseSync({
+      root: body.dir === undefined ? undefined : String(body.dir),
+      project: body.project === undefined ? undefined : body.project === null ? null : String(body.project),
+      dryRun: body.dryRun === true
+    });
+    return send(res, 200, report);
+  }
+  if (path === "/codebase/search" && method === "GET") {
+    const query = str(q.q);
+    if (!query) return send(res, 400, { error: "codebase search: q is required" });
+    const result = await service.codebaseSearch({
+      query,
+      k: num(q.k, 1, 100),
+      budgetTokens: num(q.budget, 1, 100000),
+      project: q.project ?? null
+    });
+    return send(res, 200, result);
+  }
+  const codebaseDetail = path.match(/^\/codebase\/symbol\/([^/]+)$/);
+  if (codebaseDetail && method === "GET") {
+    const id = decodeURIComponent(codebaseDetail[1]!);
+    const detail = await service.codebaseSymbol({ idOrName: id, project: q.project ?? null });
+    if (!detail) return send(res, 404, { error: `unknown codebase symbol: ${id}` });
+    return send(res, 200, detail);
+  }
+  if (path === "/codebase" && method === "DELETE") {
+    return send(res, 200, await service.codebaseForget({ project: q.project ?? null }));
+  }
+
   // Must precede the `/memories/:id` route below: that pattern also matches
   // "/memories/search", so a GET would be read as "fetch the memory whose id is
   // search" and answer 404 — which is exactly what `search` did whenever a

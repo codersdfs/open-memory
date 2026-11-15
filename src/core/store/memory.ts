@@ -9,6 +9,15 @@ import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
 import { DROP_LEDGER_CAP, type CurationDrop, type CurationDropInput } from "../write/curation.js";
 import { median } from "../stats.js";
+import type {
+  CodebaseCapability,
+  CodebaseStats,
+  CodeEdgeRow,
+  CodeFileChange,
+  CodeFileInfo,
+  CodeSymbolRow
+} from "../codebase/types.js";
+import { codeFileId } from "../codebase/ids.js";
 import {
   BUCKET_ABSTRACT_ROWS,
   accumulateCentroid,
@@ -967,6 +976,144 @@ export class InMemoryVectorStore implements VectorStore {
               .flatMap(([, edges]) => edges.map((e) => ({ ...e })))
     };
   }
+
+  /**
+   * Codebase index mirror (ADR-0050): same contract as the SQL capability, one
+   * Map per project. Edges live in a flat list per project and are filtered by
+   * scan — the mirrors exist so a test that passes on one store proves something
+   * about the other, so the read semantics are deliberately identical, and the
+   * linear scans are the honest cost of keeping it that way.
+   */
+  get codebase(): CodebaseCapability {
+    const filesFor = (project: string): Map<string, CodeFileInfo> => {
+      let m = this.codeFilesMap.get(project);
+      if (!m) {
+        m = new Map();
+        this.codeFilesMap.set(project, m);
+      }
+      return m;
+    };
+    const symbolsFor = (project: string): Map<string, CodeSymbolRow> => {
+      let m = this.codeSymbolsMap.get(project);
+      if (!m) {
+        m = new Map();
+        this.codeSymbolsMap.set(project, m);
+      }
+      return m;
+    };
+    const edgesFor = (project: string): CodeEdgeRow[] => {
+      let list = this.codeEdgesMap.get(project);
+      if (!list) {
+        list = [];
+        this.codeEdgesMap.set(project, list);
+      }
+      return list;
+    };
+    const recomputeFanIn = (project: string): void => {
+      const edges = edgesFor(project);
+      const counts = new Map<string, number>();
+      for (const e of edges) {
+        if (e.kind !== "calls") continue;
+        counts.set(e.toId, (counts.get(e.toId) ?? 0) + 1);
+      }
+      for (const row of symbolsFor(project).values()) row.fanIn = counts.get(row.id) ?? 0;
+    };
+    // Field maps copy one level deep like reExports: the store hands out rows a
+    // caller could mutate, and a mutated mirror would lie to the next reader.
+    const copyFields = (fields: Record<string, Record<string, string>>): Record<string, Record<string, string>> =>
+      Object.fromEntries(Object.entries(fields).map(([typeName, map]) => [typeName, { ...map }]));
+    return {
+      codeFiles: async (project) =>
+        [...filesFor(project).values()].sort((a, b) => a.path.localeCompare(b.path)).map((f) => ({ ...f, reExports: f.reExports.map((r) => ({ spec: r.spec, names: [...r.names] })), fields: copyFields(f.fields) })),
+      codeSymbols: async (project, opts) =>
+        [...symbolsFor(project).values()]
+          .filter((r) => (opts?.includeModules ? true : r.kind !== "module"))
+          .sort((a, b) => a.path.localeCompare(b.path) || a.qualifiedName.localeCompare(b.qualifiedName))
+          .map((r) => ({ ...r })),
+      codeSymbolsByIds: async (project, ids) => {
+        const wanted = new Set(ids);
+        return [...symbolsFor(project).values()].filter((r) => wanted.has(r.id)).map((r) => ({ ...r }));
+      },
+      codeSymbolsMatching: async (project, substr, limit) => {
+        const q = substr.toLowerCase();
+        return [...symbolsFor(project).values()]
+          .filter((r) => r.kind !== "module" && (r.name.toLowerCase().includes(q) || r.qualifiedName.toLowerCase().includes(q) || r.signature.toLowerCase().includes(q)))
+          .sort((a, b) => b.fanIn - a.fanIn || a.name.localeCompare(b.name))
+          .slice(0, Math.max(1, Math.floor(limit)))
+          .map((r) => ({ ...r }));
+      },
+      codeSymbolById: async (project, id) => {
+        const row = symbolsFor(project).get(id);
+        return row ? { ...row } : null;
+      },
+      codeEdges: async (project, symbolId, dir) => {
+        const live = (id: string): boolean => symbolsFor(project).has(id);
+        return edgesFor(project)
+          .filter((e) => (dir === "in" ? e.toId === symbolId : e.fromId === symbolId) && live(e.fromId) && live(e.toId))
+          .map((e) => ({ ...e }));
+      },
+      codeStats: async (project): Promise<CodebaseStats> => ({
+        files: filesFor(project).size,
+        parseErrors: [...filesFor(project).values()].filter((f) => f.parseError !== null).length,
+        symbols: symbolsFor(project).size,
+        edges: edgesFor(project).filter((e) => symbolsFor(project).has(e.fromId)).length
+      }),
+      codeApplyChanges: async (project, changes) => {
+        const files = filesFor(project);
+        const symbols = symbolsFor(project);
+        const edges = edgesFor(project);
+        for (const change of changes) {
+          const fid = codeFileId(project, change.path);
+          const oldIds = [...symbols.values()].filter((r) => r.fileId === fid).map((r) => r.id);
+          const dead = new Set(oldIds);
+          // Same ownership rule as the SQL store: a changed file deletes only
+          // its outbound edges — inbound edges to its surviving symbols (ids
+          // are deterministic) stay valid — while a removed file takes every
+          // edge touching it.
+          const removed = change.hash === null;
+          for (let i = edges.length - 1; i >= 0; i--) {
+            const edge = edges[i]!;
+            if (removed ? dead.has(edge.fromId) || dead.has(edge.toId) : dead.has(edge.fromId)) edges.splice(i, 1);
+          }
+          for (const id of oldIds) symbols.delete(id);
+          if (change.hash === null) {
+            files.delete(change.path);
+            continue;
+          }
+          files.set(change.path, {
+            id: fid,
+            project,
+            path: change.path,
+            hash: change.hash,
+            mtime: change.mtime,
+            lines: change.lines,
+            parseError: change.parseError,
+            reExports: change.reExports.map((r) => ({ spec: r.spec, names: [...r.names] })),
+            fields: copyFields(change.fields),
+            language: change.language
+          });
+          for (const sym of change.symbols) symbols.set(sym.id, { ...sym });
+          for (const edge of change.edges) {
+            if (!edges.some((e) => e.kind === edge.kind && e.fromId === edge.fromId && e.toId === edge.toId && e.evidence === edge.evidence)) {
+              edges.push({ ...edge });
+            }
+          }
+        }
+        recomputeFanIn(project);
+      },
+      codeForget: async (project) => {
+        const n = symbolsFor(project).size;
+        this.codeFilesMap.delete(project);
+        this.codeSymbolsMap.delete(project);
+        this.codeEdgesMap.delete(project);
+        return n;
+      }
+    };
+  }
+
+  private codeFilesMap = new Map<string, Map<string, CodeFileInfo>>();
+  private codeSymbolsMap = new Map<string, Map<string, CodeSymbolRow>>();
+  private codeEdgesMap = new Map<string, CodeEdgeRow[]>();
 
   private linksByFrom = new Map<string, KnowledgeEdge[]>();
 }

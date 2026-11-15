@@ -5,8 +5,8 @@
 ![the console: a query, the floor preset that made seven hits appear, the token budget,
 and the score decomposition behind every hit](docs/images/console-recall-dark.png)
 
-> **Status: `0.4.0-beta.3`** — pre-release. The storage format is settled; the HTTP and MCP surfaces
-> can still move between prereleases.
+> **Status: `0.4.0-beta.3`** — pre-release. The storage format is settled; the HTTP, MCP, and console UI
+> surfaces can still move between prereleases.
 
 Agent memory is usually a vector database you babysit or a cloud you don't trust with your history.
 Open Memory is a single `memory.db` file (`node:sqlite`, WAL) that stores episodic, semantic, procedural
@@ -31,6 +31,7 @@ Docker, and your history never leaves the machine.
 - **Vault graph** (`/graph.html`): Obsidian-style node graph over `vault/` — any markdown you point `VAULT_DIR` at. Edges come from `[[wikilinks]]` in the body plus the frontmatter `links:` that ingest writes — nothing is inferred, so the graph never lies about intent. Click a node for the local graph (depth 1-3), filter with `tag:x` / `path:x` / substring, colour by folder, drag nodes; positions persist to `vault/.positions.json`. Dangling and ambiguous links render as hollow nodes — hiding them would hide the maintenance debt.
 - **CLI** (`ai-memory`): every subcommand works non-interactively, because hooks call it. Uses the daemon when one answers, otherwise opens the store in-process.
 - **MCP server** (`src/mcp/tools.ts`): `memory_*` tools, every one accepting an explicit `scope` (`memory_knowledge` adds the vault index).
+- **Codebase memory** (ADR-0050): the repository's code indexed into the same store — files, symbols (functions, classes, methods, types), imports and call references, parsed by a zero-dependency structural scanner. Six languages behind one grammar registry: **TypeScript/JavaScript, Go, Java, C#, Rust, Kotlin** — each row carries the `language` that wrote it, so a mixed-repo index stays auditable; each language's own module system does the import resolution (go.mod prefixes, Java/Kotlin packages-to-directories, Rust `crate::`/`super::` paths, tsconfig `paths` aliases). `codebase_index` is incremental by content hash and idempotent (1,121 mixed-language files re-index in ~2 s); `codebase_search` ranks exact > prefix > substring deterministically under the hard token budget; `codebase_symbol` shows importers, callers and callees, every edge labelled with its evidence (`import` / `re-export` / `local` / `alias` are exact, `name-match` is the heuristic the graph admits to). `ai-memory codebase index | search | symbol | forget` runs the same paths. Python and the remaining graph-quality phases are planned in [docs/roadmap-codebase-memory.md](docs/roadmap-codebase-memory.md).
 - **Local boundary** (ADR-0049): the daemon serves one principal — a key file in the data dir, its token required on every read/write route (`x-ai-memory-principal`), and the namespace user segment owned server-side. Another OS account gets 401/403 instead of a partition it names; a second account runs its own store and port.
 - **Wire it in** ([docs/integrations.md](docs/integrations.md)): one command for the agents it knows, and `agent add` for any other MCP client — no code.
 - **Zero runtime dependencies.** `node:http`, `node:sqlite`, `node:crypto`. Dev-only: tsx, typescript, vitest.

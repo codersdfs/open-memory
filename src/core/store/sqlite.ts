@@ -27,6 +27,15 @@ import { facetTagsOf, rederiveTags } from "../write/facets.js";
 import { extractValidAt, textHash } from "../write/text.js";
 import { DROP_LEDGER_CAP, type CurationDrop, type CurationDropInput } from "../write/curation.js";
 import { median } from "../stats.js";
+import type {
+  CodebaseCapability,
+  CodebaseStats,
+  CodeEdgeRow,
+  CodeFileChange,
+  CodeFileInfo,
+  CodeSymbolRow
+} from "../codebase/types.js";
+import { codeFileId } from "../codebase/ids.js";
 
 /**
  * The candidate pool that vectorSearch and cosineSpread must agree on. They are read
@@ -670,6 +679,77 @@ export class SqliteVectorStore implements VectorStore {
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_links_to ON knowledge_links(to_id);
     `);
+    // Codebase index (ADR-0050). Derived state, the repository's files are the
+    // truth: code_files carries the content hash the sync diffs against, and the
+    // persisted re-export statements and type-field maps let a chain into an
+    // *unchanged* file resolve without re-parsing it. code_edges are keyed on
+    // their full triple, so a symbol referenced five times is one edge.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS code_files (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        path TEXT NOT NULL,
+        hash TEXT,
+        mtime INTEGER,
+        lines INTEGER,
+        parse_error TEXT,
+        re_exports TEXT NOT NULL DEFAULT '[]',
+        fields TEXT NOT NULL DEFAULT '{}',
+        language TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_code_files_path ON code_files(project, path);
+      CREATE TABLE IF NOT EXISTS code_symbols (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        signature TEXT,
+        line_start INTEGER,
+        line_end INTEGER,
+        exported INTEGER NOT NULL DEFAULT 0,
+        parent_id TEXT,
+        fan_in INTEGER NOT NULL DEFAULT 0,
+        language TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(file_id);
+      CREATE INDEX IF NOT EXISTS idx_code_symbols_project ON code_symbols(project);
+      CREATE TABLE IF NOT EXISTS code_edges (
+        kind TEXT NOT NULL,
+        from_id TEXT NOT NULL,
+        to_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        PRIMARY KEY (kind, from_id, to_id, evidence)
+      );
+      CREATE INDEX IF NOT EXISTS idx_code_edges_from ON code_edges(from_id);
+      CREATE INDEX IF NOT EXISTS idx_code_edges_to ON code_edges(to_id);
+      -- The fan_in recompute groups the calls edges by target; without the
+      -- (to_id, kind) pair the planner reads the whole edge table per symbol and
+      -- a 12k-symbol index costs seconds instead of milliseconds.
+      CREATE INDEX IF NOT EXISTS idx_code_edges_to_kind ON code_edges(to_id, kind);
+    `);
+    // A store opened by a build older than the fields column reads the same
+    // tables: add the column in place (the established ALTER-if-missing
+    // pattern), and its '{}' default reads as "no persisted fields" until the
+    // file's next sync rewrites the row.
+    const codeFileCols = this.db.prepare(`PRAGMA table_info(code_files)`).all() as { name: string }[];
+    if (!codeFileCols.some((c) => c.name === "fields")) {
+      this.db.exec(`ALTER TABLE code_files ADD COLUMN fields TEXT NOT NULL DEFAULT '{}'`);
+    }
+    // Language (roadmap Phase 2): the grammar id that indexed the row. Existing
+    // rows were indexed by the TypeScript scanner, so 'typescript' is the honest
+    // backfill — the same渐进 convergence the fields default uses.
+    const codeSymbolCols = this.db.prepare(`PRAGMA table_info(code_symbols)`).all() as { name: string }[];
+    if (!codeFileCols.some((c) => c.name === "language")) {
+      this.db.exec(`ALTER TABLE code_files ADD COLUMN language TEXT`);
+      this.db.exec(`UPDATE code_files SET language = 'typescript' WHERE language IS NULL`);
+    }
+    if (!codeSymbolCols.some((c) => c.name === "language")) {
+      this.db.exec(`ALTER TABLE code_symbols ADD COLUMN language TEXT`);
+      this.db.exec(`UPDATE code_symbols SET language = 'typescript' WHERE language IS NULL`);
+    }
     // P2 (ADR-0016 amendment, 2026-11-07): store-level bookkeeping as a small KV,
     // not a column — this describes the file, not any memory, and a maintenance
     // timestamp on 10^5 rows would be the same number 10^5 times. IF NOT EXISTS,
@@ -3360,6 +3440,246 @@ export class SqliteVectorStore implements VectorStore {
           .prepare(`SELECT from_id, to_id, target FROM knowledge_links ORDER BY from_id, target`)
           .all() as { from_id: string; to_id: string | null; target: string }[]);
     return rows.map((r) => ({ from: r.from_id, to: r.to_id ?? null, target: r.target }));
+  }
+
+  // ---- Codebase capability (ADR-0050). Primitive persistence: the sync decides
+  // what changed, this decides how it lands — one transaction per sync, every
+  // edge a file owns deleted before its replacement is inserted, fan_in recomputed
+  // over the live edges inside the same commit. A crash lands all of a sync or
+  // none of it, never a half-indexed repository.
+
+  get codebase(): CodebaseCapability {
+    return this as unknown as CodebaseCapability;
+  }
+
+  private codeFileRow(r: { id: string; project: string; path: string; hash: string | null; mtime: number | null; lines: number | null; parse_error: string | null; re_exports: string; fields: string }): CodeFileInfo {
+    let reExports: { spec: string; names: string[] }[] = [];
+    try {
+      const parsed = JSON.parse(r.re_exports) as unknown;
+      if (Array.isArray(parsed)) {
+        reExports = parsed
+          .filter((x): x is { spec: string; names: string[] } => typeof x === "object" && x !== null && typeof (x as { spec?: unknown }).spec === "string")
+          .map((x) => ({ spec: x.spec, names: Array.isArray(x.names) ? x.names.map(String) : [] }));
+      }
+    } catch {
+      // A malformed blob reads as no re-exports — the sync rewrites it on the
+      // next change to the file, and an import through it simply does not resolve.
+    }
+    let fields: Record<string, Record<string, string>> = {};
+    try {
+      const parsedFields = JSON.parse(r.fields) as unknown;
+      if (parsedFields && typeof parsedFields === "object" && !Array.isArray(parsedFields)) {
+        for (const [typeName, typeFields] of Object.entries(parsedFields as Record<string, unknown>)) {
+          if (!typeFields || typeof typeFields !== "object" || Array.isArray(typeFields)) continue;
+          const entry: Record<string, string> = {};
+          for (const [fieldName, fieldType] of Object.entries(typeFields as Record<string, unknown>)) {
+            if (typeof fieldType === "string") entry[fieldName] = fieldType;
+          }
+          fields[typeName] = entry;
+        }
+      }
+    } catch {
+      // A malformed blob reads as no fields — the sync rewrites it on the next
+      // change to the file, and a two-level call through it builds no edge.
+    }
+    let language: string | null = (r as { language?: string | null }).language ?? null;
+    return { id: r.id, project: r.project, path: r.path, hash: r.hash, mtime: r.mtime, lines: r.lines, parseError: r.parse_error, reExports, fields, language };
+  }
+
+  private codeSymbolRow(r: Record<string, unknown>): CodeSymbolRow {
+    return {
+      id: String(r.id),
+      project: String(r.project),
+      fileId: String(r.file_id),
+      path: String(r.path),
+      name: String(r.name),
+      qualifiedName: String(r.qualified_name),
+      kind: String(r.kind) as CodeSymbolRow["kind"],
+      signature: (r.signature as string | null) ?? "",
+      lineStart: (r.line_start as number | null) ?? null,
+      lineEnd: (r.line_end as number | null) ?? null,
+      exported: Number(r.exported) === 1,
+      parentId: (r.parent_id as string | null) ?? null,
+      fanIn: Number(r.fan_in ?? 0),
+      language: (r.language as string | null) ?? null
+    };
+  }
+
+  private codeSymbolSql(where: string, params: (string | number)[], suffix = ""): CodeSymbolRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, project, file_id, path, name, qualified_name, kind, signature, line_start, line_end, exported, parent_id, fan_in, language
+         FROM code_symbols WHERE ${where}${suffix}`
+      )
+      .all(...params) as Record<string, unknown>[];
+    return rows.map((r) => this.codeSymbolRow(r));
+  }
+
+  async codeFiles(project: string): Promise<CodeFileInfo[]> {
+    this.ensure();
+    const rows = this.db
+      .prepare(`SELECT id, project, path, hash, mtime, lines, parse_error, re_exports, fields, language FROM code_files WHERE project = ? ORDER BY path`)
+      .all(project) as { id: string; project: string; path: string; hash: string | null; mtime: number | null; lines: number | null; parse_error: string | null; re_exports: string; fields: string; language: string | null }[];
+    return rows.map((r) => this.codeFileRow(r));
+  }
+
+  async codeSymbols(project: string, opts?: { includeModules?: boolean }): Promise<CodeSymbolRow[]> {
+    this.ensure();
+    return this.codeSymbolSql("project = ?" + (opts?.includeModules ? "" : " AND kind != 'module'"), [project], " ORDER BY path, qualified_name");
+  }
+
+  async codeSymbolsByIds(project: string, ids: string[]): Promise<CodeSymbolRow[]> {
+    this.ensure();
+    if (ids.length === 0) return [];
+    const out: CodeSymbolRow[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      out.push(...this.codeSymbolSql(`project = ? AND id IN (${chunk.map(() => "?").join(",")})`, [project, ...chunk]));
+    }
+    return out;
+  }
+
+  async codeSymbolsMatching(project: string, substr: string, limit: number): Promise<CodeSymbolRow[]> {
+    this.ensure();
+    const escaped = substr.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+    const pattern = `%${escaped}%`;
+    return this.codeSymbolSql(
+      `project = ? AND kind != 'module' AND (name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\' OR signature LIKE ? ESCAPE '\\')`,
+      [project, pattern, pattern, pattern],
+      ` ORDER BY fan_in DESC, name LIMIT ${Math.max(1, Math.floor(limit))}`
+    );
+  }
+
+  async codeSymbolById(project: string, id: string): Promise<CodeSymbolRow | null> {
+    this.ensure();
+    const rows = this.codeSymbolSql("project = ? AND id = ?", [project, id]);
+    return rows[0] ?? null;
+  }
+
+  async codeEdges(project: string, symbolId: string, dir: "in" | "out"): Promise<CodeEdgeRow[]> {
+    this.ensure();
+    // Edges are project-qualified through their endpoints, so the project filter
+    // rides the symbols table: an edge whose endpoint died with its file answers
+    // nothing (and the sync deletes it in the same transaction as the symbol).
+    const col = dir === "in" ? "to_id" : "from_id";
+    const other = dir === "in" ? "from_id" : "to_id";
+    const rows = this.db
+      .prepare(
+        `SELECT e.kind, e.from_id, e.to_id, e.evidence FROM code_edges e
+         JOIN code_symbols s ON s.id = e.${other} AND s.project = ?
+         WHERE e.${col} = ? ORDER BY e.kind, e.evidence`
+      )
+      .all(project, symbolId) as { kind: string; from_id: string; to_id: string; evidence: string }[];
+    return rows.map((r) => ({ kind: r.kind as CodeEdgeRow["kind"], fromId: r.from_id, toId: r.to_id, evidence: r.evidence as CodeEdgeRow["evidence"] }));
+  }
+
+  async codeStats(project: string): Promise<CodebaseStats> {
+    this.ensure();
+    const files = this.db.prepare(`SELECT COUNT(*) AS c FROM code_files WHERE project = ?`).get(project) as { c: number };
+    const parseErrors = this.db.prepare(`SELECT COUNT(*) AS c FROM code_files WHERE project = ? AND parse_error IS NOT NULL`).get(project) as { c: number };
+    const symbols = this.db.prepare(`SELECT COUNT(*) AS c FROM code_symbols WHERE project = ?`).get(project) as { c: number };
+    const edges = this.db
+      .prepare(`SELECT COUNT(*) AS c FROM code_edges e JOIN code_symbols s ON s.id = e.from_id WHERE s.project = ?`)
+      .get(project) as { c: number };
+    return { files: files.c, parseErrors: parseErrors.c, symbols: symbols.c, edges: edges.c };
+  }
+
+  private codeDeleteEdges(ids: string[], bothSides = true): void {
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const placeholders = chunk.map(() => "?").join(",");
+      if (bothSides) {
+        this.db.prepare(`DELETE FROM code_edges WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`).run(...chunk, ...chunk);
+      } else {
+        this.db.prepare(`DELETE FROM code_edges WHERE from_id IN (${placeholders})`).run(...chunk);
+      }
+    }
+  }
+
+  async codeApplyChanges(project: string, changes: CodeFileChange[]): Promise<void> {
+    this.ensure();
+    const db = this.db;
+    const insertFile = db.prepare(
+      `INSERT INTO code_files (id, project, path, hash, mtime, lines, parse_error, re_exports, fields, language)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET hash = excluded.hash, mtime = excluded.mtime, lines = excluded.lines,
+         parse_error = excluded.parse_error, re_exports = excluded.re_exports, fields = excluded.fields, language = excluded.language`
+    );
+    const insertSymbol = db.prepare(
+      `INSERT OR REPLACE INTO code_symbols (id, project, file_id, path, name, qualified_name, kind, signature, line_start, line_end, exported, parent_id, fan_in, language)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+    );
+    const insertEdge = db.prepare(`INSERT OR REPLACE INTO code_edges (kind, from_id, to_id, evidence) VALUES (?, ?, ?, ?)`);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const change of changes) {
+        const fid = codeFileId(project, change.path);
+        const oldIds = (db.prepare(`SELECT id FROM code_symbols WHERE file_id = ?`).all(fid) as { id: string }[]).map((r) => r.id);
+        // A changed file only owns its OUTBOUND edges: symbol ids are
+        // deterministic, so inbound edges to its surviving symbols stay valid
+        // and must survive; a removed file takes every edge touching it.
+        this.codeDeleteEdges(oldIds, change.hash === null);
+        db.prepare(`DELETE FROM code_symbols WHERE file_id = ?`).run(fid);
+        if (change.hash === null) {
+          db.prepare(`DELETE FROM code_files WHERE id = ?`).run(fid);
+          continue;
+        }
+        insertFile.run(fid, project, change.path, change.hash, change.mtime, change.lines, change.parseError, JSON.stringify(change.reExports), JSON.stringify(change.fields), change.language);
+        for (const sym of change.symbols) {
+          insertSymbol.run(
+            sym.id, project, sym.fileId, sym.path, sym.name, sym.qualifiedName, sym.kind, sym.signature,
+            sym.lineStart, sym.lineEnd, sym.exported ? 1 : 0, sym.parentId, sym.language
+          );
+        }
+        for (const edge of change.edges) {
+          insertEdge.run(edge.kind, edge.fromId, edge.toId, edge.evidence);
+        }
+      }
+      // Fan-in is recomputed, never patched: a symbol whose last inbound edge
+      // died has to read 0. The correlated subquery this replaced was measured at
+      // 32 s on an 11k-symbol index (the planner reads every calls edge per row),
+      // so the count is read in ONE grouped pass and written by PK seek — linear
+      // in the edges, not quadratic in the symbols.
+      db.prepare(`UPDATE code_symbols SET fan_in = 0 WHERE project = ? AND fan_in != 0`).run(project);
+      const counts = db
+        .prepare(
+          `SELECT e.to_id AS id, COUNT(*) AS c FROM code_edges e
+           JOIN code_symbols s ON s.id = e.to_id AND s.project = ?
+           WHERE e.kind = 'calls' GROUP BY e.to_id`
+        )
+        .all(project) as { id: string; c: number }[];
+      const setFanIn = db.prepare(`UPDATE code_symbols SET fan_in = ? WHERE id = ?`);
+      for (const row of counts) setFanIn.run(row.c, row.id);
+      db.exec("COMMIT");
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // A commit that already landed cannot roll back; rethrow the original error.
+      }
+      throw e;
+    }
+  }
+
+  async codeForget(project: string): Promise<number> {
+    this.ensure();
+    const db = this.db;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const symbols = db.prepare(`SELECT COUNT(*) AS c FROM code_symbols WHERE project = ?`).get(project) as { c: number };
+      db.prepare(`DELETE FROM code_edges WHERE from_id IN (SELECT id FROM code_symbols WHERE project = ?) OR to_id IN (SELECT id FROM code_symbols WHERE project = ?)`).run(project, project);
+      db.prepare(`DELETE FROM code_symbols WHERE project = ?`).run(project);
+      db.prepare(`DELETE FROM code_files WHERE project = ?`).run(project);
+      db.exec("COMMIT");
+      return symbols.c;
+    } catch (e) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Same contract as codeApplyChanges: rethrow the original failure.
+      }
+      throw e;
+    }
   }
 }
 
