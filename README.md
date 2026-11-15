@@ -5,7 +5,7 @@
 ![the console: a query, the floor preset that made seven hits appear, the token budget,
 and the score decomposition behind every hit](docs/images/console-recall-dark.png)
 
-> **Status: `0.4.0-beta.3`** — pre-release. The storage format is settled; the HTTP, MCP, and console UI
+> **Status: `0.4.0-beta.4`** — pre-release. The storage format is settled; the HTTP, MCP, and console UI
 > surfaces can still move between prereleases.
 
 Agent memory is usually a vector database you babysit or a cloud you don't trust with your history.

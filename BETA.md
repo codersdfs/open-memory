@@ -8,7 +8,7 @@ token budget, MCP + HTTP + CLI. Your history never leaves the machine. This page
 
 ```bash
 npm i -g @franklinww/open-memory@beta
-ai-memory --version        # expect 0.4.0-beta.3
+ai-memory --version        # expect 0.4.0-beta.4
 ```
 
 Requirements: Node >= 22.5. Works best on a machine where you already run a coding agent daily.

@@ -6,7 +6,7 @@ rejected by npm as too similar to the existing `openmemory`); the command stays 
 Prereleases (`-beta.N`) may still move the HTTP, MCP, and console UI surfaces between builds. The
 on-disk format is the part that does not.
 
-## Unreleased
+## 0.4.0-beta.4 — 2026-11-15
 
 ### Added
 
