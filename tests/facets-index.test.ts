@@ -42,10 +42,12 @@ afterAll(() => {
 });
 
 /** The raw file, opened beside the store the way `tests/maintenance.test.ts` reads it. */
-function raw(file: string): DatabaseSync {
+// The instance type comes off the lazily-required value above: `node:sqlite` cannot be
+// imported statically here (vite rewrites it), and its class is a value binding, not a type.
+function raw(file: string): InstanceType<typeof DatabaseSync> {
   return new DatabaseSync(file);
 }
-function facetCount(db: DatabaseSync, id: string): number {
+function facetCount(db: InstanceType<typeof DatabaseSync>, id: string): number {
   return (db.prepare(`SELECT COUNT(*) AS n FROM memory_facets WHERE memory_id = ?`).get(id) as { n: number }).n;
 }
 

@@ -690,7 +690,7 @@ describe("the bound itself", () => {
       expect(rows.length).toBe(CLUSTERS * ROWS_PER_PROJECT);
       for (const qtext of queries) {
         const q = await embedder.embed(qtext);
-        for (const s of (store as unknown as { buckets: Map<string, { centroid: number[]; norm: number; cosTheta: number }> }).buckets.values()) {
+        for (const s of (store as unknown as { buckets: Map<string, { projectKey: string; centroid: number[]; norm: number; cosTheta: number }> }).buckets.values()) {
           const bound = bucketScanBound(queryToCentroid(q, s.centroid!, s.norm), s.cosTheta);
           for (const m of rows) {
             if ((m.project ?? "") !== (s.projectKey === "" ? null : s.projectKey)) continue;

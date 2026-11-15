@@ -197,6 +197,8 @@ describe("byVectorDim", () => {
     visibility: "private",
     status: "active",
     pin: 0,
+    validAt: null,
+    invalidAt: null,
     createdAt: 0,
     updatedAt: 0,
   });

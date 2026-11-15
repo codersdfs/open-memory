@@ -9,7 +9,7 @@ function mem(over: Partial<Memory> = {}): Memory {
     type: "semantic", text: "use pnpm not npm",
     embedding: [], importance: 0.8, strength: 0.8, lastUsedAt: null, useCount: 0,
     source: "mcp:pi", tags: ["entity:pnpm"], supersedesId: null, isDeleted: 0,
-    visibility: "private", status: "active", pin: 0, createdAt: 1, updatedAt: 1, ...over
+    visibility: "private", status: "active", pin: 0, validAt: null, invalidAt: null, createdAt: 1, updatedAt: 1, ...over
   };
 }
 

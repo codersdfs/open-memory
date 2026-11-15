@@ -11,6 +11,7 @@ import { InMemoryVectorStore } from "../src/core/store/memory.js";
 import { SqliteVectorStore } from "../src/core/store/sqlite.js";
 import { MemoryService } from "../src/core/memoryService.js";
 import { HashEmbeddingProvider } from "../src/core/embedding/hash.js";
+import type { EmbeddingProvider } from "../src/core/embedding/provider.js";
 import { buildServer } from "../src/api/server.js";
 import { countTokens } from "../src/core/retrieval/tokens.js";
 import type { Memory } from "../src/core/types.js";

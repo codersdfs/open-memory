@@ -173,12 +173,12 @@ describe("the conflict window's three arms", () => {
   });
 
   it("caps the union at ten, trimming the weakest arm first", () => {
-    const n = (id: string) => ({
+    const n = (id: string): { memory: Memory; vectorScore: number } => ({
       memory: {
         id, namespace: NS, project: null, kind: "note", knowledgeId: null, knowledgeSection: null,
         type: "semantic", text: "t " + id, embedding: [], importance: 0.5, strength: 0.5, lastUsedAt: null,
         useCount: 0, tags: [], supersedesId: null, isDeleted: 0, visibility: "private",
-        status: "active", pin: 0, createdAt: 1, updatedAt: 1
+        status: "active", pin: 0, validAt: null, invalidAt: null, createdAt: 1, updatedAt: 1
       },
       vectorScore: 0.5
     });
@@ -388,7 +388,7 @@ describe("the three unjudged outcomes stay distinguishable", () => {
     expect(next.decision.conflictFacet).toBe("conflict:api");
     expect((await svc.get(old.id))!.tags).toContain("conflict:api");
     expect(next.memory.tags).toContain("conflict:api");
-    expect(next.memory.tags.every((t) => t !== "judged:failed")).toBe(true);
+    expect((next.memory.tags ?? []).every((t) => t !== "judged:failed")).toBe(true);
   });
 
   it("a judge that was asked and failed tags the row and counts on stderr — no conflict marker", async () => {
@@ -406,7 +406,7 @@ describe("the three unjudged outcomes stay distinguishable", () => {
       const next = await svc.saveDetailed({ namespace: NS, type: "semantic", text: "the API listens on port 9090", tags: ["entity:api"] });
       expect(next.decision.reason).toBe("judge-failed");
       expect(next.memory.tags).toContain("judged:failed");
-      expect(next.memory.tags.every((t) => !t.startsWith("conflict:"))).toBe(true);
+      expect((next.memory.tags ?? []).every((t) => !t.startsWith("conflict:"))).toBe(true);
     } finally {
       globalThis.fetch = origFetch;
       restore();
@@ -445,7 +445,7 @@ describe("the three unjudged outcomes stay distinguishable", () => {
     try {
       const next = await svc.saveDetailed({ namespace: NS, type: "semantic", text: "the API listens on port 9090", tags: ["entity:api"] });
       expect(next.decision.reason).toBe("model-unrelated");
-      expect(next.memory.tags.every((t) => !t.startsWith("conflict:") && t !== "judged:failed")).toBe(true);
+      expect((next.memory.tags ?? []).every((t) => !t.startsWith("conflict:") && t !== "judged:failed")).toBe(true);
     } finally {
       globalThis.fetch = origFetch;
       restore();
@@ -464,8 +464,8 @@ describe("the three unjudged outcomes stay distinguishable", () => {
     const next = await svc.saveDetailed({ namespace: NS, type: "semantic", text: "deploy api v3 to staging tonight" });
     expect(next.decision.reason).toBe("model-unavailable");
     expect(next.decision.conflictFacet).toBeUndefined();
-    expect((await svc.get(old.id))!.tags.every((t) => !t.startsWith("conflict:"))).toBe(true);
-    expect(next.memory.tags.every((t) => !t.startsWith("conflict:"))).toBe(true);
+    expect(((await svc.get(old.id))!.tags ?? []).every((t) => !t.startsWith("conflict:"))).toBe(true);
+    expect((next.memory.tags ?? []).every((t) => !t.startsWith("conflict:"))).toBe(true);
   });
 });
 
@@ -482,7 +482,7 @@ describe("the guards never yield to the conflict marker", () => {
       type: "semantic", text: "the API listens on port 8787",
       embedding: [], importance: 0.8, strength: 0.8, lastUsedAt: null, useCount: 0,
       source: "mcp:pi", tags: ["entity:api"], supersedesId: null, isDeleted: 0,
-      visibility: "private", status: "active", pin: 0, createdAt: 1, updatedAt: 1, ...over
+      visibility: "private", status: "active", pin: 0, validAt: null, invalidAt: null, createdAt: 1, updatedAt: 1, ...over
     },
     vectorScore: 0.9
   });
@@ -583,7 +583,7 @@ describe("stats.pendingConflicts", () => {
     type: "semantic", text: "the API listens on port 8787",
     embedding: [], importance: 0.5, strength: 0.5, lastUsedAt: null, useCount: 0,
     tags: [], supersedesId: null, isDeleted: 0, visibility: "private", status: "active",
-    pin: 0, createdAt: 0, updatedAt: 0, ...over
+    pin: 0, validAt: null, invalidAt: null, createdAt: 0, updatedAt: 0, ...over
   });
 
   it("counts readable-live marked rows only, and hands the rows to the panel", () => {
@@ -601,6 +601,8 @@ describe("stats.pendingConflicts", () => {
 });
 
 /** The raw file, opened beside the store the way `tests/facets-index.test.ts` reads it. */
-function raw(file: string): DatabaseSync {
+// `node:sqlite` is required lazily above (vite rewrites a static import), so the
+// instance type comes off that value rather than a second, colliding import.
+function raw(file: string): InstanceType<typeof DatabaseSync> {
   return new DatabaseSync(file);
 }

@@ -311,7 +311,9 @@ describe("principal: clients carry the token", () => {
     try {
       const client = new MemoryClient(gatedBase);
       const res = await client.get("/namespaces");
-      expect(res.ok).toBe(false);
+      // Narrowing the union IS the assertion: an `ok` response here would mean the
+      // gate let a keyless client read, which is the failure this test names.
+      if (res.ok) throw new Error(`expected a refusal, got ${JSON.stringify(res.data)}`);
       expect(res.status).toBe(401);
       expect(res.error).toContain(PRINCIPAL_HEADER);
     } finally {

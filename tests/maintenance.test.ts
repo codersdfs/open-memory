@@ -263,7 +263,9 @@ describe("use_count migration", () => {
     const opened = await new Promise<{ code: number | null; stdout: string }>((resolve, reject) => {
       const child = spawnChild(process.execPath, [TSX, opener], { stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
-      child.stdout.on("data", (d) => { stdout += String(d); });
+      // The stdio above pipes stdout, so this is non-null in practice; the optional
+      // chain keeps it honest and a missing stream still fails the assertion below.
+      child.stdout?.on("data", (d) => { stdout += String(d); });
       child.on("error", reject);
       child.once("exit", (code) => resolve({ code, stdout }));
     });

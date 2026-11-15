@@ -54,6 +54,8 @@ function mem(o: Partial<Memory> & { type: Memory["type"] }): Memory {
     visibility: "private",
     status: "active",
     pin: 0,
+    validAt: null,
+    invalidAt: null,
     createdAt: 0,
     updatedAt: 0,
     ...o
